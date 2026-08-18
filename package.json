@@ -1,0 +1,33 @@
+{
+  "name": "pi-cua",
+  "version": "0.1.0",
+  "description": "Run local Pi sessions against persistent Linux and Windows CUA sandboxes",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "cua",
+    "sandbox"
+  ],
+  "author": "Zane Chee",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/injaneity/pi-cua.git"
+  },
+  "homepage": "https://github.com/injaneity/pi-cua#readme",
+  "bugs": {
+    "url": "https://github.com/injaneity/pi-cua/issues"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  }
+}
