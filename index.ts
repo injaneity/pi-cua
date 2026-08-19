@@ -49,6 +49,14 @@ type SandboxItem = {
   pool: string;
   online: boolean;
 };
+type WorkspaceState = {
+  version: 1;
+  localRoot: string;
+  // immutable objects captured when this thread first enters a sandbox
+  commit: string;
+  commitTree: string;
+  baselineTree: string;
+};
 type BackendResult = {
   ok: boolean;
   error?: string;
@@ -65,6 +73,7 @@ type BackendResult = {
   changed?: boolean;
   state?: string;
   remote_cwd?: string;
+  workspace_state?: WorkspaceState;
   target?: unknown;
 };
 type Destination =
@@ -78,6 +87,7 @@ type ExecutionTarget =
       address: string;
       localCwd: string;
       remoteCwd: string;
+      workspaceState: WorkspaceState;
     };
 type UIContext = ExtensionContext | ExtensionCommandContext;
 type PickerItem = SelectItem & { value: string };
@@ -520,29 +530,44 @@ function requireSandbox(result: BackendResult): {
 }
 
 function parseTarget(value: unknown): ExecutionTarget | undefined {
-  if (!value || typeof value !== "object") return undefined;
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "object")
+    throw new Error("saved execution target is invalid");
   const data = value as Record<string, unknown>;
   if (data.kind === "local") return { kind: "local" };
   if (
     data.kind !== "sandbox" ||
     typeof data.name !== "string" ||
     (data.os !== "linux" && data.os !== "windows") ||
+    typeof data.address !== "string" ||
     typeof data.localCwd !== "string" ||
     typeof data.remoteCwd !== "string"
   )
-    return undefined;
+    throw new Error("saved execution target is invalid");
+  const sync = data.workspaceState as Record<string, unknown> | undefined;
+  if (
+    !sync ||
+    sync.version !== 1 ||
+    typeof sync.localRoot !== "string" ||
+    typeof sync.commit !== "string" ||
+    typeof sync.commitTree !== "string" ||
+    typeof sync.baselineTree !== "string"
+  )
+    throw new Error("saved sandbox workspace state is unsupported");
   return {
     kind: "sandbox",
     name: data.name,
     os: data.os,
-    address: typeof data.address === "string" ? data.address : data.name,
+    address: data.address,
     localCwd: data.localCwd,
     remoteCwd: data.remoteCwd,
+    workspaceState: sync as WorkspaceState,
   };
 }
 
 export default function cuaSandbox(pi: ExtensionAPI): void {
   let target: ExecutionTarget = { kind: "local" };
+  let placementError: Error | undefined;
   let bridge: ToolBridge | undefined;
   const proxiedTools = new Set<string>();
   const toolPackages = new Set<string>();
@@ -758,13 +783,9 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
   async function prepareTarget(
     destination: Extract<Destination, { kind: "sandbox" }>,
     ctx: UIContext,
-    options: {
-      transferCurrentWorkspace?: boolean;
-      includeLocalOverlay?: boolean;
-    } = {},
+    options: { inheritWorkspace?: boolean } = {},
   ): Promise<Extract<ExecutionTarget, { kind: "sandbox" }>> {
-    const { transferCurrentWorkspace = true, includeLocalOverlay = true } =
-      options;
+    const { inheritWorkspace = true } = options;
     captureToolProviders();
     pi.events.emit("cua:execution-target-changed", {
       ...destination,
@@ -778,22 +799,14 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
           source_cwd: ctx.cwd,
           workspace_id: ctx.sessionManager.getSessionId(),
           tool_packages: [...toolPackages],
-          include_local_overlay: includeLocalOverlay,
-          source_sandbox:
-            transferCurrentWorkspace && target.kind === "sandbox"
-              ? target.name
-              : undefined,
-          source_os:
-            transferCurrentWorkspace && target.kind === "sandbox"
-              ? target.os
-              : undefined,
-          source_address:
-            transferCurrentWorkspace && target.kind === "sandbox"
-              ? target.address
-              : undefined,
-          source_remote_cwd:
-            transferCurrentWorkspace && target.kind === "sandbox"
-              ? target.remoteCwd
+          source:
+            inheritWorkspace && target.kind === "sandbox"
+              ? {
+                  address: target.address,
+                  os: target.os,
+                  remoteCwd: target.remoteCwd,
+                  state: target.workspaceState,
+                }
               : undefined,
         },
         ctx.signal,
@@ -808,7 +821,8 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       );
       if (
         typeof result.remote_cwd !== "string" ||
-        typeof result.address !== "string"
+        typeof result.address !== "string" ||
+        !result.workspace_state
       ) {
         throw new Error("cua backend returned an invalid execution target");
       }
@@ -818,6 +832,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         address: result.address,
         localCwd: ctx.cwd,
         remoteCwd: result.remote_cwd,
+        workspaceState: result.workspace_state,
       };
     } catch (error) {
       pi.events.emit("cua:execution-target-changed", target);
@@ -872,6 +887,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     }
     bridge?.close();
     target = next;
+    placementError = undefined;
     bridge = nextBridge;
     if (next.kind === "sandbox") installProxies();
     ctx.ui.setStatus("cua-session", undefined);
@@ -942,8 +958,32 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         if (!destination) return;
         if (destination.kind === "local") {
           if (target.kind === "sandbox") {
-            throw new Error(
-              "switching a sandbox workspace back to local is not yet supported",
+            pi.events.emit("cua:execution-target-changed", {
+              ...target,
+              state: "connecting",
+              phase: "workspace.local.sync",
+              message: "syncing sandbox changes to local",
+            });
+            await runBackend(
+              {
+                action: "sync_workspace_to_local",
+                source: {
+                  address: target.address,
+                  os: target.os,
+                  remoteCwd: target.remoteCwd,
+                  state: target.workspaceState,
+                },
+                local_cwd: target.localCwd,
+              },
+              ctx.signal,
+              (status) => {
+                pi.events.emit("cua:execution-target-changed", {
+                  ...target,
+                  state: "connecting",
+                  phase: status.phase,
+                  message: status.message,
+                });
+              },
             );
           }
           const local: ExecutionTarget = { kind: "local" };
@@ -975,10 +1015,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
           const prepared = await prepareTarget(
             { kind: "sandbox", name: saved.name, os: saved.os },
             ctx,
-            {
-              transferCurrentWorkspace: false,
-              includeLocalOverlay: false,
-            },
+            { inheritWorkspace: false },
           );
           await activate(prepared, ctx);
         } else {
@@ -997,19 +1034,20 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         await activate({ kind: "local" }, ctx);
         return;
       }
-      const prepared = await prepareTarget(destination, ctx, {
-        transferCurrentWorkspace: false,
-      });
+      const prepared = await prepareTarget(destination, ctx);
       await activate(prepared, ctx);
     } catch (error) {
+      placementError =
+        error instanceof Error ? error : new Error(String(error));
       ctx.ui.notify(
-        `sandbox unavailable; using local tools: ${error instanceof Error ? error.message : String(error)}`,
-        "warning",
+        `execution placement blocked: ${placementError.message}; choose a target with /sandbox`,
+        "error",
       );
     }
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
+    if (placementError) throw placementError;
     if (target.kind !== "sandbox" || !bridge) return;
     const expectedTools = captureToolProviders();
     await bridge.refresh(expectedTools);
@@ -1022,6 +1060,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
   });
 
   pi.on("user_bash", () => {
+    if (placementError) throw placementError;
     if (target.kind !== "sandbox" || !bridge) return;
     const operations: BashOperations = {
       exec: (command, _cwd, options) =>

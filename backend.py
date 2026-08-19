@@ -32,7 +32,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any
+from typing import Any, TypedDict, cast
 from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
@@ -78,6 +78,7 @@ LONG_ACTIONS = {
     "ensure",
     "delete",
     "prepare_execution",
+    "sync_workspace_to_local",
 }
 FLEET_KEYCHAIN_SERVICE = "cua-sandbox-fleet-api"
 TAILSCALE_KEYCHAIN_SERVICE = "cua-sandbox-tailscale-oauth"
@@ -1365,13 +1366,76 @@ async def delete_one(name: str) -> dict[str, Any]:
 
 
 @dataclass(frozen=True)
-class WorkspaceBundle:
+class WorkspaceRepository:
     root: Path
     relative_cwd: Path
     remote_url: str
     commit: str
-    archive: bytes
-    deleted_paths: tuple[str, ...]
+
+
+class WorkspaceState(TypedDict):
+    """Immutable trees captured when a thread first enters a sandbox."""
+
+    version: int
+    localRoot: str
+    commit: str
+    commitTree: str
+    baselineTree: str
+
+
+class SandboxWorkspaceSource(TypedDict):
+    address: str
+    os: str
+    remoteCwd: str
+    state: WorkspaceState
+
+
+@dataclass(frozen=True)
+class WorkspaceTransfer:
+    state: WorkspaceState
+    baseline_patch: bytes
+    current_patch: bytes
+    final_tree: str
+
+
+WORKSPACE_OBJECT_FIELDS = ("commit", "commitTree", "baselineTree")
+
+
+def require_workspace_state(value: object, field: str) -> WorkspaceState:
+    if (
+        not isinstance(value, dict)
+        or value.get("version") != 1
+        or not isinstance(value.get("localRoot"), str)
+        or any(
+            not isinstance(value.get(key), str)
+            or not re.fullmatch(r"[0-9a-f]{40,64}", value[key])
+            for key in WORKSPACE_OBJECT_FIELDS
+        )
+    ):
+        raise TypeError(f"{field} is invalid")
+    return cast(WorkspaceState, value)
+
+
+def require_sandbox_source(value: object) -> SandboxWorkspaceSource:
+    if not isinstance(value, dict):
+        raise TypeError("source must be an object")
+    address = value.get("address")
+    profile = value.get("os")
+    remote_cwd = value.get("remoteCwd")
+    if (
+        not isinstance(address, str)
+        or not address
+        or profile not in PROFILES
+        or not isinstance(remote_cwd, str)
+        or not remote_cwd
+    ):
+        raise TypeError("source has invalid sandbox fields")
+    return SandboxWorkspaceSource(
+        address=address,
+        os=cast(str, profile),
+        remoteCwd=remote_cwd,
+        state=require_workspace_state(value.get("state"), "source.state"),
+    )
 
 
 def git_output(root: Path, *args: str) -> str:
@@ -1385,9 +1449,238 @@ def git_output(root: Path, *args: str) -> str:
     return proc.stdout.strip()
 
 
-def build_workspace_bundle(
-    source_cwd: Path, *, include_overlay: bool = True
-) -> WorkspaceBundle:
+def workspace_tree(source: Path) -> tuple[Path, str]:
+    root = Path(git_output(source, "rev-parse", "--show-toplevel")).resolve()
+    with tempfile.TemporaryDirectory() as directory:
+        index = Path(directory) / "index"
+        environment = {**os.environ, "GIT_INDEX_FILE": str(index)}
+        for arguments in (("read-tree", "HEAD"), ("add", "-A", "--", ".")):
+            subprocess.run(
+                ["git", "-C", str(root), *arguments],
+                check=True,
+                capture_output=True,
+                env=environment,
+                timeout=300,
+            )
+        tree = subprocess.run(
+            ["git", "-C", str(root), "write-tree"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=300,
+        ).stdout.strip()
+    if not re.fullmatch(r"[0-9a-f]{40,64}", tree):
+        raise RuntimeError("Git returned an invalid workspace tree")
+    return root, tree
+
+
+WORKSPACE_FILTER_CHECK = r"""const { spawnSync } = require('node:child_process');
+const root = process.argv[1];
+const run = (args, input) => {
+  const result = spawnSync('git', ['-C', root, ...args], { input });
+  if (result.status !== 0) {
+    process.stderr.write(result.stderr);
+    process.exit(result.status ?? 1);
+  }
+  return result.stdout;
+};
+const paths = run(['ls-files', '-z', '--cached', '--others', '--exclude-standard']);
+const fields = run(
+  ['check-attr', '-z', '--stdin', 'filter', 'working-tree-encoding'],
+  paths,
+).toString('utf8').split('\0');
+for (let i = 0; i + 2 < fields.length; i += 3) {
+  if (!['', 'unspecified', 'unset'].includes(fields[i + 2])) {
+    process.stderr.write(`unsupported Git attribute: ${fields[i + 1]}=${fields[i + 2]} on ${fields[i]}\n`);
+    process.exit(42);
+  }
+}
+"""
+
+
+def reject_remote_workspace_filters(name: str, profile: str, root: str) -> None:
+    command = (
+        f"node -e {shlex.quote(WORKSPACE_FILTER_CHECK)} {shlex.quote(root)}"
+        if profile == "linux"
+        else f"& 'C:\\cua\\node-v22.20.0-win-x64\\node.exe' -e {powershell_literal(WORKSPACE_FILTER_CHECK)} {powershell_literal(root)}"
+    )
+    run_guest_ssh(name, profile, command, timeout=60)
+
+
+def remote_workspace_tree(
+    name: str,
+    profile: str,
+    root: str,
+    *,
+    reference: str | None = None,
+) -> str:
+    reject_remote_workspace_filters(name, profile, root)
+    ref = f"refs/cua-pi/sync/{reference}" if reference else None
+    if profile == "linux":
+        command = f"""set -eu
+index=$(mktemp)
+rm -f "$index"
+trap 'rm -f "$index"' EXIT
+export GIT_INDEX_FILE="$index"
+git -C {shlex.quote(root)} read-tree HEAD
+git -C {shlex.quote(root)} add -A -- .
+tree=$(git -C {shlex.quote(root)} write-tree)
+"""
+        if ref:
+            command += (
+                f"commit=$(printf '%s\\n' pi-cua-sync | "
+                f"git -C {shlex.quote(root)} -c user.name=pi-cua "
+                f'-c user.email=pi-cua@localhost commit-tree "$tree")\n'
+                f'git -C {shlex.quote(root)} update-ref {shlex.quote(ref)} "$commit"\n'
+            )
+        command += "printf '%s\\n' \"$tree\"\n"
+    else:
+        command = f"""$ErrorActionPreference = 'Stop'
+$index = Join-Path $env:TEMP ('cua-sync-' + [guid]::NewGuid().ToString('N'))
+try {{
+  $env:GIT_INDEX_FILE = $index
+  git -C {powershell_literal(root)} read-tree HEAD
+  if ($LASTEXITCODE -ne 0) {{ throw 'git read-tree failed' }}
+  git -C {powershell_literal(root)} add -A -- .
+  if ($LASTEXITCODE -ne 0) {{ throw 'git add failed' }}
+  $tree = (git -C {powershell_literal(root)} write-tree).Trim()
+  if ($LASTEXITCODE -ne 0) {{ throw 'git write-tree failed' }}
+"""
+        if ref:
+            command += f"  $commit = ('pi-cua-sync' | git -C {powershell_literal(root)} -c user.name=pi-cua -c user.email=pi-cua@localhost commit-tree $tree).Trim()\n  git -C {powershell_literal(root)} update-ref {powershell_literal(ref)} $commit\n  if ($LASTEXITCODE -ne 0) {{ throw 'git update-ref failed' }}\n"
+        command += "  Write-Output $tree\n} finally { Remove-Item Env:GIT_INDEX_FILE -ErrorAction SilentlyContinue; Remove-Item -Force $index -ErrorAction SilentlyContinue }\n"
+    tree = run_guest_ssh(name, profile, command, timeout=600).stdout.splitlines()[-1]
+    if not re.fullmatch(r"[0-9a-f]{40,64}", tree):
+        raise RuntimeError("guest Git returned an invalid workspace tree")
+    return tree
+
+
+def workspace_patch(root: Path, base_tree: str, final_tree: str) -> bytes:
+    if not all(
+        re.fullmatch(r"[0-9a-f]{40,64}", tree) for tree in (base_tree, final_tree)
+    ):
+        raise ValueError("workspace diff requires full Git tree IDs")
+    patch = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "diff",
+            "--binary",
+            "--full-index",
+            base_tree,
+            final_tree,
+            "--",
+        ],
+        check=True,
+        capture_output=True,
+        timeout=600,
+    ).stdout
+    if len(patch) > 200 * 1024 * 1024:
+        raise RuntimeError("workspace diff exceeds the 200 MiB limit")
+    return patch
+
+
+def remote_workspace_patch(
+    name: str, profile: str, root: str, base_tree: str, final_tree: str
+) -> bytes:
+    if not all(
+        re.fullmatch(r"[0-9a-f]{40,64}", tree) for tree in (base_tree, final_tree)
+    ):
+        raise ValueError("workspace diff requires full Git tree IDs")
+    command = (
+        f"git -C {shlex.quote(root)} diff --binary --full-index {shlex.quote(base_tree)} {shlex.quote(final_tree)} --"
+        if profile == "linux"
+        else f"git -C {powershell_literal(root)} diff --binary --full-index {base_tree} {final_tree} --"
+    )
+    result = subprocess.run(
+        ["ssh", *ssh_options(profile), f"cua@{name}", command],
+        capture_output=True,
+        timeout=600,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"remote workspace diff failed with exit {result.returncode}: "
+            f"{result.stderr.decode(errors='replace').strip()}"
+        )
+    if len(result.stdout) > 200 * 1024 * 1024:
+        raise RuntimeError("workspace diff exceeds the 200 MiB limit")
+    return result.stdout
+
+
+def apply_workspace_patch(root: Path, patch: bytes, expected_tree: str) -> None:
+    command = ["git", "-C", str(root), "apply", "--binary", "--whitespace=nowarn"]
+    if patch:
+        subprocess.run([*command, "--check"], input=patch, check=True, timeout=300)
+        subprocess.run(command, input=patch, check=True, timeout=300)
+    _, actual_tree = workspace_tree(root)
+    if actual_tree != expected_tree:
+        if patch:
+            subprocess.run(
+                [*command, "--reverse"], input=patch, check=True, timeout=300
+            )
+        raise RuntimeError(
+            "workspace verification failed after applying sandbox changes"
+        )
+
+
+def apply_remote_workspace_patch(
+    name: str,
+    profile: str,
+    root: str,
+    patch: bytes,
+    expected_tree: str,
+    *,
+    reference: str | None = None,
+) -> None:
+    if patch:
+        patch_id = uuid.uuid4().hex
+        remote_path = (
+            f"/tmp/cua-workspace-{patch_id}.patch"
+            if profile == "linux"
+            else rf"C:\Windows\Temp\cua-workspace-{patch_id}.patch"
+        )
+        copy_guest_file(name, profile, patch, remote_path)
+        if profile == "linux":
+            command = f"""set -eu
+trap 'rm -f {shlex.quote(remote_path)}' EXIT
+git -C {shlex.quote(root)} apply --binary --whitespace=nowarn --check {shlex.quote(remote_path)}
+git -C {shlex.quote(root)} apply --binary --whitespace=nowarn {shlex.quote(remote_path)}
+"""
+        else:
+            command = f"""$ErrorActionPreference = 'Stop'
+try {{
+  git -C {powershell_literal(root)} apply --binary --whitespace=nowarn --check {powershell_literal(remote_path)}
+  if ($LASTEXITCODE -ne 0) {{ throw 'git apply check failed' }}
+  git -C {powershell_literal(root)} apply --binary --whitespace=nowarn {powershell_literal(remote_path)}
+  if ($LASTEXITCODE -ne 0) {{ throw 'git apply failed' }}
+}} finally {{
+  Remove-Item -Force -ErrorAction SilentlyContinue {powershell_literal(remote_path)}
+}}
+"""
+        run_guest_ssh(name, profile, command, timeout=600)
+    actual_tree = remote_workspace_tree(name, profile, root, reference=reference)
+    if actual_tree != expected_tree:
+        raise RuntimeError(
+            "workspace verification failed after applying sandbox changes"
+        )
+
+
+def reject_workspace_filters(root: Path) -> None:
+    result = subprocess.run(
+        ["node", "-e", WORKSPACE_FILTER_CHECK, str(root)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise ValueError(result.stderr.strip() or "workspace filter check failed")
+
+
+def inspect_workspace(source_cwd: Path) -> WorkspaceRepository:
     root_text = git_output(source_cwd, "rev-parse", "--show-toplevel")
     root = Path(root_text).resolve()
     resolved_cwd = source_cwd.resolve()
@@ -1402,51 +1695,13 @@ def build_workspace_bundle(
     staged_files = git_output(root, "ls-files", "--stage")
     if any(line.startswith("160000 ") for line in staged_files.splitlines()):
         raise ValueError("workspace transfer does not yet support Git submodules")
+    reject_workspace_filters(root)
 
-    changed = subprocess.run(
-        ["git", "-C", str(root), "diff", "--name-only", "-z", "HEAD"],
-        check=True,
-        capture_output=True,
-        timeout=60,
-    ).stdout.split(b"\0")
-    untracked = subprocess.run(
-        ["git", "-C", str(root), "ls-files", "-z", "--others", "--exclude-standard"],
-        check=True,
-        capture_output=True,
-        timeout=60,
-    ).stdout.split(b"\0")
-    tracked = list(dict.fromkeys([*changed, *untracked])) if include_overlay else []
-    buffer = io.BytesIO()
-    source_bytes = 0
-    with tarfile.open(fileobj=buffer, mode="w:gz", dereference=False) as archive:
-        for raw_path in tracked:
-            if not raw_path:
-                continue
-            relative_path = raw_path.decode("utf-8", "surrogateescape")
-            source = root / relative_path
-            if source.exists() or source.is_symlink():
-                source_bytes += source.lstat().st_size
-                if source_bytes > 200 * 1024 * 1024:
-                    raise ValueError("workspace transfer exceeds the 200 MiB limit")
-                archive.add(source, arcname=relative_path, recursive=False)
-    deleted = subprocess.run(
-        ["git", "-C", str(root), "ls-files", "-z", "--deleted"],
-        check=True,
-        capture_output=True,
-        timeout=60,
-    ).stdout.split(b"\0")
-    deleted_paths = (
-        tuple(path.decode("utf-8", "surrogateescape") for path in deleted if path)
-        if include_overlay
-        else ()
-    )
-    return WorkspaceBundle(
+    return WorkspaceRepository(
         root=root,
         relative_cwd=resolved_cwd.relative_to(root),
         remote_url=remote_url,
         commit=commit,
-        archive=buffer.getvalue(),
-        deleted_paths=deleted_paths,
     )
 
 
@@ -1682,21 +1937,17 @@ def guest_repository_available(
 async def prepare_workspace(
     name: str,
     profile: str,
-    source_cwd: Path,
+    source: WorkspaceRepository,
     workspace_id: str,
-    *,
-    include_overlay: bool = True,
 ) -> str:
-    progress(f"workspace.{name}.bundle", f"capturing {source_cwd}")
-    bundle = build_workspace_bundle(source_cwd, include_overlay=include_overlay)
-    repository_key = hashlib.sha256(bundle.remote_url.encode()).hexdigest()[:20]
+    progress(f"workspace.{name}.baseline", f"preparing {source.root}")
+    repository_key = hashlib.sha256(source.remote_url.encode()).hexdigest()[:20]
     if profile == "linux":
         workspace_root = f"/home/cua/workspaces/{workspace_id}"
-        archive_path = f"/tmp/cua-workspace-{workspace_id}.tgz"
         repository_cache = f"/home/cua/.cache/cua-pi/git/{repository_key}.git"
         snapshot_path = f"/tmp/cua-snapshot-{workspace_id}.tgz"
         use_remote = guest_repository_available(
-            name, profile, repository_cache, bundle.remote_url, bundle.commit
+            name, profile, repository_cache, source.remote_url, source.commit
         )
         if not use_remote:
             progress(
@@ -1704,41 +1955,42 @@ async def prepare_workspace(
                 "origin is unavailable; sending a local commit snapshot",
             )
             copy_guest_file(
-                name, profile, git_snapshot(bundle.root, bundle.commit), snapshot_path
+                name, profile, git_snapshot(source.root, source.commit), snapshot_path
             )
-        copy_guest_file(name, profile, bundle.archive, archive_path)
-        deleted = " ".join(
-            shlex.quote(str(PurePosixPath(workspace_root) / path))
-            for path in bundle.deleted_paths
-        )
         remote_setup = f"""if [ ! -d {shlex.quote(repository_cache)} ]; then
-  git clone --mirror --progress {shlex.quote(bundle.remote_url)} {shlex.quote(repository_cache)}
-elif ! git -C {shlex.quote(repository_cache)} cat-file -e {shlex.quote(bundle.commit + "^{commit}")} 2>/dev/null; then
-  git -C {shlex.quote(repository_cache)} fetch --progress origin {shlex.quote(bundle.commit)}
+  git clone --mirror --progress {shlex.quote(source.remote_url)} {shlex.quote(repository_cache)}
+elif ! git -C {shlex.quote(repository_cache)} cat-file -e {shlex.quote(source.commit + "^{commit}")} 2>/dev/null; then
+  git -C {shlex.quote(repository_cache)} fetch --progress origin {shlex.quote(source.commit)}
 fi
 if [ ! -d {shlex.quote(workspace_root)}/.git ]; then
-  git clone --reference-if-able {shlex.quote(repository_cache)} --dissociate --no-checkout --progress {shlex.quote(bundle.remote_url)} {shlex.quote(workspace_root)}
+  git clone --reference-if-able {shlex.quote(repository_cache)} --dissociate --no-checkout --progress {shlex.quote(source.remote_url)} {shlex.quote(workspace_root)}
 fi
-if ! git -C {shlex.quote(workspace_root)} cat-file -e {shlex.quote(bundle.commit + "^{commit}")} 2>/dev/null; then
-  git -C {shlex.quote(workspace_root)} fetch --depth=1 --progress origin {shlex.quote(bundle.commit)}
+if ! git -C {shlex.quote(workspace_root)} cat-file -e {shlex.quote(source.commit + "^{commit}")} 2>/dev/null; then
+  git -C {shlex.quote(workspace_root)} fetch --depth=1 --progress origin {shlex.quote(source.commit)}
 fi
-git -C {shlex.quote(workspace_root)} checkout --detach --force {shlex.quote(bundle.commit)}"""
-        snapshot_setup = f"""rm -rf {shlex.quote(workspace_root)}
-mkdir -p {shlex.quote(workspace_root)}
+git -C {shlex.quote(workspace_root)} checkout --detach --force {shlex.quote(source.commit)}
+git -C {shlex.quote(workspace_root)} clean -ffd"""
+        snapshot_setup = f"""mkdir -p {shlex.quote(workspace_root)}
+if [ -d {shlex.quote(workspace_root)}/.git ]; then
+  git -C {shlex.quote(workspace_root)} rm -rf --ignore-unmatch -- .
+  git -C {shlex.quote(workspace_root)} clean -ffd
+else
+  git -C {shlex.quote(workspace_root)} init -q
+  git -C {shlex.quote(workspace_root)} config user.name pi-cua
+  git -C {shlex.quote(workspace_root)} config user.email pi-cua@localhost
+fi
 tar -xzf {shlex.quote(snapshot_path)} -C {shlex.quote(workspace_root)}
-git -C {shlex.quote(workspace_root)} init -q
-git -C {shlex.quote(workspace_root)} config user.name pi-cua
-git -C {shlex.quote(workspace_root)} config user.email pi-cua@localhost
 git -C {shlex.quote(workspace_root)} add -A
-git -C {shlex.quote(workspace_root)} -c commit.gpgsign=false commit -qm 'pi-cua workspace baseline'
-git -C {shlex.quote(workspace_root)} remote add origin {shlex.quote(bundle.remote_url)}
+git -C {shlex.quote(workspace_root)} -c commit.gpgsign=false commit --allow-empty -qm 'pi-cua workspace baseline'
+if git -C {shlex.quote(workspace_root)} remote get-url origin >/dev/null 2>&1; then
+  git -C {shlex.quote(workspace_root)} remote set-url origin {shlex.quote(source.remote_url)}
+else
+  git -C {shlex.quote(workspace_root)} remote add origin {shlex.quote(source.remote_url)}
+fi
 rm -f {shlex.quote(snapshot_path)}"""
         command = f"""set -eu
 mkdir -p /home/cua/workspaces /home/cua/.cache/cua-pi/git
 {remote_setup if use_remote else snapshot_setup}
-tar -xzf {shlex.quote(archive_path)} -C {shlex.quote(workspace_root)}
-rm -f {deleted}
-rm -f {shlex.quote(archive_path)}
 """
         run_guest_ssh(
             name,
@@ -1749,15 +2001,14 @@ rm -f {shlex.quote(archive_path)}
         )
         return str(
             PurePosixPath(workspace_root)
-            / PurePosixPath(bundle.relative_cwd.as_posix())
+            / PurePosixPath(source.relative_cwd.as_posix())
         )
 
     workspace_root = rf"C:\cua\workspaces\{workspace_id}"
-    archive_path = rf"C:\Windows\Temp\cua-workspace-{workspace_id}.tgz"
     repository_cache = rf"C:\cua\cache\git\{repository_key}.git"
     snapshot_path = rf"C:\Windows\Temp\cua-snapshot-{workspace_id}.tgz"
     use_remote = guest_repository_available(
-        name, profile, repository_cache, bundle.remote_url, bundle.commit
+        name, profile, repository_cache, source.remote_url, source.commit
     )
     if not use_remote:
         progress(
@@ -1765,36 +2016,34 @@ rm -f {shlex.quote(archive_path)}
             "origin is unavailable; sending a local commit snapshot",
         )
         copy_guest_file(
-            name, profile, git_snapshot(bundle.root, bundle.commit), snapshot_path
+            name, profile, git_snapshot(source.root, source.commit), snapshot_path
         )
-    copy_guest_file(name, profile, bundle.archive, archive_path)
-    deleted_commands = "; ".join(
-        f"Remove-Item -Force -Recurse -ErrorAction SilentlyContinue {powershell_literal(str(PureWindowsPath(workspace_root) / PureWindowsPath(path)))}"
-        for path in bundle.deleted_paths
-    )
-    remote_setup = f"""if (-not (Test-Path $cache)) {{ git clone --mirror {powershell_literal(bundle.remote_url)} $cache }} else {{ git -C $cache cat-file -e '{bundle.commit}^{{commit}}' 2>$null; if ($LASTEXITCODE -ne 0) {{ git -C $cache fetch origin {bundle.commit} }} }}
-if (-not (Test-Path "$root\\.git")) {{ git clone --reference-if-able $cache --dissociate --no-checkout {powershell_literal(bundle.remote_url)} $root }}
-git -C $root cat-file -e '{bundle.commit}^{{commit}}' 2>$null
-if ($LASTEXITCODE -ne 0) {{ git -C $root fetch --depth=1 origin {bundle.commit} }}
-git -C $root checkout --detach --force {bundle.commit}"""
-    snapshot_setup = f"""Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $root
-New-Item -ItemType Directory -Force -Path $root | Out-Null
+    remote_setup = f"""if (-not (Test-Path $cache)) {{ git clone --mirror {powershell_literal(source.remote_url)} $cache }} else {{ git -C $cache cat-file -e '{source.commit}^{{commit}}' 2>$null; if ($LASTEXITCODE -ne 0) {{ git -C $cache fetch origin {source.commit} }} }}
+if (-not (Test-Path "$root\\.git")) {{ git clone --reference-if-able $cache --dissociate --no-checkout {powershell_literal(source.remote_url)} $root }}
+git -C $root cat-file -e '{source.commit}^{{commit}}' 2>$null
+if ($LASTEXITCODE -ne 0) {{ git -C $root fetch --depth=1 origin {source.commit} }}
+git -C $root checkout --detach --force {source.commit}
+git -C $root clean -ffd"""
+    snapshot_setup = f"""New-Item -ItemType Directory -Force -Path $root | Out-Null
+if (Test-Path "$root\\.git") {{
+  git -C $root rm -rf --ignore-unmatch -- .
+  git -C $root clean -ffd
+}} else {{
+  git -C $root init -q
+  git -C $root config user.name pi-cua
+  git -C $root config user.email pi-cua@localhost
+}}
 tar.exe -xzf {powershell_literal(snapshot_path)} -C $root
-git -C $root init -q
-git -C $root config user.name pi-cua
-git -C $root config user.email pi-cua@localhost
 git -C $root add -A
-git -C $root -c commit.gpgsign=false commit -qm 'pi-cua workspace baseline'
-git -C $root remote add origin {powershell_literal(bundle.remote_url)}
+git -C $root -c commit.gpgsign=false commit --allow-empty -qm 'pi-cua workspace baseline'
+git -C $root remote get-url origin 2>$null | Out-Null
+if ($LASTEXITCODE -eq 0) {{ git -C $root remote set-url origin {powershell_literal(source.remote_url)} }} else {{ git -C $root remote add origin {powershell_literal(source.remote_url)} }}
 Remove-Item -Force {powershell_literal(snapshot_path)}"""
     script = f"""$ErrorActionPreference = 'Stop'
 $root = {powershell_literal(workspace_root)}
 $cache = {powershell_literal(repository_cache)}
 New-Item -ItemType Directory -Force -Path 'C:\\cua\\workspaces','C:\\cua\\cache\\git' | Out-Null
 {remote_setup if use_remote else snapshot_setup}
-tar.exe -xzf {powershell_literal(archive_path)} -C $root
-{deleted_commands}
-Remove-Item -Force {powershell_literal(archive_path)}
 """
     script_path = rf"C:\Windows\Temp\cua-workspace-{workspace_id}.ps1"
     copy_guest_file(name, profile, script.encode("utf-8-sig"), script_path)
@@ -1805,7 +2054,7 @@ Remove-Item -Force {powershell_literal(archive_path)}
         timeout=1800,
         stream_phase=f"workspace.{name}.sync",
     )
-    relative_windows = PureWindowsPath(*bundle.relative_cwd.parts)
+    relative_windows = PureWindowsPath(*source.relative_cwd.parts)
     return str(PureWindowsPath(workspace_root) / relative_windows)
 
 
@@ -1831,121 +2080,146 @@ if ($cwd.Equals($root, [StringComparison]::OrdinalIgnoreCase)) {{ Write-Output '
     return lines[-2], lines[-1]
 
 
-def transfer_workspace(
-    source_name: str,
-    source_profile: str,
-    source_cwd: str,
-    target_name: str,
-    target_profile: str,
-    workspace_id: str,
-) -> str:
-    source_root, relative = workspace_location(source_name, source_profile, source_cwd)
-    source_command = (
-        f"tar -czf - -C {shlex.quote(source_root)} ."
-        if source_profile == "linux"
-        else f"tar.exe -czf - -C {powershell_literal(source_root)} ."
+def capture_local_workspace(repository: WorkspaceRepository) -> WorkspaceTransfer:
+    local_root, baseline_tree = workspace_tree(repository.root)
+    commit_tree = git_output(local_root, "rev-parse", "HEAD^{tree}")
+    state = WorkspaceState(
+        version=1,
+        localRoot=str(local_root),
+        commit=repository.commit,
+        commitTree=commit_tree,
+        baselineTree=baseline_tree,
     )
-    if target_profile == "linux":
-        destination = f"/home/cua/workspaces/{workspace_id}"
-        staging = f"{destination}.staging"
-        backup = f"{destination}.backup"
-        target_command = f"""set -eu
-rm -rf {shlex.quote(staging)} {shlex.quote(backup)}
-mkdir -p {shlex.quote(staging)}
-tar -xzf - -C {shlex.quote(staging)}
-if [ -e {shlex.quote(destination)} ]; then mv {shlex.quote(destination)} {shlex.quote(backup)}; fi
-if mv {shlex.quote(staging)} {shlex.quote(destination)}; then
-  rm -rf {shlex.quote(backup)}
-else
-  if [ -e {shlex.quote(backup)} ]; then mv {shlex.quote(backup)} {shlex.quote(destination)}; fi
-  exit 1
-fi
-"""
-        remote_cwd = str(PurePosixPath(destination) / PurePosixPath(relative))
-    else:
-        destination = rf"C:\cua\workspaces\{workspace_id}"
-        staging = f"{destination}.staging"
-        backup = f"{destination}.backup"
-        target_command = rf"""$ErrorActionPreference = 'Stop'
-$stage = {powershell_literal(staging)}
-$destination = {powershell_literal(destination)}
-$backup = {powershell_literal(backup)}
-Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $stage,$backup
-New-Item -ItemType Directory -Force -Path $stage | Out-Null
-tar.exe -xzf - -C $stage
-if (Test-Path $destination) {{ Move-Item $destination $backup }}
-try {{ Move-Item $stage $destination; Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $backup }}
-catch {{ if (Test-Path $backup) {{ Move-Item $backup $destination }}; throw }}
-"""
-        remote_cwd = str(PureWindowsPath(destination) / PureWindowsPath(relative))
+    return WorkspaceTransfer(
+        state=state,
+        baseline_patch=workspace_patch(local_root, commit_tree, baseline_tree),
+        current_patch=b"",
+        final_tree=baseline_tree,
+    )
 
-    progress(f"workspace.{target_name}.transfer", f"copying from {source_name}")
-    with (
-        tempfile.TemporaryFile() as source_error,
-        tempfile.TemporaryFile() as target_error,
-    ):
-        source = subprocess.Popen(
-            [
-                "ssh",
-                *ssh_options(source_profile),
-                f"cua@{source_name}",
-                source_command,
-            ],
-            stdout=subprocess.PIPE,
-            stderr=source_error,
+
+def capture_sandbox_delta(
+    source: SandboxWorkspaceSource,
+) -> tuple[str, bytes, str]:
+    state = source["state"]
+    source_root, _ = workspace_location(
+        source["address"], source["os"], source["remoteCwd"]
+    )
+    final_tree = remote_workspace_tree(source["address"], source["os"], source_root)
+    patch = remote_workspace_patch(
+        source["address"],
+        source["os"],
+        source_root,
+        state["baselineTree"],
+        final_tree,
+    )
+    return source_root, patch, final_tree
+
+
+def capture_sandbox_workspace(source: SandboxWorkspaceSource) -> WorkspaceTransfer:
+    state = source["state"]
+    source_root, current_patch, final_tree = capture_sandbox_delta(source)
+    return WorkspaceTransfer(
+        state=state,
+        baseline_patch=remote_workspace_patch(
+            source["address"],
+            source["os"],
+            source_root,
+            state["commitTree"],
+            state["baselineTree"],
+        ),
+        current_patch=current_patch,
+        final_tree=final_tree,
+    )
+
+
+def restore_sandbox_workspace(
+    name: str,
+    profile: str,
+    root: str,
+    transfer: WorkspaceTransfer,
+    reference: str,
+) -> None:
+    commit_tree = remote_workspace_tree(
+        name, profile, root, reference=f"{reference}/commit"
+    )
+    if commit_tree != transfer.state["commitTree"]:
+        raise RuntimeError("destination workspace does not match the Git baseline")
+    apply_remote_workspace_patch(
+        name,
+        profile,
+        root,
+        transfer.baseline_patch,
+        transfer.state["baselineTree"],
+        reference=f"{reference}/workspace",
+    )
+    progress("workspace.destination.apply", "applying current workspace changes")
+    apply_remote_workspace_patch(
+        name,
+        profile,
+        root,
+        transfer.current_patch,
+        transfer.final_tree,
+    )
+
+
+def sync_workspace_to_local(
+    source: SandboxWorkspaceSource, local_cwd: str
+) -> dict[str, Any]:
+    workspace_state = source["state"]
+    local_root = Path(workspace_state["localRoot"]).resolve()
+    requested_root = Path(
+        git_output(Path(local_cwd), "rev-parse", "--show-toplevel")
+    ).resolve()
+    if requested_root != local_root:
+        raise RuntimeError("local workspace path changed since sandbox activation")
+
+    progress("workspace.local.verify", "checking the local workspace baseline")
+    _, local_tree = workspace_tree(local_root)
+    if local_tree != workspace_state["baselineTree"]:
+        raise RuntimeError(
+            "local workspace changed while the sandbox was active; restore it to the departure state before syncing"
         )
-        assert source.stdout is not None
-        target = subprocess.Popen(
-            [
-                "ssh",
-                *ssh_options(target_profile),
-                f"cua@{target_name}",
-                target_command,
-            ],
-            stdin=source.stdout,
-            stdout=target_error,
-            stderr=target_error,
-        )
-        source.stdout.close()
-        try:
-            target_code = target.wait(timeout=1800)
-            source_code = source.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            source.kill()
-            target.kill()
-            raise RuntimeError("workspace transfer timed out") from None
-        if source_code != 0 or target_code != 0:
-            source_error.seek(0)
-            target_error.seek(0)
-            detail = (source_error.read() + target_error.read()).decode(
-                errors="replace"
-            )
-            raise RuntimeError(
-                f"workspace transfer failed (source={source_code}, target={target_code}): {detail.strip()}"
-            )
-    return remote_cwd
+
+    progress("workspace.local.diff", "capturing sandbox changes")
+    _, current_patch, final_tree = capture_sandbox_delta(source)
+    progress(
+        "workspace.local.apply",
+        f"applying {len(current_patch) / 1048576:.1f} MiB of sandbox changes",
+    )
+    try:
+        apply_workspace_patch(local_root, current_patch, final_tree)
+    except subprocess.CalledProcessError as error:
+        raise RuntimeError(
+            "sandbox changes do not apply cleanly to the local workspace"
+        ) from error
+    return {"local_cwd": local_cwd, "changed": bool(current_patch)}
 
 
 async def prepare_execution(
     name: str,
     source_cwd: str,
     workspace_key: str,
-    source_sandbox: str | None = None,
-    source_profile: str | None = None,
-    source_address: str | None = None,
-    source_remote_cwd: str | None = None,
-    include_local_overlay: bool = True,
+    source: SandboxWorkspaceSource | None = None,
     tool_packages: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     states = {item["name"]: item for item in local_states()}
     if name not in states:
         raise ValueError(f"unknown managed sandbox: {name}")
     profile = states[name]["os"]
-    if source_sandbox:
-        if source_sandbox not in states:
-            raise ValueError(f"unknown source sandbox: {source_sandbox}")
-        if source_profile != states[source_sandbox]["os"]:
-            raise ValueError("source sandbox operating system mismatch")
+    repository = inspect_workspace(Path(source_cwd).expanduser().resolve())
+    transfer = (
+        capture_sandbox_workspace(source)
+        if source
+        else capture_local_workspace(repository)
+    )
+    if source:
+        repository = WorkspaceRepository(
+            root=repository.root,
+            relative_cwd=repository.relative_cwd,
+            remote_url=repository.remote_url,
+            commit=transfer.state["commit"],
+        )
     address = healthy_over_ssh(states[name].get("address") or name, profile)
     if address is None:
         tailnet = local_tailscale_identity()
@@ -1963,31 +2237,24 @@ async def prepare_execution(
         finally:
             await disconnect_safely(sb)
 
+    reference = hashlib.sha256(workspace_key.encode()).hexdigest()[:32]
     sync_guest_packages(address, profile, tool_packages)
     workspace_id = hashlib.sha256(workspace_key.encode()).hexdigest()[:16]
-    remote_cwd = (
-        transfer_workspace(
-            source_address or source_sandbox,
-            source_profile,
-            source_remote_cwd,
-            address,
-            profile,
-            workspace_id,
-        )
-        if source_sandbox and source_profile and source_remote_cwd
-        else await prepare_workspace(
-            address,
-            profile,
-            Path(source_cwd).expanduser().resolve(),
-            workspace_id,
-            include_overlay=include_local_overlay,
-        )
+    remote_cwd = await prepare_workspace(
+        address,
+        profile,
+        repository,
+        workspace_id,
     )
+    progress("workspace.baseline", "reconstructing the destination workspace")
+    remote_root, _ = workspace_location(address, profile, remote_cwd)
+    restore_sandbox_workspace(address, profile, remote_root, transfer, reference)
     return {
         "name": name,
         "os": profile,
         "address": address,
         "remote_cwd": remote_cwd,
+        "workspace_state": transfer.state,
     }
 
 
@@ -2019,6 +2286,12 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         return operation_status(str(request.get("operation_id") or ""))
     if action == "operation_cancel":
         return cancel_operation(str(request.get("operation_id") or ""))
+    if action == "sync_workspace_to_local":
+        local_cwd = request.get("local_cwd")
+        if not isinstance(local_cwd, str) or not local_cwd:
+            raise TypeError("sync_workspace_to_local requires local_cwd")
+        source = require_sandbox_source(request.get("source"))
+        return sync_workspace_to_local(source, local_cwd)
     configure_fleet_auth()
     if action == "create":
         return await create_one(str(request.get("os") or ""), request.get("name"))
@@ -2030,11 +2303,10 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         workspace_key = request.get("workspace_id")
         if not isinstance(workspace_key, str) or not workspace_key:
             raise ValueError("prepare_execution requires workspace_id")
-        source_sandbox = request.get("source_sandbox")
-        source_os = request.get("source_os")
-        source_address = request.get("source_address")
-        source_remote_cwd = request.get("source_remote_cwd")
-        include_local_overlay = request.get("include_local_overlay", True)
+        source_value = request.get("source")
+        source = (
+            require_sandbox_source(source_value) if source_value is not None else None
+        )
         tool_packages = request.get("tool_packages", [])
         if not isinstance(tool_packages, list) or any(
             not isinstance(package, str)
@@ -2043,25 +2315,11 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
             for package in tool_packages
         ):
             raise TypeError("tool_packages contains an unsupported package source")
-        if not isinstance(include_local_overlay, bool):
-            raise TypeError("include_local_overlay must be a boolean")
-        if source_sandbox is not None and not isinstance(source_sandbox, str):
-            raise TypeError("source_sandbox must be a string")
-        if source_os is not None and source_os not in {"linux", "windows"}:
-            raise TypeError("source_os must be linux or windows")
-        if source_address is not None and not isinstance(source_address, str):
-            raise TypeError("source_address must be a string")
-        if source_remote_cwd is not None and not isinstance(source_remote_cwd, str):
-            raise TypeError("source_remote_cwd must be a string")
         return await prepare_execution(
             str(request.get("name") or ""),
             str(request.get("source_cwd") or ""),
             workspace_key,
-            source_sandbox,
-            source_os,
-            source_address,
-            source_remote_cwd,
-            include_local_overlay,
+            source,
             tuple(dict.fromkeys(tool_packages)),
         )
     raise ValueError(
@@ -2070,7 +2328,7 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
 
 
 def ensure_cloud_runtime(action: object, request: dict[str, Any]) -> None:
-    cloud_actions = LONG_ACTIONS
+    cloud_actions = LONG_ACTIONS - {"sync_workspace_to_local"}
     if (
         action not in cloud_actions
         or importlib.util.find_spec("cua_sandbox") is not None
