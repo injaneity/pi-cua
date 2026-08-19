@@ -1,12 +1,5 @@
 import {
   DynamicBorder,
-  createBashToolDefinition,
-  createEditToolDefinition,
-  createFindToolDefinition,
-  createGrepToolDefinition,
-  createLsToolDefinition,
-  createReadToolDefinition,
-  createWriteToolDefinition,
   type AgentToolResult,
   type BashOperations,
   type ExtensionAPI,
@@ -326,15 +319,46 @@ class ToolBridge {
     return this.remoteTools.get(name);
   }
 
-  async refresh(expectedTools: string[]): Promise<void> {
+  private async request<T>(
+    id: string,
+    message: Record<string, unknown>,
+    options: {
+      signal?: AbortSignal;
+      onUpdate?: (update: ToolUpdate) => void;
+      onData?: (data: Buffer) => void;
+    } = {},
+  ): Promise<T> {
     await this.start();
-    const id = `manifest-${++this.sequence}`;
-    const tools = await new Promise<RemoteToolInfo[]>((resolve, reject) => {
+    if (options.signal?.aborted) throw new Error("aborted");
+    return new Promise<T>((resolve, reject) => {
+      const finish = (callback: () => void) => {
+        options.signal?.removeEventListener("abort", onAbort);
+        callback();
+      };
+      const onAbort = () => this.send({ type: "cancel", id });
+      options.signal?.addEventListener("abort", onAbort, { once: true });
       this.pending.set(id, {
-        resolve: (value) => resolve(value as RemoteToolInfo[]),
-        reject,
+        resolve: (value) => finish(() => resolve(value as T)),
+        reject: (error) => finish(() => reject(error)),
+        onUpdate: options.onUpdate,
+        onData: options.onData,
       });
-      this.send({ type: "manifest", id });
+      try {
+        this.send(message);
+      } catch (error) {
+        this.pending.delete(id);
+        finish(() =>
+          reject(error instanceof Error ? error : new Error(String(error))),
+        );
+      }
+    });
+  }
+
+  async refresh(expectedTools: string[]): Promise<void> {
+    const id = `manifest-${++this.sequence}`;
+    const tools = await this.request<RemoteToolInfo[]>(id, {
+      type: "manifest",
+      id,
     });
     const names = new Set(tools.map((item) => item.name));
     const missing = expectedTools.filter((name) => !names.has(name));
@@ -345,41 +369,24 @@ class ToolBridge {
     for (const item of tools) this.remoteTools.set(item.name, item);
   }
 
-  async execute(
+  execute(
     toolName: string,
     id: string,
     input: unknown,
     signal: AbortSignal | undefined,
     onUpdate: ((update: ToolUpdate) => void) | undefined,
   ): Promise<AgentToolResult<unknown>> {
-    await this.start();
-    return new Promise<AgentToolResult<unknown>>((resolve, reject) => {
-      const onAbort = () => this.send({ type: "cancel", id });
-      signal?.addEventListener("abort", onAbort, { once: true });
-      this.pending.set(id, {
-        resolve: (value) => {
-          signal?.removeEventListener("abort", onAbort);
-          resolve(value as AgentToolResult<unknown>);
-        },
-        reject: (error) => {
-          signal?.removeEventListener("abort", onAbort);
-          reject(error);
-        },
+    return this.request(
+      id,
+      { type: "execute", id, tool: toolName, input },
+      {
+        signal,
         onUpdate,
-      });
-      try {
-        this.send({ type: "execute", id, tool: toolName, input });
-      } catch (error) {
-        const pending = this.pending.get(id);
-        this.pending.delete(id);
-        pending?.reject(
-          error instanceof Error ? error : new Error(String(error)),
-        );
-      }
-    });
+      },
+    );
   }
 
-  async bash(
+  bash(
     id: string,
     command: string,
     options: {
@@ -388,31 +395,11 @@ class ToolBridge {
       timeout?: number;
     },
   ): Promise<{ exitCode: number | null }> {
-    await this.start();
-    return new Promise((resolve, reject) => {
-      const onAbort = () => this.send({ type: "cancel", id });
-      options.signal?.addEventListener("abort", onAbort, { once: true });
-      this.pending.set(id, {
-        resolve: (value) => {
-          options.signal?.removeEventListener("abort", onAbort);
-          resolve(value as { exitCode: number | null });
-        },
-        reject: (error) => {
-          options.signal?.removeEventListener("abort", onAbort);
-          reject(error);
-        },
-        onData: options.onData,
-      });
-      try {
-        this.send({ type: "bash", id, command, timeout: options.timeout });
-      } catch (error) {
-        const pending = this.pending.get(id);
-        this.pending.delete(id);
-        pending?.reject(
-          error instanceof Error ? error : new Error(String(error)),
-        );
-      }
-    });
+    return this.request(
+      id,
+      { type: "bash", id, command, timeout: options.timeout },
+      options,
+    );
   }
 
   close(): void {
@@ -837,18 +824,9 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     }
   }
 
-  function installProxies(ctx: UIContext): void {
+  function installProxies(): void {
     if (target.kind !== "sandbox") return;
     const active = pi.getActiveTools();
-    const builtin = new Map<string, AnyToolDefinition>([
-      ["read", createReadToolDefinition(ctx.cwd)],
-      ["write", createWriteToolDefinition(ctx.cwd)],
-      ["edit", createEditToolDefinition(ctx.cwd)],
-      ["bash", createBashToolDefinition(ctx.cwd)],
-      ["grep", createGrepToolDefinition(ctx.cwd)],
-      ["find", createFindToolDefinition(ctx.cwd)],
-      ["ls", createLsToolDefinition(ctx.cwd)],
-    ]);
     for (const info of pi.getAllTools()) {
       if (localTools.has(info.name)) continue;
       const owned = info.sourceInfo.path.startsWith(extensionDir);
@@ -856,14 +834,8 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       const remote = bridge?.definition(info.name);
       if (!remote)
         throw new Error(`remote tool metadata missing: ${info.name}`);
-      const definition: AnyToolDefinition = builtin.get(info.name) ?? {
-        ...remote,
-        async execute() {
-          throw new Error("unreachable");
-        },
-      };
       pi.registerTool({
-        ...definition,
+        ...remote,
         async execute(id, input, signal, onUpdate) {
           if (target.kind !== "sandbox" || !bridge) {
             throw new Error(`${info.name} has no active sandbox`);
@@ -900,7 +872,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     bridge?.close();
     target = next;
     bridge = nextBridge;
-    if (next.kind === "sandbox") installProxies(ctx);
+    if (next.kind === "sandbox") installProxies();
     ctx.ui.setStatus("cua-session", undefined);
     pi.events.emit("cua:execution-target-changed", next);
   }
@@ -1040,7 +1012,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     if (target.kind !== "sandbox" || !bridge) return;
     const expectedTools = captureToolProviders();
     await bridge.refresh(expectedTools);
-    installProxies(ctx);
+    installProxies();
     const localCwd = `Current working directory: ${target.localCwd}`;
     const environment = `Execution environment: ${target.os}. All tools and user shell commands run in ${target.os}; use relative workspace paths and answer environment questions for ${target.os}.`;
     return {

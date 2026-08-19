@@ -648,19 +648,9 @@ def tailscale_api(
 
 
 def local_tailscale_identity() -> str:
-    try:
-        process = subprocess.run(
-            ["tailscale", "status", "--json"],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        status = json.loads(process.stdout)
-    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as error:
-        raise RuntimeError(
-            f"local Tailscale status failed: {error_text(error)}"
-        ) from error
+    status = local_tailscale_status()
+    if status is None:
+        raise RuntimeError("local Tailscale status failed")
     tailnet = (status.get("CurrentTailnet") or {}).get("Name")
     online = (status.get("Self") or {}).get("Online") is True
     if status.get("BackendState") != "Running" or not online:
@@ -757,17 +747,24 @@ async def guest_tailscale_identity(sb: Any, profile: str) -> tuple[str, str, lis
     return tailnet, hostname, tags
 
 
-def local_tailscale_peer(name: str, address: str) -> dict[str, Any] | None:
+def local_tailscale_status(timeout: float = 10) -> dict[str, Any] | None:
     try:
         process = subprocess.run(
             ["tailscale", "status", "--json"],
             check=True,
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=timeout,
         )
         status = json.loads(process.stdout)
+        return status if isinstance(status, dict) else None
     except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return None
+
+
+def local_tailscale_peer(address: str) -> dict[str, Any] | None:
+    status = local_tailscale_status()
+    if status is None:
         return None
     peers = (status.get("Peer") or {}).values()
     for peer in peers:
@@ -839,7 +836,7 @@ async def verify_tailscale_enrollment(
     deadline = time.monotonic() + 90
     peer = None
     while time.monotonic() < deadline:
-        peer = local_tailscale_peer(name, address)
+        peer = local_tailscale_peer(address)
         if peer is not None:
             break
         await asyncio.sleep(3)
@@ -860,16 +857,8 @@ async def verify_tailscale_enrollment(
 
 
 def online_tailscale_hosts() -> set[str]:
-    try:
-        proc = subprocess.run(
-            ["tailscale", "status", "--json"],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=3,
-        )
-        status = json.loads(proc.stdout)
-    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+    status = local_tailscale_status(timeout=3)
+    if status is None:
         return set()
     peers = [status.get("Self") or {}, *(status.get("Peer") or {}).values()]
     online = set()
@@ -1455,15 +1444,15 @@ def ssh_options(profile: str) -> list[str]:
 
 def healthy_over_ssh(name: str, profile: str) -> str | None:
     try:
-        command = guest_health_command(profile)
-        result = subprocess.run(
-            ["ssh", *ssh_options(profile), f"cua@{name}", command],
-            capture_output=True,
-            text=True,
+        result = run_guest_ssh(
+            name,
+            profile,
+            guest_health_command(profile),
             timeout=15,
             check=False,
+            report=False,
         )
-    except subprocess.TimeoutExpired:
+    except (OSError, RuntimeError):
         return None
     lines = result.stdout.strip().splitlines() if result.returncode == 0 else []
     return lines[-1] if lines else None
@@ -1476,8 +1465,11 @@ def run_guest_ssh(
     *,
     timeout: int,
     stream_phase: str | None = None,
+    check: bool = True,
+    report: bool = True,
 ) -> subprocess.CompletedProcess[str]:
-    progress(f"ssh.{name}", "running remote command")
+    if report:
+        progress(f"ssh.{name}", "running remote command")
     argv = ["ssh", *ssh_options(profile), f"cua@{name}", command]
     if stream_phase is None:
         try:
@@ -1488,7 +1480,7 @@ def run_guest_ssh(
             raise RuntimeError(
                 f"SSH command on {name} timed out after {timeout} seconds"
             ) from error
-        if result.returncode != 0:
+        if check and result.returncode != 0:
             raise RuntimeError(
                 f"SSH command on {name} failed with exit {result.returncode}: "
                 f"{(result.stderr or result.stdout).strip()}"
@@ -1530,7 +1522,7 @@ def run_guest_ssh(
             break
     returncode = process.wait()
     text_output = output.decode(errors="replace")
-    if returncode != 0:
+    if check and returncode != 0:
         raise RuntimeError(
             f"SSH command on {name} failed with exit {returncode}: "
             f"{text_output.strip()[-2000:]}"
@@ -1543,18 +1535,19 @@ def guest_file_size(name: str, profile: str, remote_path: str) -> int | None:
     command = (
         f"stat -c %s {shlex.quote(remote_path)} 2>/dev/null || echo 0"
         if profile == "linux"
-        else f"(Get-Item -LiteralPath '{remote_path}' -ErrorAction SilentlyContinue).Length"
+        else f"(Get-Item -LiteralPath {powershell_literal(remote_path)} -ErrorAction SilentlyContinue).Length"
     )
     try:
-        result = subprocess.run(
-            ["ssh", *ssh_options(profile), f"cua@{name}", command],
-            capture_output=True,
-            text=True,
+        result = run_guest_ssh(
+            name,
+            profile,
+            command,
             timeout=10,
             check=False,
+            report=False,
         )
         return int(result.stdout.strip().splitlines()[-1])
-    except (subprocess.SubprocessError, OSError, ValueError, IndexError):
+    except (OSError, RuntimeError, ValueError, IndexError):
         return None
 
 
