@@ -77,6 +77,22 @@ const children = new Map();
 const write = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
 const tool = (name) =>
   session.agent.state.tools.find((candidate) => candidate.name === name);
+const manifest = () =>
+  session.getAllTools().map((item) => {
+    const definition = session.getToolDefinition(item.name);
+    const active = tool(item.name);
+    return {
+      name: item.name,
+      label: active?.label ?? item.name,
+      description: definition?.description ?? item.description,
+      promptSnippet: definition?.promptSnippet,
+      promptGuidelines: definition?.promptGuidelines,
+      parameters: definition?.parameters ?? item.parameters,
+      constrainedSampling: definition?.constrainedSampling,
+      renderShell: definition?.renderShell,
+      executionMode: definition?.executionMode,
+    };
+  });
 
 async function execute(request) {
   const selected = tool(request.tool);
@@ -177,6 +193,10 @@ function handle(request) {
     bash(request);
     return;
   }
+  if (request.type === "manifest" && typeof request.id === "string") {
+    write({ type: "manifest", id: request.id, tools: manifest() });
+    return;
+  }
   if (request.type === "cancel" && typeof request.id === "string") {
     controllers.get(request.id)?.abort();
     children.get(request.id)?.kill("SIGKILL");
@@ -216,22 +236,4 @@ async function shutdown() {
 
 process.stdin.on("end", () => void shutdown());
 
-write({
-  type: "ready",
-  protocol: protocolVersion,
-  tools: session.getAllTools().map((item) => {
-    const definition = session.getToolDefinition(item.name);
-    const active = tool(item.name);
-    return {
-      name: item.name,
-      label: active?.label ?? item.name,
-      description: definition?.description ?? item.description,
-      promptSnippet: definition?.promptSnippet,
-      promptGuidelines: definition?.promptGuidelines,
-      parameters: definition?.parameters ?? item.parameters,
-      constrainedSampling: definition?.constrainedSampling,
-      renderShell: definition?.renderShell,
-      executionMode: definition?.executionMode,
-    };
-  }),
-});
+write({ type: "ready", protocol: protocolVersion, tools: manifest() });

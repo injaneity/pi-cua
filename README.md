@@ -8,7 +8,7 @@ pi's tui, agent, model, and conversation sessions stay local. each local session
 pi install git:github.com/injaneity/pi-cua
 ```
 
-this package currently targets macos controllers, CUA Fleet pools named `cua-pi-linux` and `cua-pi-windows`, and a Tailscale network with the `tag:cua-sandbox` ACL tag. store the CUA Fleet and Tailscale OAuth credentials in Keychain:
+this package currently targets macos controllers with `uv` and the Tailscale CLI installed. the controller must be online in a Tailscale network with the `tag:cua-sandbox` ACL tag. its OAuth client must be allowed to create auth keys for that tag, and the tailnet ACL must allow the controller to reach tagged guests, including Tailscale SSH for linux. CUA Fleet pools default to `cua-pi-linux` and `cua-pi-windows`; fleet pool/namespace names are a tenant-wide authorization boundary — if another tenant already owns a default name, pool operations fail with a persistent 403; set `CUA_PI_LINUX_POOL` and `CUA_PI_WINDOWS_POOL` to unclaimed names for your tenant. store the CUA Fleet and Tailscale OAuth credentials in Keychain:
 
 ```bash
 security add-generic-password -U -s cua-sandbox-fleet-api -a client-id -w "$CUA_CLIENT_ID"
@@ -56,7 +56,7 @@ pi-cua emits `cua:execution-target-changed` with local, connecting, and ready ta
 
 the guest receives the pi sdk version, only the user packages that own routed tools, top-level extension definitions, and the generic tool host. the host activates lifecycle handlers only for extensions that own required tools. it does not receive local model credentials, prompts, conversation sessions, or the sandbox controller.
 
-workspace preparation requires a git repository with a network `origin` and does not support submodules. new threads and existing local threads carry the local overlay, limited to 200 mib; forks intentionally omit it. guests keep a bare repository cache outside all workspaces, so fresh sessions and forks reuse git objects without sharing mutable files. package-manager caches also remain in the guest user profile. sandbox-to-sandbox handoff for the same thread streams the complete workspace, including `.git` and untracked files, over ssh.
+workspace preparation requires a git repository with a network `origin` and does not support submodules. if the guest cannot authenticate to the origin, the controller sends a clean commit snapshot and creates an isolated baseline without copying git credentials. new threads and existing local threads carry the local overlay, limited to 200 mib; forks intentionally omit it. guests keep a bare repository cache outside all workspaces, so fresh sessions and forks reuse git objects without sharing mutable files. package-manager caches also remain in the guest user profile. sandbox-to-sandbox handoff for the same thread streams the complete workspace, including `.git` and untracked files, over ssh.
 
 ## verification
 
