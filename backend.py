@@ -1477,10 +1477,11 @@ def workspace_tree(source: Path) -> tuple[Path, str]:
 
 WORKSPACE_FILTER_CHECK = r"""const { spawnSync } = require('node:child_process');
 const root = process.argv[1];
+const maxBuffer = 256 * 1024 * 1024;
 const run = (args, input) => {
-  const result = spawnSync('git', ['-C', root, ...args], { input });
-  if (result.status !== 0) {
-    process.stderr.write(result.stderr);
+  const result = spawnSync('git', ['-C', root, ...args], { input, maxBuffer });
+  if (result.error || result.status !== 0) {
+    process.stderr.write(result.stderr ?? Buffer.from(result.error?.message ?? 'git failed'));
     process.exit(result.status ?? 1);
   }
   return result.stdout;
