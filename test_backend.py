@@ -14,6 +14,26 @@ from unittest.mock import patch
 import backend
 
 
+class ImageSelectionTests(unittest.TestCase):
+    def test_builtin_and_registry_images(self) -> None:
+        default = backend.PROFILES["linux"]["image"]
+        self.assertEqual(backend.normalize_image("linux", "linux"), default)
+        self.assertEqual(
+            backend.normalize_image("linux", "oci://ghcr.io/acme/linux:64gb"),
+            "ghcr.io/acme/linux:64gb",
+        )
+
+    def test_registry_image_requires_matching_os_and_reference(self) -> None:
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            backend.normalize_image("linux", "windows")
+        with self.assertRaisesRegex(ValueError, "OCI registry reference"):
+            backend.normalize_image("linux", "ubuntu:24.04")
+        self.assertEqual(
+            backend.normalize_image("linux", "https://registry.example/linux:64gb"),
+            "registry.example/linux:64gb",
+        )
+
+
 class LocalStateTests(unittest.TestCase):
     def test_only_managed_fleet_claims_are_listed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -253,6 +253,7 @@ def database() -> Iterator[sqlite3.Connection]:
             tailscale_tailnet TEXT,
             tailscale_device_id TEXT,
             tailscale_addresses TEXT,
+            image TEXT,
             updated_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS execution_targets (
@@ -268,7 +269,7 @@ def database() -> Iterator[sqlite3.Connection]:
     sandbox_columns = {
         row["name"] for row in connection.execute("PRAGMA table_info(sandboxes)")
     }
-    for column in ("tailscale_tailnet", "tailscale_device_id", "tailscale_addresses"):
+    for column in ("tailscale_tailnet", "tailscale_device_id", "tailscale_addresses", "image"):
         if column not in sandbox_columns:
             connection.execute(f"ALTER TABLE sandboxes ADD COLUMN {column} TEXT")
     try:
@@ -329,7 +330,26 @@ def set_execution_target(
     return {"target": target}
 
 
-def record_sandbox(name: str, profile: str, reference: dict[str, Any]) -> None:
+def normalize_image(profile: str, image: str | None) -> str:
+    if profile not in PROFILES:
+        raise ValueError("os must be linux or windows")
+    if not image or image.lower() in {profile, "default"}:
+        return PROFILES[profile]["image"]
+    value = image.strip()
+    if value.lower() in {"linux", "windows"}:
+        if value.lower() != profile:
+            raise ValueError(f"image {value!r} does not match os {profile!r}")
+        return PROFILES[profile]["image"]
+    if value.startswith(("http://", "https://")):
+        value = value.split("://", 1)[1]
+    elif value.startswith("oci://"):
+        value = value[6:]
+    if "/" not in value:
+        raise ValueError("custom image must be an OCI registry reference such as ghcr.io/org/image:tag")
+    return value
+
+
+def record_sandbox(name: str, profile: str, reference: dict[str, Any], image: str) -> None:
     pool_name = reference.get("pool")
     if not isinstance(pool_name, str):
         raise TypeError("CUA claim reference has no pool")
@@ -337,15 +357,16 @@ def record_sandbox(name: str, profile: str, reference: dict[str, Any]) -> None:
     with database() as connection:
         connection.execute(
             """
-            INSERT INTO sandboxes (name, os, pool_name, claim_reference, updated_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO sandboxes (name, os, pool_name, claim_reference, image, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(name) DO UPDATE SET
                 os = excluded.os,
                 pool_name = excluded.pool_name,
                 claim_reference = excluded.claim_reference,
+                image = excluded.image,
                 updated_at = excluded.updated_at
             """,
-            (name, profile, pool_name, json.dumps(reference), now),
+            (name, profile, pool_name, json.dumps(reference), image, now),
         )
 
 
@@ -382,10 +403,16 @@ def remove_sandbox_record(name: str) -> None:
 def controller_sandboxes() -> list[dict[str, Any]]:
     with database() as connection:
         rows = connection.execute(
-            "SELECT name, os, pool_name FROM sandboxes ORDER BY name"
+            "SELECT name, os, pool_name, image FROM sandboxes ORDER BY name"
         ).fetchall()
     return [
-        {"name": row["name"], "os": row["os"], "pool": row["pool_name"]} for row in rows
+        {
+            "name": row["name"],
+            "os": row["os"],
+            "pool": row["pool_name"],
+            "image": row["image"],
+        }
+        for row in rows
     ]
 
 
@@ -1142,9 +1169,10 @@ async def ensure_one(name: str) -> dict[str, Any]:
         await disconnect_safely(sb)
 
 
-async def create_one(profile: str, requested_name: str | None) -> dict[str, Any]:
-    if profile not in PROFILES:
-        raise ValueError("os must be linux or windows")
+async def create_one(
+    profile: str, requested_name: str | None, image_ref: str | None = None
+) -> dict[str, Any]:
+    image_ref = normalize_image(profile, image_ref)
     name = requested_name or next_name(profile)
     validate_name(name)
     if any(item["name"] == name for item in local_states()):
@@ -1154,7 +1182,7 @@ async def create_one(profile: str, requested_name: str | None) -> dict[str, Any]
     from cua_sandbox import Image, Pool, Sandbox, WarmPoolAutoscaling
 
     spec = PROFILES[profile]
-    image = Image.from_registry(spec["image"], os_type=profile, kind="vm")
+    image = Image.from_registry(image_ref, os_type=profile, kind="vm")
     autoscaling = WarmPoolAutoscaling(
         min_pool_size=0, initial_pool_size=1, max_pool_size=10
     )
@@ -1198,7 +1226,7 @@ async def create_one(profile: str, requested_name: str | None) -> dict[str, Any]
         f"claim.{name}.wait-service",
         960,
     )
-    record_sandbox(name, profile, sb.to_dict())
+    record_sandbox(name, profile, sb.to_dict(), image_ref)
     await disconnect_safely(sb)
     sb = await connect_sandbox(name)
     try:
@@ -1208,7 +1236,7 @@ async def create_one(profile: str, requested_name: str | None) -> dict[str, Any]
             else bootstrap_windows(sb, name, tailnet)
         )
         await complete_tailscale_enrollment(sb, profile, name, address, tailnet)
-        return {"name": name, "os": profile, "address": address, "changed": True}
+        return {"name": name, "os": profile, "image": image_ref, "address": address, "changed": True}
     finally:
         await disconnect_safely(sb)
 
@@ -1704,7 +1732,12 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         return cancel_operation(str(request.get("operation_id") or ""))
     configure_fleet_auth()
     if action == "create":
-        return await create_one(str(request.get("os") or ""), request.get("name"))
+        image_ref = request.get("image")
+        if image_ref is not None and not isinstance(image_ref, str):
+            raise TypeError("image must be a string")
+        return await create_one(
+            str(request.get("os") or ""), request.get("name"), image_ref
+        )
     if action == "ensure":
         return await ensure_one(str(request.get("name") or ""))
     if action == "delete":

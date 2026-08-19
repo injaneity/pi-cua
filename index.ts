@@ -41,6 +41,12 @@ const resourceSchema = Type.Object({
     Type.String({ description: "Managed sandbox name, such as linux-1" }),
   ),
   os: Type.Optional(StringEnum(["linux", "windows"] as const)),
+  image: Type.Optional(
+    Type.String({
+      description:
+        "Optional OCI registry image. Use linux or windows for the built-in default.",
+    }),
+  ),
   confirm: Type.Optional(
     Type.Boolean({
       description: "Required for create or delete when no UI is available",
@@ -55,6 +61,7 @@ type SandboxItem = {
   os: SandboxOS;
   pool: string;
   online: boolean;
+  image?: string | null;
 };
 type BackendResult = {
   ok: boolean;
@@ -627,6 +634,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
   async function createSandbox(
     os: SandboxOS,
     ctx: UIContext,
+    image?: string,
   ): Promise<Destination | undefined> {
     if (!ctx.hasUI) return undefined;
     const confirmed = await ctx.ui.confirm(
@@ -639,7 +647,10 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       ctx.ui.theme.fg("accent", `creating ${os} sandbox...`),
     );
     try {
-      const result = await runBackend({ action: "create", os }, ctx.signal);
+      const result = await runBackend(
+        { action: "create", os, ...(image ? { image } : {}) },
+        ctx.signal,
+      );
       const sandbox = requireSandbox(result);
       pi.events.emit("cua:sandboxes-changed", result);
       return { kind: "sandbox", ...sandbox };
@@ -659,7 +670,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       ...online.map((sandbox) => ({
         value: sandbox.name,
         label: sandbox.name,
-        description: `${sandbox.os} • reachable over Tailscale`,
+        description: `${sandbox.os} • ${sandbox.image || "default image"} • reachable over Tailscale`,
       })),
       {
         value: "create",
@@ -685,9 +696,17 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     args: string,
     ctx: UIContext,
   ): Promise<Destination | undefined> {
-    const value = args.trim().toLowerCase();
+    const raw = args.trim();
+    const value = raw.toLowerCase();
     if (!value) return pickDestination(ctx);
     if (value === "local") return { kind: "local" };
+    const imageMatch = raw.match(/^(linux|windows)\s+(.+)$/i);
+    if (imageMatch)
+      return createSandbox(
+        imageMatch[1].toLowerCase() as SandboxOS,
+        ctx,
+        imageMatch[2].trim(),
+      );
     if (value === "linux" || value === "new linux")
       return createSandbox("linux", ctx);
     if (value === "windows" || value === "new windows")
@@ -868,6 +887,8 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     async execute(_id, input: ResourceInput, signal, onUpdate, ctx) {
       if (input.action === "create" && !input.os)
         throw new Error("create requires os");
+      if (input.image && input.action !== "create")
+        throw new Error("image is only valid for create");
       if (["ensure", "delete"].includes(input.action) && !input.name) {
         throw new Error(`${input.action} requires name`);
       }
