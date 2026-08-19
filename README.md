@@ -56,7 +56,7 @@ pi-cua emits `cua:execution-target-changed` with local, connecting, and ready ta
 
 the guest receives the pi sdk version, only the user packages that own routed tools, top-level extension definitions, and the generic tool host. the host activates lifecycle handlers only for extensions that own required tools. it does not receive local model credentials, prompts, conversation sessions, or the sandbox controller.
 
-workspace preparation requires a git repository with a network `origin` and does not support submodules. new threads and existing local threads carry the local overlay, limited to 200 mib; forks intentionally omit it. guests keep a bare repository cache outside all workspaces, so fresh sessions and forks reuse git objects without sharing mutable files. package-manager caches also remain in the guest user profile. sandbox-to-sandbox handoff for the same thread streams the complete workspace, including `.git` and untracked files, over ssh.
+workspace preparation requires a git repository with a network `origin` and does not support submodules. if the guest cannot authenticate to the origin, the controller sends a clean commit snapshot and creates an isolated baseline without copying git credentials. new threads and existing local threads carry the local overlay, limited to 200 mib; forks intentionally omit it. guests keep a bare repository cache outside all workspaces, so fresh sessions and forks reuse git objects without sharing mutable files. package-manager caches also remain in the guest user profile. sandbox-to-sandbox handoff for the same thread streams the complete workspace, including `.git` and untracked files, over ssh.
 
 ## verification
 

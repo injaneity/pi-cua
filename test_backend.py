@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import backend
 
@@ -172,6 +172,47 @@ class WorkspaceBundleTests(unittest.TestCase):
             ) as archive:
                 self.assertEqual(archive.getnames(), [])
             self.assertEqual(clean.deleted_paths, ())
+
+            snapshot = backend.git_snapshot(root, bundle.commit)
+            with tarfile.open(fileobj=io.BytesIO(snapshot), mode="r:gz") as archive:
+                modified = archive.extractfile("modified.txt")
+                self.assertEqual(modified.read(), b"original\n")
+                self.assertNotIn("untracked.txt", archive.getnames())
+
+
+class BackgroundJobTests(unittest.IsolatedAsyncioTestCase):
+    async def test_poll_returns_result_and_always_cleans_up(self) -> None:
+        shell = SimpleNamespace()
+        shell.run = AsyncMock(
+            side_effect=[
+                SimpleNamespace(returncode=0, stdout="__DONE__0\nfinished\n"),
+                SimpleNamespace(returncode=0, stdout=""),
+            ]
+        )
+        code, output = await backend.poll_background_job(
+            SimpleNamespace(shell=shell),
+            "poll",
+            "cleanup",
+            "bootstrap.linux",
+            10,
+            "Linux",
+        )
+        self.assertEqual((code, output), (0, "finished"))
+        self.assertEqual(shell.run.await_args_list[-1].args[0], "cleanup")
+
+    async def test_poll_timeout_still_cleans_up(self) -> None:
+        shell = SimpleNamespace()
+        shell.run = AsyncMock(return_value=SimpleNamespace(returncode=0, stdout=""))
+        with self.assertRaisesRegex(RuntimeError, "timed out"):
+            await backend.poll_background_job(
+                SimpleNamespace(shell=shell),
+                "poll",
+                "cleanup",
+                "bootstrap.linux",
+                0,
+                "Linux",
+            )
+        self.assertEqual(shell.run.await_args_list[-1].args[0], "cleanup")
 
 
 class VisibleOperationTests(unittest.IsolatedAsyncioTestCase):

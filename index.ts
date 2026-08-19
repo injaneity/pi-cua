@@ -82,6 +82,7 @@ type ExecutionTarget =
       kind: "sandbox";
       name: string;
       os: SandboxOS;
+      address: string;
       localCwd: string;
       remoteCwd: string;
     };
@@ -153,7 +154,7 @@ function sshArgs(
     "-o",
     `ControlPath=${homedir()}/.ssh/cua-%C`,
     "-T",
-    `cua@${target.name}`,
+    `cua@${target.address}`,
   ];
 }
 
@@ -180,6 +181,7 @@ class ToolBridge {
   private stderr = "";
   private ready = false;
   private readonly remoteTools = new Map<string, RemoteToolInfo>();
+  private sequence = 0;
 
   constructor(
     private readonly target: Extract<ExecutionTarget, { kind: "sandbox" }>,
@@ -196,6 +198,11 @@ class ToolBridge {
     if (!message.id) return;
     const pending = this.pending.get(message.id);
     if (!pending) return;
+    if (message.type === "manifest" && message.tools) {
+      this.pending.delete(message.id);
+      pending.resolve(message.tools);
+      return;
+    }
     if (message.type === "update" && message.update) {
       pending.onUpdate?.(message.update);
       return;
@@ -317,6 +324,25 @@ class ToolBridge {
 
   definition(name: string): RemoteToolInfo | undefined {
     return this.remoteTools.get(name);
+  }
+
+  async refresh(expectedTools: string[]): Promise<void> {
+    await this.start();
+    const id = `manifest-${++this.sequence}`;
+    const tools = await new Promise<RemoteToolInfo[]>((resolve, reject) => {
+      this.pending.set(id, {
+        resolve: (value) => resolve(value as RemoteToolInfo[]),
+        reject,
+      });
+      this.send({ type: "manifest", id });
+    });
+    const names = new Set(tools.map((item) => item.name));
+    const missing = expectedTools.filter((name) => !names.has(name));
+    if (missing.length > 0) {
+      throw new Error(`remote tool host is missing: ${missing.join(", ")}`);
+    }
+    this.remoteTools.clear();
+    for (const item of tools) this.remoteTools.set(item.name, item);
   }
 
   async execute(
@@ -522,6 +548,7 @@ function parseTarget(value: unknown): ExecutionTarget | undefined {
     kind: "sandbox",
     name: data.name,
     os: data.os,
+    address: typeof data.address === "string" ? data.address : data.name,
     localCwd: data.localCwd,
     remoteCwd: data.remoteCwd,
   };
@@ -531,6 +558,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
   let target: ExecutionTarget = { kind: "local" };
   let bridge: ToolBridge | undefined;
   const proxiedTools = new Set<string>();
+  const toolPackages = new Set<string>();
 
   async function executeBackend(
     request: Record<string, unknown>,
@@ -720,23 +748,23 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     return { kind: "sandbox", name: item.name, os: item.os };
   }
 
-  function remoteToolPackages(): string[] {
-    return [
-      ...new Set(
-        pi
-          .getAllTools()
-          .filter(
-            (tool) =>
-              !localTools.has(tool.name) &&
-              tool.sourceInfo.origin === "package" &&
-              tool.sourceInfo.scope === "user" &&
-              ["git:", "npm:", "https://", "http://", "ssh://"].some((prefix) =>
-                tool.sourceInfo.source.startsWith(prefix),
-              ),
-          )
-          .map((tool) => tool.sourceInfo.source),
-      ),
-    ];
+  function captureToolProviders(): string[] {
+    const names: string[] = [];
+    for (const tool of pi.getAllTools()) {
+      if (localTools.has(tool.name)) continue;
+      names.push(tool.name);
+      if (
+        tool.sourceInfo.origin === "package" &&
+        tool.sourceInfo.scope === "user" &&
+        ["git:", "npm:", "https://", "http://", "ssh://"].some((prefix) =>
+          tool.sourceInfo.source.startsWith(prefix),
+        ) &&
+        !tool.sourceInfo.source.toLowerCase().includes("pi-cua")
+      ) {
+        toolPackages.add(tool.sourceInfo.source);
+      }
+    }
+    return names;
   }
 
   async function prepareTarget(
@@ -749,6 +777,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
   ): Promise<Extract<ExecutionTarget, { kind: "sandbox" }>> {
     const { transferCurrentWorkspace = true, includeLocalOverlay = true } =
       options;
+    captureToolProviders();
     pi.events.emit("cua:execution-target-changed", {
       ...destination,
       state: "connecting",
@@ -760,7 +789,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
           name: destination.name,
           source_cwd: ctx.cwd,
           workspace_id: ctx.sessionManager.getSessionId(),
-          tool_packages: remoteToolPackages(),
+          tool_packages: [...toolPackages],
           include_local_overlay: includeLocalOverlay,
           source_sandbox:
             transferCurrentWorkspace && target.kind === "sandbox"
@@ -769,6 +798,10 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
           source_os:
             transferCurrentWorkspace && target.kind === "sandbox"
               ? target.os
+              : undefined,
+          source_address:
+            transferCurrentWorkspace && target.kind === "sandbox"
+              ? target.address
               : undefined,
           source_remote_cwd:
             transferCurrentWorkspace && target.kind === "sandbox"
@@ -785,12 +818,16 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
           });
         },
       );
-      if (typeof result.remote_cwd !== "string") {
-        throw new Error("cua backend returned no remote workspace");
+      if (
+        typeof result.remote_cwd !== "string" ||
+        typeof result.address !== "string"
+      ) {
+        throw new Error("cua backend returned an invalid execution target");
       }
       pi.events.emit("cua:sandboxes-changed", result);
       return {
         ...destination,
+        address: result.address,
         localCwd: ctx.cwd,
         remoteCwd: result.remote_cwd,
       };
@@ -813,7 +850,9 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       ["ls", createLsToolDefinition(ctx.cwd)],
     ]);
     for (const info of pi.getAllTools()) {
-      if (localTools.has(info.name) || proxiedTools.has(info.name)) continue;
+      if (localTools.has(info.name)) continue;
+      const owned = info.sourceInfo.path.startsWith(extensionDir);
+      if (owned && proxiedTools.has(info.name)) continue;
       const remote = bridge?.definition(info.name);
       if (!remote)
         throw new Error(`remote tool metadata missing: ${info.name}`);
@@ -835,29 +874,13 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       proxiedTools.add(info.name);
     }
     pi.setActiveTools(active);
-    const bypassed = pi
-      .getAllTools()
-      .filter(
-        (info) =>
-          proxiedTools.has(info.name) &&
-          !info.sourceInfo.path.startsWith(extensionDir),
-      )
-      .map((info) => info.name);
-    if (bypassed.length > 0) {
-      throw new Error(
-        `remote tool routing lost extension precedence: ${bypassed.join(", ")}`,
-      );
-    }
   }
 
   async function activate(
     next: ExecutionTarget,
     ctx: UIContext,
   ): Promise<void> {
-    const expectedTools = pi
-      .getAllTools()
-      .map((tool) => tool.name)
-      .filter((name) => !localTools.has(name));
+    const expectedTools = captureToolProviders();
     const nextBridge =
       next.kind === "sandbox" ? new ToolBridge(next, expectedTools) : undefined;
     if (next.kind === "sandbox") {
@@ -1013,8 +1036,10 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     }
   });
 
-  pi.on("before_agent_start", (event, ctx) => {
-    if (target.kind !== "sandbox") return;
+  pi.on("before_agent_start", async (event, ctx) => {
+    if (target.kind !== "sandbox" || !bridge) return;
+    const expectedTools = captureToolProviders();
+    await bridge.refresh(expectedTools);
     installProxies(ctx);
     const localCwd = `Current working directory: ${target.localCwd}`;
     const environment = `Execution environment: ${target.os}. All tools and user shell commands run in ${target.os}; use relative workspace paths and answer environment questions for ${target.os}.`;

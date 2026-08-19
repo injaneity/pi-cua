@@ -19,6 +19,7 @@ import re
 import shlex
 import signal
 import sqlite3
+import ssl
 import subprocess
 import sys
 import tarfile
@@ -36,17 +37,22 @@ from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
-# uv-managed CPython ships without default CA verify paths, so stdlib
-# urlopen to api.tailscale.com fails CERTIFICATE_VERIFY_FAILED unless a
-# bundle is named explicitly.
-if "SSL_CERT_FILE" not in os.environ:
+
+def tls_context() -> ssl.SSLContext:
+    if os.environ.get("SSL_CERT_FILE"):
+        return ssl.create_default_context()
     try:
         import certifi
 
-        os.environ["SSL_CERT_FILE"] = certifi.where()
+        return ssl.create_default_context(cafile=certifi.where())
     except ImportError:
-        if os.path.exists("/etc/ssl/cert.pem"):
-            os.environ["SSL_CERT_FILE"] = "/etc/ssl/cert.pem"
+        fallback = "/etc/ssl/cert.pem"
+        return ssl.create_default_context(
+            cafile=fallback if os.path.exists(fallback) else None
+        )
+
+
+TLS_CONTEXT = tls_context()
 
 HOME = Path.home()
 STATE_DIR = HOME / ".cua" / "sandboxes"
@@ -57,6 +63,16 @@ CONTROLLER_LOCK = CONTROLLER_DIR / "operations.lock"
 OPERATION_DIR = CONTROLLER_DIR / "operations"
 CURRENT_OPERATION_ID: str | None = None
 CURRENT_PHASE = "startup"
+
+
+class OperationCancelled(RuntimeError):
+    pass
+
+
+def cancel_worker(_signum: int, _frame: Any) -> None:
+    raise OperationCancelled("operation cancelled")
+
+
 LONG_ACTIONS = {
     "create",
     "ensure",
@@ -403,11 +419,20 @@ def remove_sandbox_record(name: str) -> None:
 def controller_sandboxes() -> list[dict[str, Any]]:
     with database() as connection:
         rows = connection.execute(
-            "SELECT name, os, pool_name FROM sandboxes ORDER BY name"
+            "SELECT name, os, pool_name, tailscale_addresses FROM sandboxes ORDER BY name"
         ).fetchall()
-    return [
-        {"name": row["name"], "os": row["os"], "pool": row["pool_name"]} for row in rows
-    ]
+    items = []
+    for row in rows:
+        addresses = json.loads(row["tailscale_addresses"] or "[]")
+        items.append(
+            {
+                "name": row["name"],
+                "os": row["os"],
+                "pool": row["pool_name"],
+                "address": addresses[0] if addresses else None,
+            }
+        )
+    return items
 
 
 def restore_cua_state(name: str) -> None:
@@ -589,7 +614,7 @@ def tailscale_access_token() -> str:
         method="POST",
     )
     try:
-        with urlopen(token_request, timeout=30) as response:
+        with urlopen(token_request, timeout=30, context=TLS_CONTEXT) as response:
             token = json.load(response).get("access_token")
     except HTTPError as error:
         raise RuntimeError(
@@ -613,7 +638,7 @@ def tailscale_api(
         method=method,
     )
     try:
-        with urlopen(request, timeout=30) as response:
+        with urlopen(request, timeout=30, context=TLS_CONTEXT) as response:
             content = response.read()
     except HTTPError as error:
         raise RuntimeError(
@@ -749,8 +774,7 @@ def local_tailscale_peer(name: str, address: str) -> dict[str, Any] | None:
         if not isinstance(peer, dict):
             continue
         if (
-            peer.get("HostName", "").lower() == name.lower()
-            and address in (peer.get("TailscaleIPs") or [])
+            address in (peer.get("TailscaleIPs") or [])
             and "tag:cua-sandbox" in (peer.get("Tags") or [])
             and peer.get("Online") is True
         ):
@@ -804,8 +828,9 @@ async def verify_tailscale_enrollment(
             f"guest joined tailnet {guest_tailnet!r}, expected {expected_tailnet!r}"
         )
     if guest_hostname.lower() != name.lower():
-        raise RuntimeError(
-            f"guest registered hostname {guest_hostname!r}, expected {name!r}"
+        progress(
+            "tailscale.hostname",
+            f"using {address}; Tailscale registered {guest_hostname!r} instead of {name!r}",
         )
     if "tag:cua-sandbox" not in guest_tags:
         raise RuntimeError("guest is missing required Tailscale tag:cua-sandbox")
@@ -847,11 +872,15 @@ def online_tailscale_hosts() -> set[str]:
     except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
         return set()
     peers = [status.get("Self") or {}, *(status.get("Peer") or {}).values()]
-    return {
-        str(peer.get("HostName", "")).lower()
-        for peer in peers
-        if peer.get("Online") is True
-    }
+    online = set()
+    for peer in peers:
+        if peer.get("Online") is not True:
+            continue
+        online.add(str(peer.get("HostName", "")).lower())
+        online.update(
+            str(address).lower() for address in peer.get("TailscaleIPs") or []
+        )
+    return online
 
 
 def validate_name(name: str) -> None:
@@ -952,6 +981,66 @@ async def upload_windows_file(sb: Any, remote: str, content: bytes | None) -> No
         )
 
 
+async def poll_background_job(
+    sb: Any,
+    poll_command: str,
+    cleanup_command: str,
+    phase: str,
+    timeout: float,
+    platform: str,
+) -> tuple[int, str]:
+    began = time.monotonic()
+    next_heartbeat = began
+    try:
+        while True:
+            elapsed = time.monotonic() - began
+            if elapsed >= timeout:
+                raise RuntimeError(f"{phase} timed out after {timeout:g} seconds")
+            if time.monotonic() >= next_heartbeat:
+                progress(
+                    phase,
+                    "background job is running",
+                    elapsed_seconds=round(elapsed),
+                )
+                next_heartbeat = time.monotonic() + 30
+            try:
+                result = await wait_for_step(
+                    sb.shell.run(poll_command, timeout=20),
+                    f"{phase}.poll-request",
+                    30,
+                    report=False,
+                )
+            except RuntimeError as error:
+                progress(
+                    f"{phase}.poll",
+                    "guest status poll failed; background job may still be running",
+                    failure=error_text(error),
+                )
+                await asyncio.sleep(5)
+                continue
+            lines = result.stdout.splitlines()
+            if lines and lines[0].startswith("__DONE__"):
+                raw_code = lines[0].removeprefix("__DONE__").strip()
+                try:
+                    code = int(raw_code)
+                except ValueError as error:
+                    raise RuntimeError(
+                        f"invalid {platform} job result: {raw_code!r}"
+                    ) from error
+                return code, "\n".join(lines[1:]).strip()
+            await asyncio.sleep(5)
+    finally:
+        try:
+            await wait_for_step(
+                sb.shell.run(cleanup_command, timeout=20),
+                f"{phase}.cleanup",
+                30,
+                report=False,
+            )
+        except RuntimeError as error:
+            progress(f"{phase}.cleanup", "cleanup failed", failure=error_text(error))
+
+
 async def run_linux_background_job(
     sb: Any, script: str, phase: str, timeout: float
 ) -> tuple[int, str]:
@@ -983,43 +1072,11 @@ async def run_linux_background_job(
     if started.returncode != 0:
         raise RuntimeError(started.stderr or "failed to launch Linux background job")
 
-    began = time.monotonic()
-    next_heartbeat = began
     poll = (
         f"if [ -f {result_path} ]; then echo __DONE__$(cat {result_path}); "
         f"tail -n 200 {log_path} 2>/dev/null; else echo __RUNNING__; fi"
     )
-    while True:
-        elapsed = time.monotonic() - began
-        if elapsed >= timeout:
-            raise RuntimeError(f"{phase} timed out after {timeout:g} seconds")
-        if time.monotonic() >= next_heartbeat:
-            progress(phase, "background job is running", elapsed_seconds=round(elapsed))
-            next_heartbeat = time.monotonic() + 30
-        try:
-            result = await wait_for_step(
-                sb.shell.run(poll, timeout=20),
-                f"{phase}.poll-request",
-                30,
-                report=False,
-            )
-        except RuntimeError as error:
-            progress(
-                f"{phase}.poll",
-                "guest status poll failed; background job may still be running",
-                failure=error_text(error),
-            )
-            await asyncio.sleep(5)
-            continue
-        lines = result.stdout.splitlines()
-        if lines and lines[0].startswith("__DONE__"):
-            raw_code = lines[0].removeprefix("__DONE__").strip()
-            try:
-                code = int(raw_code)
-            except ValueError as error:
-                raise RuntimeError(f"invalid Linux job result: {raw_code!r}") from error
-            return code, "\n".join(lines[1:]).strip()
-        await asyncio.sleep(5)
+    return await poll_background_job(sb, poll, cleanup, phase, timeout, "Linux")
 
 
 async def run_windows_background_job(
@@ -1054,46 +1111,12 @@ async def run_windows_background_job(
     if started.returncode != 0:
         raise RuntimeError(started.stderr or "failed to launch Windows background job")
 
-    began = time.monotonic()
-    next_heartbeat = began
     poll = (
         'powershell.exe -NoProfile -Command "'
         f"if(Test-Path '{result_path}'){{Write-Output ('__DONE__' + (Get-Content -Raw '{result_path}').Trim()); "
         f"if(Test-Path '{log_path}'){{Get-Content -Tail 200 '{log_path}'}}}}else{{Write-Output '__RUNNING__'}}\""
     )
-    while True:
-        elapsed = time.monotonic() - began
-        if elapsed >= timeout:
-            raise RuntimeError(f"{phase} timed out after {timeout:g} seconds")
-        if time.monotonic() >= next_heartbeat:
-            progress(phase, "background job is running", elapsed_seconds=round(elapsed))
-            next_heartbeat = time.monotonic() + 30
-        try:
-            result = await wait_for_step(
-                sb.shell.run(poll, timeout=20),
-                f"{phase}.poll-request",
-                30,
-                report=False,
-            )
-        except RuntimeError as error:
-            progress(
-                f"{phase}.poll",
-                "guest status poll failed; background job may still be running",
-                failure=error_text(error),
-            )
-            await asyncio.sleep(5)
-            continue
-        lines = result.stdout.splitlines()
-        if lines and lines[0].startswith("__DONE__"):
-            raw_code = lines[0].removeprefix("__DONE__").strip()
-            try:
-                code = int(raw_code)
-            except ValueError as error:
-                raise RuntimeError(
-                    f"invalid Windows job result: {raw_code!r}"
-                ) from error
-            return code, "\n".join(lines[1:]).strip()
-        await asyncio.sleep(5)
+    return await poll_background_job(sb, poll, cleanup, phase, timeout, "Windows")
 
 
 async def bootstrap_windows(sb: Any, name: str, tailnet: str) -> str:
@@ -1269,16 +1292,15 @@ async def create_one(profile: str, requested_name: str | None) -> dict[str, Any]
             break
         except RuntimeError as error:
             detail = error_text(error)
-            transient = "NamespaceTerminating" in detail or (
-                "status=403" in detail
-                and (
-                    "k8s request is not allowed" in detail
-                    or (
-                        "cannot create resource" in detail
-                        and "osgymsandboxwarmpools" in detail
-                    )
+            if "status=403" in detail and "osgymsandboxwarmpools" in detail:
+                variable = (
+                    "CUA_PI_LINUX_POOL" if profile == "linux" else "CUA_PI_WINDOWS_POOL"
                 )
-            )
+                raise RuntimeError(
+                    f"Fleet pool {spec['pool']!r} is unavailable to this tenant; "
+                    f"set {variable} to an unclaimed pool name"
+                ) from error
+            transient = "NamespaceTerminating" in detail
             if not transient or attempt == 12:
                 raise
             progress(phase, "Fleet namespace is converging; retrying in 10 seconds")
@@ -1504,6 +1526,7 @@ def run_guest_ssh(
                 progress(stream_phase, lines[-1].decode(errors="replace").strip()[:200])
                 last_report = time.monotonic()
         elif process.poll() is not None:
+            output += process.stdout.read()
             break
     returncode = process.wait()
     text_output = output.decode(errors="replace")
@@ -1538,7 +1561,9 @@ def guest_file_size(name: str, profile: str, remote_path: str) -> int | None:
 def copy_guest_file(name: str, profile: str, content: bytes, remote_path: str) -> None:
     total = len(content)
     total_mib = total / 1048576
-    progress(f"scp.{name}", f"uploading {total_mib:.1f} MiB to {remote_path}")
+    show_progress = total >= 1024 * 1024
+    size = f"{total_mib:.1f} MiB" if show_progress else f"{total} bytes"
+    progress(f"scp.{name}", f"uploading {size} to {remote_path}")
     with tempfile.NamedTemporaryFile() as source:
         source.write(content)
         source.flush()
@@ -1555,32 +1580,42 @@ def copy_guest_file(name: str, profile: str, content: bytes, remote_path: str) -
             stderr=subprocess.PIPE,
             text=True,
         )
-        deadline = time.monotonic() + 300
-        # Poll the growing remote file so the operation reports a live percent
-        # instead of one silent blocking transfer.
-        while process.poll() is None:
-            if time.monotonic() >= deadline:
+        if not show_progress:
+            try:
+                stdout, stderr = process.communicate(timeout=300)
+            except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
-                raise RuntimeError(f"SCP upload to {name} timed out after 300 seconds")
-            time.sleep(2)
-            if process.poll() is not None:
-                break
-            size = guest_file_size(name, profile, remote_path)
-            if size and total:
-                percent = min(100, size * 100 // total)
-                progress(
-                    f"scp.{name}",
-                    f"uploading {remote_path}: "
-                    f"{size / 1048576:.1f}/{total_mib:.1f} MiB ({percent}%)",
-                )
-        stdout, stderr = process.communicate()
+                raise RuntimeError(
+                    f"SCP upload to {name} timed out after 300 seconds"
+                ) from None
+        else:
+            deadline = time.monotonic() + 300
+            while process.poll() is None:
+                if time.monotonic() >= deadline:
+                    process.kill()
+                    process.wait()
+                    raise RuntimeError(
+                        f"SCP upload to {name} timed out after 300 seconds"
+                    )
+                time.sleep(2)
+                if process.poll() is not None:
+                    break
+                remote_size = guest_file_size(name, profile, remote_path)
+                if remote_size:
+                    percent = min(100, remote_size * 100 // total)
+                    progress(
+                        f"scp.{name}",
+                        f"uploading {remote_path}: "
+                        f"{remote_size / 1048576:.1f}/{total_mib:.1f} MiB ({percent}%)",
+                    )
+            stdout, stderr = process.communicate()
     if process.returncode != 0:
         raise RuntimeError(
             f"SCP upload to {name} failed with exit {process.returncode}: "
             f"{(stderr or stdout).strip()}"
         )
-    progress(f"scp.{name}", f"uploaded {total_mib:.1f} MiB to {remote_path}")
+    progress(f"scp.{name}", f"uploaded {size} to {remote_path}")
 
 
 def sync_guest_packages(name: str, profile: str, packages: tuple[str, ...]) -> None:
@@ -1591,6 +1626,30 @@ def sync_guest_packages(name: str, profile: str, packages: tuple[str, ...]) -> N
         else r"C:\Users\cua\.pi\agent\settings.json"
     )
     copy_guest_file(name, profile, settings, remote_path)
+
+
+def git_snapshot(root: Path, commit: str) -> bytes:
+    return subprocess.run(
+        ["git", "-C", str(root), "archive", "--format=tar.gz", commit],
+        check=True,
+        capture_output=True,
+        timeout=300,
+    ).stdout
+
+
+def guest_repository_available(
+    name: str, profile: str, cache: str, remote_url: str, commit: str
+) -> bool:
+    command = (
+        f"git -C {shlex.quote(cache)} cat-file -e {shlex.quote(commit + '^{commit}')} 2>/dev/null || git ls-remote --exit-code {shlex.quote(remote_url)} HEAD >/dev/null"
+        if profile == "linux"
+        else f"git -C {powershell_literal(cache)} cat-file -e '{commit}^{{commit}}' 2>$null; if ($LASTEXITCODE -ne 0) {{ git ls-remote --exit-code {powershell_literal(remote_url)} HEAD | Out-Null; if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }} }}"
+    )
+    try:
+        run_guest_ssh(name, profile, command, timeout=60)
+        return True
+    except RuntimeError:
+        return False
 
 
 async def prepare_workspace(
@@ -1608,14 +1667,24 @@ async def prepare_workspace(
         workspace_root = f"/home/cua/workspaces/{workspace_id}"
         archive_path = f"/tmp/cua-workspace-{workspace_id}.tgz"
         repository_cache = f"/home/cua/.cache/cua-pi/git/{repository_key}.git"
+        snapshot_path = f"/tmp/cua-snapshot-{workspace_id}.tgz"
+        use_remote = guest_repository_available(
+            name, profile, repository_cache, bundle.remote_url, bundle.commit
+        )
+        if not use_remote:
+            progress(
+                f"workspace.{name}.snapshot",
+                "origin is unavailable; sending a local commit snapshot",
+            )
+            copy_guest_file(
+                name, profile, git_snapshot(bundle.root, bundle.commit), snapshot_path
+            )
         copy_guest_file(name, profile, bundle.archive, archive_path)
         deleted = " ".join(
             shlex.quote(str(PurePosixPath(workspace_root) / path))
             for path in bundle.deleted_paths
         )
-        command = f"""set -eu
-mkdir -p /home/cua/workspaces /home/cua/.cache/cua-pi/git
-if [ ! -d {shlex.quote(repository_cache)} ]; then
+        remote_setup = f"""if [ ! -d {shlex.quote(repository_cache)} ]; then
   git clone --mirror --progress {shlex.quote(bundle.remote_url)} {shlex.quote(repository_cache)}
 elif ! git -C {shlex.quote(repository_cache)} cat-file -e {shlex.quote(bundle.commit + "^{commit}")} 2>/dev/null; then
   git -C {shlex.quote(repository_cache)} fetch --progress origin {shlex.quote(bundle.commit)}
@@ -1626,7 +1695,20 @@ fi
 if ! git -C {shlex.quote(workspace_root)} cat-file -e {shlex.quote(bundle.commit + "^{commit}")} 2>/dev/null; then
   git -C {shlex.quote(workspace_root)} fetch --depth=1 --progress origin {shlex.quote(bundle.commit)}
 fi
-git -C {shlex.quote(workspace_root)} checkout --detach --force {shlex.quote(bundle.commit)}
+git -C {shlex.quote(workspace_root)} checkout --detach --force {shlex.quote(bundle.commit)}"""
+        snapshot_setup = f"""rm -rf {shlex.quote(workspace_root)}
+mkdir -p {shlex.quote(workspace_root)}
+tar -xzf {shlex.quote(snapshot_path)} -C {shlex.quote(workspace_root)}
+git -C {shlex.quote(workspace_root)} init -q
+git -C {shlex.quote(workspace_root)} config user.name pi-cua
+git -C {shlex.quote(workspace_root)} config user.email pi-cua@localhost
+git -C {shlex.quote(workspace_root)} add -A
+git -C {shlex.quote(workspace_root)} -c commit.gpgsign=false commit -qm 'pi-cua workspace baseline'
+git -C {shlex.quote(workspace_root)} remote add origin {shlex.quote(bundle.remote_url)}
+rm -f {shlex.quote(snapshot_path)}"""
+        command = f"""set -eu
+mkdir -p /home/cua/workspaces /home/cua/.cache/cua-pi/git
+{remote_setup if use_remote else snapshot_setup}
 tar -xzf {shlex.quote(archive_path)} -C {shlex.quote(workspace_root)}
 rm -f {deleted}
 rm -f {shlex.quote(archive_path)}
@@ -1646,20 +1728,43 @@ rm -f {shlex.quote(archive_path)}
     workspace_root = rf"C:\cua\workspaces\{workspace_id}"
     archive_path = rf"C:\Windows\Temp\cua-workspace-{workspace_id}.tgz"
     repository_cache = rf"C:\cua\cache\git\{repository_key}.git"
+    snapshot_path = rf"C:\Windows\Temp\cua-snapshot-{workspace_id}.tgz"
+    use_remote = guest_repository_available(
+        name, profile, repository_cache, bundle.remote_url, bundle.commit
+    )
+    if not use_remote:
+        progress(
+            f"workspace.{name}.snapshot",
+            "origin is unavailable; sending a local commit snapshot",
+        )
+        copy_guest_file(
+            name, profile, git_snapshot(bundle.root, bundle.commit), snapshot_path
+        )
     copy_guest_file(name, profile, bundle.archive, archive_path)
     deleted_commands = "; ".join(
         f"Remove-Item -Force -Recurse -ErrorAction SilentlyContinue {powershell_literal(str(PureWindowsPath(workspace_root) / PureWindowsPath(path)))}"
         for path in bundle.deleted_paths
     )
+    remote_setup = f"""if (-not (Test-Path $cache)) {{ git clone --mirror {powershell_literal(bundle.remote_url)} $cache }} else {{ git -C $cache cat-file -e '{bundle.commit}^{{commit}}' 2>$null; if ($LASTEXITCODE -ne 0) {{ git -C $cache fetch origin {bundle.commit} }} }}
+if (-not (Test-Path "$root\\.git")) {{ git clone --reference-if-able $cache --dissociate --no-checkout {powershell_literal(bundle.remote_url)} $root }}
+git -C $root cat-file -e '{bundle.commit}^{{commit}}' 2>$null
+if ($LASTEXITCODE -ne 0) {{ git -C $root fetch --depth=1 origin {bundle.commit} }}
+git -C $root checkout --detach --force {bundle.commit}"""
+    snapshot_setup = f"""Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $root
+New-Item -ItemType Directory -Force -Path $root | Out-Null
+tar.exe -xzf {powershell_literal(snapshot_path)} -C $root
+git -C $root init -q
+git -C $root config user.name pi-cua
+git -C $root config user.email pi-cua@localhost
+git -C $root add -A
+git -C $root -c commit.gpgsign=false commit -qm 'pi-cua workspace baseline'
+git -C $root remote add origin {powershell_literal(bundle.remote_url)}
+Remove-Item -Force {powershell_literal(snapshot_path)}"""
     script = f"""$ErrorActionPreference = 'Stop'
 $root = {powershell_literal(workspace_root)}
 $cache = {powershell_literal(repository_cache)}
 New-Item -ItemType Directory -Force -Path 'C:\\cua\\workspaces','C:\\cua\\cache\\git' | Out-Null
-if (-not (Test-Path $cache)) {{ git clone --mirror {powershell_literal(bundle.remote_url)} $cache }} else {{ git -C $cache cat-file -e '{bundle.commit}^{{commit}}' 2>$null; if ($LASTEXITCODE -ne 0) {{ git -C $cache fetch origin {bundle.commit} }} }}
-if (-not (Test-Path "$root\\.git")) {{ git clone --reference-if-able $cache --dissociate --no-checkout {powershell_literal(bundle.remote_url)} $root }}
-git -C $root cat-file -e '{bundle.commit}^{{commit}}' 2>$null
-if ($LASTEXITCODE -ne 0) {{ git -C $root fetch --depth=1 origin {bundle.commit} }}
-git -C $root checkout --detach --force {bundle.commit}
+{remote_setup if use_remote else snapshot_setup}
 tar.exe -xzf {powershell_literal(archive_path)} -C $root
 {deleted_commands}
 Remove-Item -Force {powershell_literal(archive_path)}
@@ -1800,6 +1905,7 @@ async def prepare_execution(
     workspace_key: str,
     source_sandbox: str | None = None,
     source_profile: str | None = None,
+    source_address: str | None = None,
     source_remote_cwd: str | None = None,
     include_local_overlay: bool = True,
     tool_packages: tuple[str, ...] = (),
@@ -1830,20 +1936,20 @@ async def prepare_execution(
         finally:
             await disconnect_safely(sb)
 
-    sync_guest_packages(name, profile, tool_packages)
+    sync_guest_packages(address, profile, tool_packages)
     workspace_id = hashlib.sha256(workspace_key.encode()).hexdigest()[:16]
     remote_cwd = (
         transfer_workspace(
-            source_sandbox,
+            source_address or source_sandbox,
             source_profile,
             source_remote_cwd,
-            name,
+            address,
             profile,
             workspace_id,
         )
         if source_sandbox and source_profile and source_remote_cwd
         else await prepare_workspace(
-            name,
+            address,
             profile,
             Path(source_cwd).expanduser().resolve(),
             workspace_id,
@@ -1863,7 +1969,11 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
     if action == "list":
         online = online_tailscale_hosts()
         items = [
-            {**item, "online": item["name"].lower() in online}
+            {
+                **item,
+                "online": item["name"].lower() in online
+                or str(item.get("address") or "").lower() in online,
+            }
             for item in local_states()
         ]
         return {"sandboxes": items}
@@ -1895,6 +2005,7 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("prepare_execution requires workspace_id")
         source_sandbox = request.get("source_sandbox")
         source_os = request.get("source_os")
+        source_address = request.get("source_address")
         source_remote_cwd = request.get("source_remote_cwd")
         include_local_overlay = request.get("include_local_overlay", True)
         tool_packages = request.get("tool_packages", [])
@@ -1911,6 +2022,8 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
             raise TypeError("source_sandbox must be a string")
         if source_os is not None and source_os not in {"linux", "windows"}:
             raise TypeError("source_os must be linux or windows")
+        if source_address is not None and not isinstance(source_address, str):
+            raise TypeError("source_address must be a string")
         if source_remote_cwd is not None and not isinstance(source_remote_cwd, str):
             raise TypeError("source_remote_cwd must be a string")
         return await prepare_execution(
@@ -1919,6 +2032,7 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
             workspace_key,
             source_sandbox,
             source_os,
+            source_address,
             source_remote_cwd,
             include_local_overlay,
             tuple(dict.fromkeys(tool_packages)),
@@ -1969,6 +2083,8 @@ def main() -> None:
             raise TypeError("request must be a JSON object")
         action = request.get("action")
         worker = os.environ.get("CUA_DETACHED_WORKER") == "1"
+        if worker:
+            signal.signal(signal.SIGTERM, cancel_worker)
         CURRENT_OPERATION_ID = os.environ.setdefault(
             "CUA_OPERATION_ID", uuid.uuid4().hex[:12]
         )
@@ -2036,13 +2152,18 @@ def main() -> None:
         )
     except Exception as error:  # noqa: BLE001 - process boundary returns all failures as JSON
         try:
-            progress(CURRENT_PHASE, "operation failed", error=error_text(error))
+            cancelled = isinstance(error, OperationCancelled)
+            progress(
+                CURRENT_PHASE,
+                "operation cancelled" if cancelled else "operation failed",
+                error=error_text(error),
+            )
             if os.environ.get("CUA_DETACHED_WORKER") == "1" and CURRENT_OPERATION_ID:
                 finish_operation(
                     CURRENT_OPERATION_ID,
-                    "failed",
-                    error_type=type(error).__name__,
-                    error=error_text(error),
+                    "cancelled" if cancelled else "failed",
+                    error_type=None if cancelled else type(error).__name__,
+                    error=None if cancelled else error_text(error),
                 )
         except OSError as log_error:
             print(
