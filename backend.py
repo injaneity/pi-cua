@@ -1073,13 +1073,15 @@ async def run_windows_background_job(
 ) -> tuple[int, str]:
     log_path = r"C:\Windows\Temp\cua-bootstrap.log"
     result_path = r"C:\Windows\Temp\cua-bootstrap.result"
+    runner_path = r"C:\Windows\Temp\cua-bootstrap-runner.ps1"
     cleanup = (
         'powershell.exe -NoProfile -Command "'
         "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*cua-bootstrap*' -and $_.ProcessId -ne $PID } | "
-        f"ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}; Remove-Item -Force -ErrorAction SilentlyContinue '{log_path}','{result_path}'\""
+        "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }; "
+        "schtasks.exe /Delete /TN CuaPiBootstrap /F 2>&1 | Out-Null; "
+        f"Remove-Item -Force -ErrorAction SilentlyContinue '{runner_path}','{log_path}','{result_path}'\""
     )
     await wait_for_step(sb.shell.run(cleanup, timeout=20), f"{phase}.prepare", 30)
-    runner_path = r"C:\Windows\Temp\cua-bootstrap-runner.ps1"
     runner = (
         "$ErrorActionPreference = 'Stop'\n"
         "$code = 0\n"
