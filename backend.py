@@ -714,9 +714,14 @@ def local_states() -> list[dict[str, Any]]:
             (name for name, item in PROFILES.items() if item["pool"] == pool), None
         )
         if state.get("runtime_type") == "fleet" and profile:
-            item = {"name": state.get("name", path.stem), "os": profile, "pool": pool}
-            if isinstance(item["name"], str):
-                by_name[item["name"]] = item
+            name = state.get("name", path.stem)
+            if isinstance(name, str):
+                by_name[name] = {
+                    **by_name.get(name, {}),
+                    "name": name,
+                    "os": profile,
+                    "pool": pool,
+                }
     return sorted(by_name.values(), key=lambda item: item["name"])
 
 
@@ -1040,13 +1045,20 @@ async def run_linux_background_job(
     # child ("&", nohup, setsid all fail), so the job must detach through the
     # service manager — the schtasks analog used on Windows.
     sudo = 'if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO=sudo; fi; '
-    cleanup = (
+    stop = (
         sudo
         + "$SUDO systemctl stop cua-bootstrap.service 2>/dev/null; "
         + "$SUDO systemctl reset-failed cua-bootstrap.service 2>/dev/null; "
-        + f"$SUDO rm -f {log_path} {result_path}; true"
     )
-    await wait_for_step(sb.shell.run(cleanup, timeout=20), f"{phase}.prepare", 30)
+    prepare_cleanup = stop + f"$SUDO rm -f {log_path} {result_path}; true"
+    final_cleanup = (
+        stop
+        + f"$SUDO rm -f {script_path} {log_path} {result_path} "
+        + "/tmp/cua-tailscale-auth-key /tmp/cua-pi-agent.tgz; true"
+    )
+    await wait_for_step(
+        sb.shell.run(prepare_cleanup, timeout=20), f"{phase}.prepare", 30
+    )
     await wait_for_step(
         sb.files.write_text(script_path, script), f"{phase}.runner-upload", 30
     )
@@ -1065,7 +1077,7 @@ async def run_linux_background_job(
         f"if [ -f {result_path} ]; then echo __DONE__$(cat {result_path}); "
         f"tail -n 200 {log_path} 2>/dev/null; else echo __RUNNING__; fi"
     )
-    return await poll_background_job(sb, poll, cleanup, phase, timeout, "Linux")
+    return await poll_background_job(sb, poll, final_cleanup, phase, timeout, "Linux")
 
 
 async def run_windows_background_job(
@@ -1074,14 +1086,29 @@ async def run_windows_background_job(
     log_path = r"C:\Windows\Temp\cua-bootstrap.log"
     result_path = r"C:\Windows\Temp\cua-bootstrap.result"
     runner_path = r"C:\Windows\Temp\cua-bootstrap-runner.ps1"
-    cleanup = (
-        'powershell.exe -NoProfile -Command "'
+    stop = (
         "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*cua-bootstrap*' -and $_.ProcessId -ne $PID } | "
         "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }; "
         "schtasks.exe /Delete /TN CuaPiBootstrap /F 2>&1 | Out-Null; "
-        f"Remove-Item -Force -ErrorAction SilentlyContinue '{runner_path}','{log_path}','{result_path}'\""
     )
-    await wait_for_step(sb.shell.run(cleanup, timeout=20), f"{phase}.prepare", 30)
+
+    def cleanup(paths: str) -> str:
+        return (
+            'powershell.exe -NoProfile -Command "'
+            + stop
+            + f'Remove-Item -Force -ErrorAction SilentlyContinue {paths}"'
+        )
+
+    prepare_cleanup = cleanup(f"'{runner_path}','{log_path}','{result_path}'")
+    final_cleanup = cleanup(
+        f"'{runner_path}','{script_path}','{log_path}','{result_path}',"
+        "'C:\\Windows\\Temp\\cua-pi-agent.zip',"
+        "'C:\\Windows\\Temp\\cua-authorized-key.pub',"
+        "'C:\\Windows\\Temp\\cua-tailscale-auth-key'"
+    )
+    await wait_for_step(
+        sb.shell.run(prepare_cleanup, timeout=20), f"{phase}.prepare", 30
+    )
     runner = (
         "$ErrorActionPreference = 'Stop'\n"
         "$code = 0\n"
@@ -1107,7 +1134,7 @@ async def run_windows_background_job(
         f"if(Test-Path '{result_path}'){{Write-Output ('__DONE__' + (Get-Content -Raw '{result_path}').Trim()); "
         f"if(Test-Path '{log_path}'){{Get-Content -Tail 200 '{log_path}'}}}}else{{Write-Output '__RUNNING__'}}\""
     )
-    return await poll_background_job(sb, poll, cleanup, phase, timeout, "Windows")
+    return await poll_background_job(sb, poll, final_cleanup, phase, timeout, "Windows")
 
 
 async def bootstrap_windows(sb: Any, name: str, tailnet: str) -> str:
@@ -1221,7 +1248,12 @@ async def complete_tailscale_enrollment(
     node_id, addresses = await verify_tailscale_enrollment(
         sb, profile, name, address, tailnet
     )
-    record_tailscale_enrollment(name, tailnet, node_id, addresses)
+    record_tailscale_enrollment(
+        name,
+        tailnet,
+        node_id,
+        [address, *(item for item in addresses if item != address)],
+    )
 
 
 async def ensure_one(name: str) -> dict[str, Any]:
@@ -1914,7 +1946,7 @@ async def prepare_execution(
             raise ValueError(f"unknown source sandbox: {source_sandbox}")
         if source_profile != states[source_sandbox]["os"]:
             raise ValueError("source sandbox operating system mismatch")
-    address = healthy_over_ssh(name, profile)
+    address = healthy_over_ssh(states[name].get("address") or name, profile)
     if address is None:
         tailnet = local_tailscale_identity()
         restore_cua_state(name)
@@ -2047,7 +2079,9 @@ def ensure_cloud_runtime(action: object, request: dict[str, Any]) -> None:
     if action == "prepare_execution":
         name = request.get("name")
         state = next((item for item in local_states() if item["name"] == name), None)
-        if state and healthy_over_ssh(state["name"], state["os"]):
+        if state and healthy_over_ssh(
+            state.get("address") or state["name"], state["os"]
+        ):
             return
     command = [
         "uv",

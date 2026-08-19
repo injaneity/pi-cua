@@ -673,6 +673,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       const sandbox = requireSandbox(result);
       pi.events.emit("cua:sandboxes-changed", result);
       pi.events.emit("cua:execution-target-changed", {
+        kind: "sandbox",
         ...sandbox,
         state: "connecting",
       });

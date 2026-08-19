@@ -56,6 +56,32 @@ class LocalStateTests(unittest.TestCase):
                     ],
                 )
 
+    def test_local_state_preserves_controller_tailscale_address(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            (state_dir / "linux-1.json").write_text(
+                json.dumps(
+                    {
+                        "name": "linux-1",
+                        "runtime_type": "fleet",
+                        "pool_name": "cua-pi-linux",
+                    }
+                )
+            )
+            controller = {
+                "name": "linux-1",
+                "os": "linux",
+                "pool": "cua-pi-linux",
+                "address": "100.64.0.2",
+            }
+            with (
+                patch.object(backend, "STATE_DIR", state_dir),
+                patch.object(
+                    backend, "controller_sandboxes", return_value=[controller]
+                ),
+            ):
+                self.assertEqual(backend.local_states(), [controller])
+
 
 class TailscaleTests(unittest.TestCase):
     def test_enrollment_key_is_one_use_and_scoped_to_exact_tailnet(self) -> None:
