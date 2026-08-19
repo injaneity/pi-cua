@@ -558,6 +558,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
   async function runBackend(
     request: Record<string, unknown>,
     signal?: AbortSignal,
+    onStatus?: (status: BackendResult) => void,
   ): Promise<BackendResult> {
     let status = await executeBackend(request, signal);
     const operationId = status.operation_id;
@@ -576,6 +577,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
           action: "operation_status",
           operation_id: operationId,
         });
+        onStatus?.(status);
       }
     } catch (error) {
       if (signal?.aborted) {
@@ -639,7 +641,19 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       ctx.ui.theme.fg("accent", `creating ${os} sandbox...`),
     );
     try {
-      const result = await runBackend({ action: "create", os }, ctx.signal);
+      const result = await runBackend(
+        { action: "create", os },
+        ctx.signal,
+        (status) => {
+          const detail = [status.phase, status.message]
+            .filter(Boolean)
+            .join(" — ");
+          ctx.ui.setStatus(
+            "cua-session",
+            ctx.ui.theme.fg("accent", `creating ${os} sandbox — ${detail}`),
+          );
+        },
+      );
       const sandbox = requireSandbox(result);
       pi.events.emit("cua:sandboxes-changed", result);
       return { kind: "sandbox", ...sandbox };
@@ -756,6 +770,16 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
               : undefined,
         },
         ctx.signal,
+        (status) => {
+          if (!ctx.hasUI) return;
+          const detail = [status.phase, status.message]
+            .filter(Boolean)
+            .join(" — ");
+          ctx.ui.setStatus(
+            "cua-session",
+            ctx.ui.theme.fg("accent", `${destination.name}: ${detail}`),
+          );
+        },
       );
       if (typeof result.remote_cwd !== "string") {
         throw new Error("cua backend returned no remote workspace");
@@ -769,6 +793,8 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     } catch (error) {
       pi.events.emit("cua:execution-target-changed", target);
       throw error;
+    } finally {
+      if (ctx.hasUI) ctx.ui.setStatus("cua-session", undefined);
     }
   }
 

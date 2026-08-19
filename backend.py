@@ -36,6 +36,18 @@ from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
+# uv-managed CPython ships without default CA verify paths, so stdlib
+# urlopen to api.tailscale.com fails CERTIFICATE_VERIFY_FAILED unless a
+# bundle is named explicitly.
+if "SSL_CERT_FILE" not in os.environ:
+    try:
+        import certifi
+
+        os.environ["SSL_CERT_FILE"] = certifi.where()
+    except ImportError:
+        if os.path.exists("/etc/ssl/cert.pem"):
+            os.environ["SSL_CERT_FILE"] = "/etc/ssl/cert.pem"
+
 HOME = Path.home()
 STATE_DIR = HOME / ".cua" / "sandboxes"
 PI_DIR = HOME / ".pi" / "agent"
@@ -59,13 +71,17 @@ WINDOWS_PUBLIC_KEY = HOME / ".ssh" / "cua_windows_ed25519.pub"
 
 PROFILES = {
     "linux": {
-        "pool": "cua-pi-linux",
+        # Fleet pool/namespace names are a tenant-wide authorization boundary:
+        # if another tenant already owns the default namespace, every pool
+        # operation fails with a persistent 403. CUA_PI_LINUX_POOL /
+        # CUA_PI_WINDOWS_POOL let each tenant pick unclaimed names.
+        "pool": os.environ.get("CUA_PI_LINUX_POOL", "cua-pi-linux"),
         "image": "public.ecr.aws/k5j5w0x5/cua-ubuntu-24.04@sha256:eb68411ed8b4d7c39829cdfe854b9d0485b78ee064c3171fd8e3f7450f7ccee7",
         "cpu": 8,
         "memory_mb": 16 * 1024,
     },
     "windows": {
-        "pool": "cua-pi-windows",
+        "pool": os.environ.get("CUA_PI_WINDOWS_POOL", "cua-pi-windows"),
         "image": "public.ecr.aws/k5j5w0x5/cua-windows-2022@sha256:6d341afc26a37c4072d22ba403a89ecdad9a29aebab79570b5a38da6b8e16370",
         "cpu": 10,
         "memory_mb": 20 * 1024,
@@ -184,7 +200,12 @@ def keychain(account: str, service: str) -> str:
 
 def pi_version() -> str:
     proc = subprocess.run(
-        ["pi", "--version"], check=True, capture_output=True, text=True, timeout=10
+        # pi 0.84+ runs a network update check on --version; 10s flakes
+        ["pi", "--version"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=60,
     )
     version = proc.stdout.strip()
     if not re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", version):
@@ -905,14 +926,15 @@ async def bootstrap_linux(sb: Any, name: str, tailnet: str) -> str:
         .replace("__BOOTSTRAP_VERSION__", bootstrap_digest("linux"))
         .replace("__PI_VERSION__", pi_version())
     )
-    result = await wait_for_step(
-        sb.shell.run(script, timeout=1200), f"bootstrap.{name}.linux", 1260
+    # The Fleet exec gateway drops any single shell.run after ~30 seconds, so
+    # the long bootstrap must run detached in the guest and be polled with
+    # short commands — same contract as run_windows_background_job.
+    code, output = await run_linux_background_job(
+        sb, script, f"bootstrap.{name}.linux", 1200
     )
-    if result.returncode != 0:
-        raise RuntimeError(
-            (result.stderr or result.stdout or "linux bootstrap failed").strip()
-        )
-    lines = result.stdout.strip().splitlines()
+    if code != 0:
+        raise RuntimeError((output or "linux bootstrap failed").strip())
+    lines = output.strip().splitlines()
     address = lines[-1] if lines else await healthy(sb, "linux")
     if not address:
         raise RuntimeError(
@@ -928,6 +950,76 @@ async def upload_windows_file(sb: Any, remote: str, content: bytes | None) -> No
             f"upload.windows.{PureWindowsPath(remote).name}",
             120,
         )
+
+
+async def run_linux_background_job(
+    sb: Any, script: str, phase: str, timeout: float
+) -> tuple[int, str]:
+    script_path = "/tmp/cua-bootstrap.sh"
+    log_path = "/tmp/cua-bootstrap.log"
+    result_path = "/tmp/cua-bootstrap.result"
+    # The guest command server rejects any command that leaves a backgrounded
+    # child ("&", nohup, setsid all fail), so the job must detach through the
+    # service manager — the schtasks analog used on Windows.
+    sudo = 'if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO=sudo; fi; '
+    cleanup = (
+        sudo
+        + "$SUDO systemctl stop cua-bootstrap.service 2>/dev/null; "
+        + "$SUDO systemctl reset-failed cua-bootstrap.service 2>/dev/null; "
+        + f"$SUDO rm -f {log_path} {result_path}; true"
+    )
+    await wait_for_step(sb.shell.run(cleanup, timeout=20), f"{phase}.prepare", 30)
+    await wait_for_step(
+        sb.files.write_text(script_path, script), f"{phase}.runner-upload", 30
+    )
+    launch = (
+        sudo
+        + "$SUDO systemd-run --collect --unit=cua-bootstrap sh -c "
+        + f"'bash {script_path} >{log_path} 2>&1; echo $? >{result_path}'"
+    )
+    started = await wait_for_step(
+        sb.shell.run(launch, timeout=20), f"{phase}.launch", 30
+    )
+    if started.returncode != 0:
+        raise RuntimeError(started.stderr or "failed to launch Linux background job")
+
+    began = time.monotonic()
+    next_heartbeat = began
+    poll = (
+        f"if [ -f {result_path} ]; then echo __DONE__$(cat {result_path}); "
+        f"tail -n 200 {log_path} 2>/dev/null; else echo __RUNNING__; fi"
+    )
+    while True:
+        elapsed = time.monotonic() - began
+        if elapsed >= timeout:
+            raise RuntimeError(f"{phase} timed out after {timeout:g} seconds")
+        if time.monotonic() >= next_heartbeat:
+            progress(phase, "background job is running", elapsed_seconds=round(elapsed))
+            next_heartbeat = time.monotonic() + 30
+        try:
+            result = await wait_for_step(
+                sb.shell.run(poll, timeout=20),
+                f"{phase}.poll-request",
+                30,
+                report=False,
+            )
+        except RuntimeError as error:
+            progress(
+                f"{phase}.poll",
+                "guest status poll failed; background job may still be running",
+                failure=error_text(error),
+            )
+            await asyncio.sleep(5)
+            continue
+        lines = result.stdout.splitlines()
+        if lines and lines[0].startswith("__DONE__"):
+            raw_code = lines[0].removeprefix("__DONE__").strip()
+            try:
+                code = int(raw_code)
+            except ValueError as error:
+                raise RuntimeError(f"invalid Linux job result: {raw_code!r}") from error
+            return code, "\n".join(lines[1:]).strip()
+        await asyncio.sleep(5)
 
 
 async def run_windows_background_job(
@@ -1356,58 +1448,139 @@ def healthy_over_ssh(name: str, profile: str) -> str | None:
 
 
 def run_guest_ssh(
-    name: str, profile: str, command: str, *, timeout: int
+    name: str,
+    profile: str,
+    command: str,
+    *,
+    timeout: int,
+    stream_phase: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     progress(f"ssh.{name}", "running remote command")
+    argv = ["ssh", *ssh_options(profile), f"cua@{name}", command]
+    if stream_phase is None:
+        try:
+            result = subprocess.run(
+                argv, capture_output=True, text=True, timeout=timeout, check=False
+            )
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError(
+                f"SSH command on {name} timed out after {timeout} seconds"
+            ) from error
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"SSH command on {name} failed with exit {result.returncode}: "
+                f"{(result.stderr or result.stdout).strip()}"
+            )
+        return result
+
+    # Streamed variant: forward the latest output line (git --progress updates
+    # are \r-terminated) into the operation record so the UI can show it live.
+    import select
+
+    process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    assert process.stdout is not None
+    output = bytearray()
+    pending = b""
+    deadline = time.monotonic() + timeout
+    last_report = 0.0
+    while True:
+        if time.monotonic() >= deadline:
+            process.kill()
+            process.wait()
+            raise RuntimeError(
+                f"SSH command on {name} timed out after {timeout} seconds"
+            )
+        ready, _, _ = select.select([process.stdout], [], [], 1.0)
+        if ready:
+            chunk = os.read(process.stdout.fileno(), 65536)
+            if not chunk:
+                break
+            output += chunk
+            pending += chunk
+            parts = re.split(rb"[\r\n]", pending)
+            pending = parts.pop()
+            lines = [part for part in parts if part.strip()]
+            if lines and time.monotonic() - last_report >= 1.0:
+                progress(stream_phase, lines[-1].decode(errors="replace").strip()[:200])
+                last_report = time.monotonic()
+        elif process.poll() is not None:
+            break
+    returncode = process.wait()
+    text_output = output.decode(errors="replace")
+    if returncode != 0:
+        raise RuntimeError(
+            f"SSH command on {name} failed with exit {returncode}: "
+            f"{text_output.strip()[-2000:]}"
+        )
+    return subprocess.CompletedProcess(argv, returncode, stdout=text_output, stderr="")
+
+
+def guest_file_size(name: str, profile: str, remote_path: str) -> int | None:
+    """Best-effort size of a remote file over the multiplexed ssh connection."""
+    command = (
+        f"stat -c %s {shlex.quote(remote_path)} 2>/dev/null || echo 0"
+        if profile == "linux"
+        else f"(Get-Item -LiteralPath '{remote_path}' -ErrorAction SilentlyContinue).Length"
+    )
     try:
         result = subprocess.run(
             ["ssh", *ssh_options(profile), f"cua@{name}", command],
             capture_output=True,
             text=True,
-            timeout=timeout,
+            timeout=10,
             check=False,
         )
-    except subprocess.TimeoutExpired as error:
-        raise RuntimeError(
-            f"SSH command on {name} timed out after {timeout} seconds"
-        ) from error
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"SSH command on {name} failed with exit {result.returncode}: "
-            f"{(result.stderr or result.stdout).strip()}"
-        )
-    return result
+        return int(result.stdout.strip().splitlines()[-1])
+    except (subprocess.SubprocessError, OSError, ValueError, IndexError):
+        return None
 
 
 def copy_guest_file(name: str, profile: str, content: bytes, remote_path: str) -> None:
-    progress(f"scp.{name}", f"uploading {len(content)} bytes to {remote_path}")
+    total = len(content)
+    total_mib = total / 1048576
+    progress(f"scp.{name}", f"uploading {total_mib:.1f} MiB to {remote_path}")
     with tempfile.NamedTemporaryFile() as source:
         source.write(content)
         source.flush()
         target_path = remote_path.replace("\\", "/")
-        try:
-            result = subprocess.run(
-                [
-                    "scp",
-                    "-q",
-                    *ssh_options(profile),
-                    source.name,
-                    f"cua@{name}:{target_path}",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=300,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as error:
-            raise RuntimeError(
-                f"SCP upload to {name} timed out after 300 seconds"
-            ) from error
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"SCP upload to {name} failed with exit {result.returncode}: "
-            f"{(result.stderr or result.stdout).strip()}"
+        process = subprocess.Popen(
+            [
+                "scp",
+                "-q",
+                *ssh_options(profile),
+                source.name,
+                f"cua@{name}:{target_path}",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
         )
+        deadline = time.monotonic() + 300
+        # Poll the growing remote file so the operation reports a live percent
+        # instead of one silent blocking transfer.
+        while process.poll() is None:
+            if time.monotonic() >= deadline:
+                process.kill()
+                process.wait()
+                raise RuntimeError(f"SCP upload to {name} timed out after 300 seconds")
+            time.sleep(2)
+            if process.poll() is not None:
+                break
+            size = guest_file_size(name, profile, remote_path)
+            if size and total:
+                percent = min(100, size * 100 // total)
+                progress(
+                    f"scp.{name}",
+                    f"uploading {remote_path}: "
+                    f"{size / 1048576:.1f}/{total_mib:.1f} MiB ({percent}%)",
+                )
+        stdout, stderr = process.communicate()
+    if process.returncode != 0:
+        raise RuntimeError(
+            f"SCP upload to {name} failed with exit {process.returncode}: "
+            f"{(stderr or stdout).strip()}"
+        )
+    progress(f"scp.{name}", f"uploaded {total_mib:.1f} MiB to {remote_path}")
 
 
 def sync_guest_packages(name: str, profile: str, packages: tuple[str, ...]) -> None:
@@ -1443,22 +1616,28 @@ async def prepare_workspace(
         command = f"""set -eu
 mkdir -p /home/cua/workspaces /home/cua/.cache/cua-pi/git
 if [ ! -d {shlex.quote(repository_cache)} ]; then
-  git clone --mirror {shlex.quote(bundle.remote_url)} {shlex.quote(repository_cache)}
+  git clone --mirror --progress {shlex.quote(bundle.remote_url)} {shlex.quote(repository_cache)}
 elif ! git -C {shlex.quote(repository_cache)} cat-file -e {shlex.quote(bundle.commit + "^{commit}")} 2>/dev/null; then
-  git -C {shlex.quote(repository_cache)} fetch origin {shlex.quote(bundle.commit)}
+  git -C {shlex.quote(repository_cache)} fetch --progress origin {shlex.quote(bundle.commit)}
 fi
 if [ ! -d {shlex.quote(workspace_root)}/.git ]; then
-  git clone --reference-if-able {shlex.quote(repository_cache)} --dissociate --no-checkout {shlex.quote(bundle.remote_url)} {shlex.quote(workspace_root)}
+  git clone --reference-if-able {shlex.quote(repository_cache)} --dissociate --no-checkout --progress {shlex.quote(bundle.remote_url)} {shlex.quote(workspace_root)}
 fi
 if ! git -C {shlex.quote(workspace_root)} cat-file -e {shlex.quote(bundle.commit + "^{commit}")} 2>/dev/null; then
-  git -C {shlex.quote(workspace_root)} fetch --depth=1 origin {shlex.quote(bundle.commit)}
+  git -C {shlex.quote(workspace_root)} fetch --depth=1 --progress origin {shlex.quote(bundle.commit)}
 fi
 git -C {shlex.quote(workspace_root)} checkout --detach --force {shlex.quote(bundle.commit)}
 tar -xzf {shlex.quote(archive_path)} -C {shlex.quote(workspace_root)}
 rm -f {deleted}
 rm -f {shlex.quote(archive_path)}
 """
-        run_guest_ssh(name, profile, command, timeout=1200)
+        run_guest_ssh(
+            name,
+            profile,
+            command,
+            timeout=1200,
+            stream_phase=f"workspace.{name}.sync",
+        )
         return str(
             PurePosixPath(workspace_root)
             / PurePosixPath(bundle.relative_cwd.as_posix())
@@ -1492,6 +1671,7 @@ Remove-Item -Force {powershell_literal(archive_path)}
         profile,
         rf"powershell.exe -NoProfile -ExecutionPolicy Bypass -File {script_path}",
         timeout=1800,
+        stream_phase=f"workspace.{name}.sync",
     )
     relative_windows = PureWindowsPath(*bundle.relative_cwd.parts)
     return str(PureWindowsPath(workspace_root) / relative_windows)
