@@ -636,29 +636,33 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       "this provisions a persistent fleet claim and incurs cost.",
     );
     if (!confirmed) return undefined;
-    ctx.ui.setStatus(
-      "cua-session",
-      ctx.ui.theme.fg("accent", `creating ${os} sandbox...`),
-    );
+    pi.events.emit("cua:execution-target-changed", {
+      kind: "progress",
+      label: `creating ${os} sandbox`,
+    });
     try {
       const result = await runBackend(
         { action: "create", os },
         ctx.signal,
         (status) => {
-          const detail = [status.phase, status.message]
-            .filter(Boolean)
-            .join(" — ");
-          ctx.ui.setStatus(
-            "cua-session",
-            ctx.ui.theme.fg("accent", `creating ${os} sandbox — ${detail}`),
-          );
+          pi.events.emit("cua:execution-target-changed", {
+            kind: "progress",
+            label: `creating ${os} sandbox`,
+            phase: status.phase,
+            message: status.message,
+          });
         },
       );
       const sandbox = requireSandbox(result);
       pi.events.emit("cua:sandboxes-changed", result);
+      pi.events.emit("cua:execution-target-changed", {
+        ...sandbox,
+        state: "connecting",
+      });
       return { kind: "sandbox", ...sandbox };
-    } finally {
-      ctx.ui.setStatus("cua-session", undefined);
+    } catch (error) {
+      pi.events.emit("cua:execution-target-changed", target);
+      throw error;
     }
   }
 
@@ -771,14 +775,12 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         },
         ctx.signal,
         (status) => {
-          if (!ctx.hasUI) return;
-          const detail = [status.phase, status.message]
-            .filter(Boolean)
-            .join(" — ");
-          ctx.ui.setStatus(
-            "cua-session",
-            ctx.ui.theme.fg("accent", `${destination.name}: ${detail}`),
-          );
+          pi.events.emit("cua:execution-target-changed", {
+            ...destination,
+            state: "connecting",
+            phase: status.phase,
+            message: status.message,
+          });
         },
       );
       if (typeof result.remote_cwd !== "string") {
@@ -793,8 +795,6 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     } catch (error) {
       pi.events.emit("cua:execution-target-changed", target);
       throw error;
-    } finally {
-      if (ctx.hasUI) ctx.ui.setStatus("cua-session", undefined);
     }
   }
 
