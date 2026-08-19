@@ -638,7 +638,8 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     if (!confirmed) return undefined;
     pi.events.emit("cua:execution-target-changed", {
       kind: "progress",
-      label: `creating ${os} sandbox`,
+      state: "creating",
+      os,
     });
     try {
       const result = await runBackend(
@@ -647,7 +648,8 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         (status) => {
           pi.events.emit("cua:execution-target-changed", {
             kind: "progress",
-            label: `creating ${os} sandbox`,
+            state: "creating",
+            os,
             phase: status.phase,
             message: status.message,
           });
