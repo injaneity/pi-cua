@@ -374,7 +374,9 @@ class SandboxResources:
     memory_mb: int
 
 
-CUSTOM_POOL_SUFFIX = re.compile(r"(?P<cpu>[1-9]\d*)c-(?P<memory_mb>[1-9]\d*)m")
+CUSTOM_POOL_PATTERN = re.compile(
+    r"^cua-pi-custom-(?P<profile>linux|windows)-[0-9a-f]{16}$"
+)
 
 
 def sandbox_resources(
@@ -391,28 +393,19 @@ def sandbox_resources(
         raise ValueError("cpu must be a positive integer")
     if type(memory_mb) is not int or memory_mb <= 0:
         raise ValueError("memory_mb must be a positive integer")
-    return SandboxResources(f"{spec['pool']}-{cpu}c-{memory_mb}m", cpu, memory_mb)
-
-
-def resources_for_pool(profile: str, pool: str) -> SandboxResources | None:
-    default = sandbox_resources(profile)
-    if pool == default.pool:
-        return default
-    prefix = f"{default.pool}-"
-    match = CUSTOM_POOL_SUFFIX.fullmatch(pool.removeprefix(prefix))
-    if not pool.startswith(prefix) or match is None:
-        return None
-    return SandboxResources(
-        pool, int(match.group("cpu")), int(match.group("memory_mb"))
-    )
+    identity = f"{spec['pool']}\0{profile}\0{cpu}\0{memory_mb}"
+    digest = hashlib.sha256(identity.encode()).hexdigest()[:16]
+    return SandboxResources(f"cua-pi-custom-{profile}-{digest}", cpu, memory_mb)
 
 
 def profile_for_pool(pool: object) -> str | None:
     if not isinstance(pool, str):
         return None
-    return next(
-        (profile for profile in PROFILES if resources_for_pool(profile, pool)), None
+    default = next(
+        (profile for profile, spec in PROFILES.items() if spec["pool"] == pool), None
     )
+    match = CUSTOM_POOL_PATTERN.fullmatch(pool)
+    return default or (match.group("profile") if match else None)
 
 
 def record_sandbox(name: str, profile: str, reference: dict[str, Any]) -> None:
@@ -473,17 +466,12 @@ def controller_sandboxes() -> list[dict[str, Any]]:
     items = []
     for row in rows:
         addresses = json.loads(row["tailscale_addresses"] or "[]")
-        resources = resources_for_pool(
-            row["os"], row["pool_name"]
-        ) or sandbox_resources(row["os"])
         items.append(
             {
                 "name": row["name"],
                 "os": row["os"],
                 "pool": row["pool_name"],
                 "address": addresses[0] if addresses else None,
-                "cpu": resources.cpu,
-                "memory_mb": resources.memory_mb,
             }
         )
     return items
@@ -768,16 +756,11 @@ def local_states() -> list[dict[str, Any]]:
         if state.get("runtime_type") == "fleet" and profile:
             name = state.get("name", path.stem)
             if isinstance(name, str):
-                resources = resources_for_pool(profile, pool)
-                if resources is None:
-                    continue
                 by_name[name] = {
                     **by_name.get(name, {}),
                     "name": name,
                     "os": profile,
                     "pool": pool,
-                    "cpu": resources.cpu,
-                    "memory_mb": resources.memory_mb,
                 }
     return sorted(by_name.values(), key=lambda item: item["name"])
 
@@ -1317,9 +1300,7 @@ async def ensure_one(name: str) -> dict[str, Any]:
     states = {item["name"]: item for item in local_states()}
     if name not in states:
         raise ValueError(f"unknown managed sandbox: {name}")
-    state = states[name]
-    profile = state["os"]
-    defaults = sandbox_resources(profile)
+    profile = states[name]["os"]
     tailnet = local_tailscale_identity()
 
     restore_cua_state(name)
@@ -1337,8 +1318,6 @@ async def ensure_one(name: str) -> dict[str, Any]:
         return {
             "name": name,
             "os": profile,
-            "cpu": state.get("cpu", defaults.cpu),
-            "memory_mb": state.get("memory_mb", defaults.memory_mb),
             "address": address,
             "changed": changed,
         }
@@ -1416,8 +1395,6 @@ async def create_one(
         return {
             "name": name,
             "os": profile,
-            "cpu": resources.cpu,
-            "memory_mb": resources.memory_mb,
             "address": address,
             "changed": True,
         }

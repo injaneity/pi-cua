@@ -15,13 +15,13 @@ import backend
 
 
 class ResourceSelectionTests(unittest.TestCase):
-    def test_resources_round_trip_through_the_pool_name(self) -> None:
+    def test_resources_have_a_deterministic_pool(self) -> None:
         default = backend.sandbox_resources("linux")
         custom = backend.sandbox_resources("linux", 16, 64 * 1024)
 
         self.assertEqual((default.cpu, default.memory_mb), (8, 16 * 1024))
-        self.assertEqual(custom.pool, f"{default.pool}-16c-65536m")
-        self.assertEqual(backend.resources_for_pool("linux", custom.pool), custom)
+        self.assertEqual(custom, backend.sandbox_resources("linux", 16, 64 * 1024))
+        self.assertRegex(custom.pool, r"^cua-pi-custom-linux-[0-9a-f]{16}$")
         self.assertEqual(backend.profile_for_pool(custom.pool), "linux")
 
     def test_custom_resources_require_two_positive_integers(self) -> None:
@@ -78,12 +78,13 @@ class LocalStateTests(unittest.TestCase):
     def test_only_managed_fleet_claims_are_listed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state_dir = Path(directory)
+            custom_pool = backend.sandbox_resources("linux", 16, 65536).pool
             (state_dir / "linux-1.json").write_text(
                 json.dumps(
                     {
                         "name": "linux-1",
                         "runtime_type": "fleet",
-                        "pool_name": "cua-pi-linux-16c-65536m",
+                        "pool_name": custom_pool,
                     }
                 )
             )
@@ -111,9 +112,7 @@ class LocalStateTests(unittest.TestCase):
                         {
                             "name": "linux-1",
                             "os": "linux",
-                            "pool": "cua-pi-linux-16c-65536m",
-                            "cpu": 16,
-                            "memory_mb": 65536,
+                            "pool": custom_pool,
                         }
                     ],
                 )
@@ -135,8 +134,6 @@ class LocalStateTests(unittest.TestCase):
                 "os": "linux",
                 "pool": "cua-pi-linux",
                 "address": "100.64.0.2",
-                "cpu": 8,
-                "memory_mb": 16 * 1024,
             }
             with (
                 patch.object(backend, "STATE_DIR", state_dir),

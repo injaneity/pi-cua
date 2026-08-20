@@ -58,8 +58,6 @@ type SandboxItem = {
   os: SandboxOS;
   pool: string;
   online: boolean;
-  cpu: number;
-  memory_mb: number;
 };
 type WorkspaceState = {
   version: 1;
@@ -83,8 +81,6 @@ type BackendResult = {
   os?: SandboxOS;
   address?: string;
   changed?: boolean;
-  cpu?: number;
-  memory_mb?: number;
   state?: string;
   remote_cwd?: string;
   workspace_state?: WorkspaceState;
@@ -525,7 +521,7 @@ function formatList(items: SandboxItem[]): string {
   return items
     .map(
       (item) =>
-        `${item.name}\t${item.os}\t${item.cpu} CPUs\t${item.memory_mb} MiB\t${item.online ? "online" : "offline"}`,
+        `${item.name}\t${item.os}\t${item.online ? "online" : "offline"}`,
     )
     .join("\n");
 }
@@ -737,7 +733,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       ...online.map((sandbox) => ({
         value: sandbox.name,
         label: sandbox.name,
-        description: `${sandbox.os} • ${sandbox.cpu} CPUs • ${sandbox.memory_mb} MiB • reachable over Tailscale`,
+        description: `${sandbox.os} • reachable over Tailscale`,
       })),
       {
         value: "create",
