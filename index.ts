@@ -15,6 +15,7 @@ import {
   Text,
 } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
+import { preferPickerItem } from "./session-targets.mjs";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { homedir } from "node:os";
@@ -461,13 +462,15 @@ async function themedSelect(
   ctx: UIContext,
   title: string,
   items: PickerItem[],
+  preferred?: string,
 ): Promise<string | undefined> {
+  const ordered = preferPickerItem(items, preferred) as PickerItem[];
   if (ctx.mode !== "tui") {
     const selected = await ctx.ui.select(
       title,
-      items.map((item) => item.label),
+      ordered.map((item) => item.label),
     );
-    return items.find((item) => item.label === selected)?.value;
+    return ordered.find((item) => item.label === selected)?.value;
   }
   const selected = await ctx.ui.custom<string | null>(
     (tui, theme, _keybindings, done) => {
@@ -476,7 +479,7 @@ async function themedSelect(
         new DynamicBorder((text: string) => theme.fg("accent", text)),
       );
       container.addChild(new Text(theme.fg("accent", theme.bold(title)), 1, 0));
-      const list = new SelectList(items, Math.min(items.length, 12), {
+      const list = new SelectList(ordered, Math.min(ordered.length, 12), {
         selectedPrefix: (text) => theme.fg("accent", text),
         selectedText: (text) =>
           theme.fg(
@@ -770,11 +773,12 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
 
   async function pickDestination(
     ctx: UIContext,
+    active?: ExecutionTarget,
   ): Promise<Destination | undefined> {
     if (!ctx.hasUI) return undefined;
     const listed = await runBackend({ action: "list" }, ctx.signal);
     const online = (listed.sandboxes ?? []).filter((sandbox) => sandbox.online);
-    const choice = await themedSelect(ctx, "Session execution", [
+    const items = [
       { value: "local", label: "local", description: "run tools on this Mac" },
       ...online.map((sandbox) => ({
         value: sandbox.name,
@@ -786,7 +790,13 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         label: "create new sandbox",
         description: "provision a persistent CUA sandbox",
       },
-    ]);
+    ];
+    const choice = await themedSelect(
+      ctx,
+      "Session execution",
+      items,
+      active?.kind === "sandbox" ? active.name : undefined,
+    );
     if (!choice) return undefined;
     if (choice === "local") return { kind: "local" };
     if (choice === "create") {
@@ -860,6 +870,13 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     options: { inheritWorkspace?: boolean } = {},
   ): Promise<Extract<ExecutionTarget, { kind: "sandbox" }>> {
     const { inheritWorkspace = true } = options;
+    if (
+      inheritWorkspace &&
+      target.kind === "sandbox" &&
+      target.name === destination.name
+    ) {
+      return target;
+    }
     captureToolProviders();
     pi.events.emit("cua:execution-target-changed", {
       ...destination,
@@ -943,6 +960,10 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     ctx: UIContext,
     options: { persist?: boolean } = {},
   ): Promise<void> {
+    if (next === target && bridge) {
+      if (options.persist !== false) await saveTarget(next, ctx);
+      return;
+    }
     const expectedTools = captureToolProviders();
     const nextBridge =
       next.kind === "sandbox" ? new ToolBridge(next, expectedTools) : undefined;
@@ -1123,7 +1144,10 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         (event.reason === "startup" &&
           ctx.sessionManager.getEntries().length === 0);
       if (!needsTarget) return;
-      const destination = await pickDestination(ctx);
+      const destination = await pickDestination(
+        ctx,
+        event.reason === "new" ? target : undefined,
+      );
       if (!destination || destination.kind === "local") {
         await activate({ kind: "local" }, ctx);
         return;

@@ -66,7 +66,8 @@ workspace preparation requires a git repository with a network `origin` and does
 uvx --quiet ruff format --check backend.py test_backend.py
 uvx --quiet ruff check backend.py test_backend.py
 python3 -m unittest -q test_backend.py
-npm exec --yes --package=prettier -- prettier --check index.ts tool-host.mjs
+node test-session-targets.mjs
+npm exec --yes --package=prettier -- prettier --check index.ts session-targets.mjs test-session-targets.mjs tool-host.mjs
 node --check tool-host.mjs
 pi --list-models
 ```
