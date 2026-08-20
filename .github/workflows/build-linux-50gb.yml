@@ -1,4 +1,4 @@
-name: diagnose resized linux boot
+name: build boot-preserving linux 30gb containerdisk
 
 on:
   push:
@@ -6,53 +6,66 @@ on:
 
 permissions:
   contents: read
-  packages: read
+  packages: write
 
 env:
-  IMAGE: ghcr.io/injaneity/pi-cua-linux@sha256:31b5392b69313bf7855945455a9a9a1fd2cf7b09b56ca2deea5d4b1c3f6146cc
+  SOURCE_IMAGE: public.ecr.aws/k5j5w0x5/cua-ubuntu-24.04@sha256:85b3f5022bf9ecc864472f5fade5e2f1f54ab88ce429af7873a1415d668dc2ea
+  STAGING_IMAGE: ghcr.io/injaneity/pi-cua-linux:30gb-preserved-staging
+  TARGET_IMAGE: ghcr.io/injaneity/pi-cua-linux:30gb-preserved-amd64
 
 jobs:
-  boot:
+  build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: reclaim runner storage
         run: |
           sudo rm -rf /opt/hostedtoolcache
           docker system prune -af
 
-      - name: install diagnostics
+      - name: install image tools
         run: |
           sudo apt-get update -qq
-          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq qemu-system-x86 qemu-utils libguestfs-tools linux-image-generic socat imagemagick tesseract-ocr
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq qemu-system-x86 qemu-utils cloud-guest-utils gdisk libguestfs-tools linux-image-generic socat imagemagick tesseract-ocr
           sudo chmod 0644 /boot/vmlinuz-*
-          sudo chmod 666 /dev/kvm 2>/dev/null || true
 
-      - name: extract and inspect disk
+      - name: resize root without changing partition numbers
         env:
           LIBGUESTFS_BACKEND: direct
           LIBGUESTFS_MEMSIZE: "1024"
         run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-          docker pull --platform linux/amd64 "$IMAGE"
-          container=$(docker create --platform linux/amd64 "$IMAGE" /bin/true)
-          docker cp "$container:/disk/disk.img" disk.img
+          docker pull --platform linux/amd64 "$SOURCE_IMAGE"
+          container=$(docker create --platform linux/amd64 "$SOURCE_IMAGE" /bin/true)
+          docker cp "$container:/disk/disk.img" disk.raw
           docker rm "$container"
-          qemu-img info disk.img
-          virt-filesystems -a disk.img --all --long --uuid -h
-          virt-df -h -a disk.img
+          docker image rm "$SOURCE_IMAGE"
 
-      - name: boot with Fleet-compatible BIOS settings
+          qemu-img resize -f raw disk.raw 30G
+          loop=$(sudo losetup --find --show --partscan disk.raw)
+          trap 'sudo losetup -d "$loop" 2>/dev/null || true' EXIT
+          sudo sgdisk -e "$loop"
+          sudo growpart "$loop" 1
+          sudo e2fsck -fy "${loop}p1"
+          sudo resize2fs "${loop}p1"
+          sudo losetup -d "$loop"
+          trap - EXIT
+
+          qemu-img convert -p -O qcow2 -c disk.raw disk.qcow2
+          rm disk.raw
+          qemu-img info disk.qcow2
+          virt-filesystems -a disk.qcow2 --all --long --uuid -h
+          virt-df -h -a disk.qcow2
+
+      - name: boot-test resized disk
         run: |
           set +e
-          format=$(qemu-img info --output=json disk.img | jq -r .format)
           qemu-system-x86_64 \
             -accel tcg \
             -machine q35 \
             -cpu max \
             -smp 2 \
             -m 4096 \
-            -drive file=disk.img,format="$format",if=virtio \
+            -drive file=disk.qcow2,format=qcow2,if=virtio \
             -netdev user,id=net0,hostfwd=tcp::18000-:8000 \
             -device virtio-net-pci,netdev=net0 \
             -display none \
@@ -69,18 +82,30 @@ jobs:
             if ! kill -0 "$pid" 2>/dev/null; then break; fi
             sleep 5
           done
-          printf 'info status\ninfo block\nscreendump boot.ppm\n' | socat - UNIX-CONNECT:qemu-monitor.sock || true
+          printf 'screendump boot.ppm\n' | socat - UNIX-CONNECT:qemu-monitor.sock || true
           convert boot.ppm boot.png 2>/dev/null || true
           echo "--- boot screen OCR ---"
           tesseract boot.png stdout 2>/dev/null || true
-          echo "--- monitor ---"
-          printf 'info status\ninfo block\n' | socat - UNIX-CONNECT:qemu-monitor.sock || true
           kill "$pid" 2>/dev/null || true
           wait "$pid" 2>/dev/null || true
           echo "--- qemu stderr ---"
           cat qemu.stderr
           echo "--- serial console ---"
           cat serial.log
-          echo "--- result ---"
           echo "service_ready=$booted"
           test "$booted" = true
+
+      - name: publish tested containerdisk
+        run: |
+          mkdir -p layer/disk
+          mv disk.qcow2 layer/disk/disk.img
+          tar -czf disk-layer.tar.gz -C layer disk
+          version=0.20.6
+          curl -fsSL "https://github.com/google/go-containerregistry/releases/download/v${version}/go-containerregistry_Linux_x86_64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin crane
+          echo "${{ secrets.GITHUB_TOKEN }}" | crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin
+          crane append --new_layer disk-layer.tar.gz --new_tag "$STAGING_IMAGE"
+          crane mutate "$STAGING_IMAGE" --set-platform linux/amd64 --tag "$TARGET_IMAGE"
+          digest=$(crane digest "$TARGET_IMAGE")
+          crane config "$TARGET_IMAGE" | jq '{os, architecture, rootfs}'
+          echo "image: $TARGET_IMAGE@$digest" >> "$GITHUB_STEP_SUMMARY"
