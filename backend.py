@@ -2402,6 +2402,7 @@ def ensure_cloud_runtime(action: object, request: dict[str, Any]) -> None:
         "uv",
         "run",
         "--quiet",
+        "--no-project",
         "--python",
         "3.11",
         "--with",
