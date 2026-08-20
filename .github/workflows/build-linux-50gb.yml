@@ -51,18 +51,20 @@ jobs:
           sudo sgdisk -e /dev/nbd0
           sudo qemu-nbd --disconnect /dev/nbd0
 
-          # Reconnect after repairing the backup GPT so the kernel scans the
-          # corrected table and exposes the original root as partition 1.
-          sudo qemu-nbd --connect=/dev/nbd0 disk.source.qcow2
+          # Use a different NBD device after repairing the backup GPT. nbd0 can
+          # remain in kernel teardown briefly and report a misleading 0-byte disk.
+          sudo qemu-nbd --connect=/dev/nbd1 disk.source.qcow2
+          trap 'sudo qemu-nbd --disconnect /dev/nbd1 2>/dev/null || true' EXIT
           sudo udevadm settle
-          sudo lsblk -o NAME,SIZE,TYPE,FSTYPE /dev/nbd0
-          test -b /dev/nbd0p1
-          sudo growpart /dev/nbd0 1
-          sudo partprobe /dev/nbd0
+          test "$(sudo blockdev --getsize64 /dev/nbd1)" -gt 30000000000
+          sudo lsblk -o NAME,SIZE,TYPE,FSTYPE /dev/nbd1
+          test -b /dev/nbd1p1
+          sudo growpart /dev/nbd1 1
+          sudo partprobe /dev/nbd1
           sudo udevadm settle
-          sudo e2fsck -fy /dev/nbd0p1
-          sudo resize2fs /dev/nbd0p1
-          sudo qemu-nbd --disconnect /dev/nbd0
+          sudo e2fsck -fy /dev/nbd1p1
+          sudo resize2fs /dev/nbd1p1
+          sudo qemu-nbd --disconnect /dev/nbd1
           trap - EXIT
 
           qemu-img convert -p -O qcow2 -c disk.source.qcow2 disk.qcow2
