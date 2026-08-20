@@ -21,6 +21,14 @@ class SizeSelectionTests(unittest.TestCase):
 
         self.assertEqual((default.cpu, default.memory_mb), (8, 16 * 1024))
         self.assertEqual((large.cpu, large.memory_mb), (16, 64 * 1024))
+        self.assertEqual(
+            (
+                backend.sandbox_size("windows").cpu,
+                backend.sandbox_size("windows").memory_mb,
+            ),
+            (10, 20 * 1024),
+        )
+        self.assertEqual(backend.sandbox_size("linux", "large"), large)
         self.assertNotEqual(default.pool, large.pool)
         self.assertEqual(backend.profile_for_pool(large.pool), "linux")
         self.assertEqual(backend.size_for_pool("linux", large.pool), large)
@@ -69,6 +77,16 @@ class SizeCreationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pool.apply.call_args.kwargs["cpu"], 16)
         self.assertEqual(pool.apply.call_args.kwargs["memory_mb"], 64 * 1024)
 
+    async def test_dispatch_passes_size_to_create(self) -> None:
+        create = AsyncMock(return_value={"name": "linux-1"})
+        with (
+            patch.object(backend, "configure_fleet_auth"),
+            patch.object(backend, "create_one", create),
+        ):
+            await backend.dispatch({"action": "create", "os": "linux", "size": "large"})
+
+        create.assert_awaited_once_with("linux", None, "large")
+
 
 class LocalStateTests(unittest.TestCase):
     def test_only_managed_fleet_claims_are_listed(self) -> None:
@@ -108,6 +126,9 @@ class LocalStateTests(unittest.TestCase):
                             "name": "linux-1",
                             "os": "linux",
                             "pool": "cua-pi-linux",
+                            "size": "default",
+                            "cpu": 8,
+                            "memory_mb": 16 * 1024,
                         }
                     ],
                 )
@@ -129,6 +150,9 @@ class LocalStateTests(unittest.TestCase):
                 "os": "linux",
                 "pool": "cua-pi-linux",
                 "address": "100.64.0.2",
+                "size": "default",
+                "cpu": 8,
+                "memory_mb": 16 * 1024,
             }
             with (
                 patch.object(backend, "STATE_DIR", state_dir),

@@ -106,12 +106,16 @@ PROFILES = {
 
 LARGE_SIZES = {
     "linux": {
-        "pool": os.environ.get("CUA_PI_LINUX_LARGE_POOL", "cua-pi-linux-large"),
+        "pool": os.environ.get(
+            "CUA_PI_LINUX_LARGE_POOL", f"{PROFILES['linux']['pool']}-large"
+        ),
         "cpu": 16,
         "memory_mb": 64 * 1024,
     },
     "windows": {
-        "pool": os.environ.get("CUA_PI_WINDOWS_LARGE_POOL", "cua-pi-windows-large"),
+        "pool": os.environ.get(
+            "CUA_PI_WINDOWS_LARGE_POOL", f"{PROFILES['windows']['pool']}-large"
+        ),
         "cpu": 16,
         "memory_mb": 64 * 1024,
     },
@@ -791,11 +795,15 @@ def local_states() -> list[dict[str, Any]]:
         if state.get("runtime_type") == "fleet" and profile:
             name = state.get("name", path.stem)
             if isinstance(name, str):
+                size = size_for_pool(profile, pool)
                 by_name[name] = {
                     **by_name.get(name, {}),
                     "name": name,
                     "os": profile,
                     "pool": pool,
+                    "size": size.name,
+                    "cpu": size.cpu,
+                    "memory_mb": size.memory_mb,
                 }
     return sorted(by_name.values(), key=lambda item: item["name"])
 
