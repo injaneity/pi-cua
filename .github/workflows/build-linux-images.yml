@@ -1,0 +1,105 @@
+name: build linux sandbox images
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [feat/linux-image-catalog]
+    paths:
+      - images/linux/**
+      - .github/workflows/build-linux-images.yml
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  UBUNTU_IMAGE_URL: https://cloud-images.ubuntu.com/noble/20260814/noble-server-cloudimg-amd64.img
+  UBUNTU_IMAGE_SHA256: 6e40c07ae715f744f84af0bec76415cc1987dd115b4b8de437818561f01a3733
+  DISK_GB: "30"
+  STAGING_IMAGE: ghcr.io/injaneity/pi-cua-linux:30gb-fresh-staging
+  TARGET_IMAGE: ghcr.io/injaneity/pi-cua-linux:30gb-fresh-amd64
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+
+      - name: reclaim runner storage
+        run: |
+          sudo rm -rf /opt/hostedtoolcache
+          docker system prune -af
+
+      - name: install image tools
+        run: |
+          sudo apt-get update -qq
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            qemu-system-x86 qemu-utils libguestfs-tools linux-image-generic
+          sudo chmod 0644 /boot/vmlinuz-*
+
+      - name: build fresh ubuntu disk
+        env:
+          LIBGUESTFS_BACKEND: direct
+          LIBGUESTFS_MEMSIZE: "1024"
+        run: |
+          curl -fL "$UBUNTU_IMAGE_URL" -o disk.qcow2
+          printf '%s  %s\n' "$UBUNTU_IMAGE_SHA256" disk.qcow2 | sha256sum -c -
+          qemu-img resize disk.qcow2 "${DISK_GB}G"
+          virt-customize \
+            -a disk.qcow2 \
+            --copy-in images/linux/provision.sh:/root \
+            --run-command 'chmod 700 /root/provision.sh' \
+            --run-command '/root/provision.sh' \
+            --run-command 'rm -f /root/provision.sh'
+          qemu-img info disk.qcow2
+          virt-filesystems -a disk.qcow2 --all --long --uuid -h
+
+      - name: boot-test image
+        run: |
+          set +e
+          qemu-system-x86_64 \
+            -accel tcg \
+            -machine q35 \
+            -cpu max \
+            -smp 2 \
+            -m 4096 \
+            -drive file=disk.qcow2,format=qcow2,if=virtio \
+            -netdev user,id=net0,hostfwd=tcp::18000-:8000 \
+            -device virtio-net-pci,netdev=net0 \
+            -display none \
+            -serial file:serial.log \
+            >qemu.stdout 2>qemu.stderr &
+          pid=$!
+          booted=false
+          for attempt in $(seq 1 150); do
+            if curl -fsS --max-time 2 http://127.0.0.1:18000/status; then
+              booted=true
+              break
+            fi
+            if ! kill -0 "$pid" 2>/dev/null; then break; fi
+            sleep 5
+          done
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+          echo "--- qemu stderr ---"
+          cat qemu.stderr
+          echo "--- serial console ---"
+          tail -500 serial.log
+          echo "service_ready=$booted"
+          test "$booted" = true
+
+      - name: publish tested containerdisk
+        run: |
+          mkdir -p layer/disk
+          mv disk.qcow2 layer/disk/disk.img
+          tar -czf disk-layer.tar.gz -C layer disk
+          version=0.20.6
+          curl -fsSL "https://github.com/google/go-containerregistry/releases/download/v${version}/go-containerregistry_Linux_x86_64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin crane
+          echo "${{ secrets.GITHUB_TOKEN }}" | crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin
+          crane append --new_layer disk-layer.tar.gz --new_tag "$STAGING_IMAGE"
+          crane mutate "$STAGING_IMAGE" --set-platform linux/amd64 --tag "$TARGET_IMAGE"
+          digest=$(crane digest "$TARGET_IMAGE")
+          crane config "$TARGET_IMAGE" | jq '{os, architecture, rootfs}'
+          echo "image: $TARGET_IMAGE@$digest" >> "$GITHUB_STEP_SUMMARY"
