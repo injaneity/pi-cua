@@ -25,7 +25,7 @@ windows provisioning also requires `~/.ssh/cua_windows_ed25519` and its `.pub` f
 - `/new` asks for a target before the new thread starts.
 - `/fork` inherits the parent thread's target but starts a new sandbox workspace from the current local checkout.
 - `/tree` changes conversation history but not execution placement.
-- `/resume` restores placement from the controller database.
+- `/resume` restores placement from durable session metadata, with the controller database as a compatibility fallback for older sessions.
 - the footer shows the selected sandbox. no remote tui or conversation session is created.
 
 custom images are available through the structured `cua_sandbox` create action's `image` field. they must be Fleet-compatible CUA containerDisks and pinned by `sha256` digest; mutable tags are rejected.
@@ -38,17 +38,17 @@ custom images are available through the structured `cua_sandbox` create action's
 2. it prepares the destination from the thread's local Git baseline, then applies the accumulated workspace delta from the active sandbox;
 3. the extension starts one non-tty ssh jsonl channel to `cua-tool-host.mjs`;
 4. the host loads pi's normal remote tool registry and reports its protocol and tool manifest;
-5. calls, updates, results, errors, cancellation, and user shell output use that channel.
+5. calls, updates, results, errors, cancellation, and user shell output use that channel. `Esc` rejects the local request immediately and asks the host to kill the full remote command process tree.
 
 all target changes use one workspace model: Pi records local and sandbox Git trees at sandbox entry, computes the accumulated binary tree diff when leaving a sandbox, verifies the destination baseline, and applies that diff. local divergence or a patch conflict stops the switch, and failure leaves the previous target active.
 
 ## state
 
-execution placement is controller metadata keyed by local pi session id and session file. it is not part of the conversation tree, so `/tree` and compaction cannot change it.
+execution placement is stored as non-context session metadata and mirrored in the controller database. restore reads the latest placement across the full session rather than the active branch, so `/tree` and compaction cannot change it.
 
 sandbox workspaces are keyed by session id. new threads and forks start from an exact snapshot of the current local checkout. a fork does not copy its parent's active sandbox workspace, so both threads retain independently verifiable local baselines.
 
-placement adds a stable operating-system instruction and logical `workspace root` cwd to the model prompt, but no sandbox name, physical path, or conversation entry. forks on the same target OS therefore keep the same prompt prefix for provider cache hits even though they receive different physical workspaces.
+placement adds a stable operating-system instruction and logical `workspace root` cwd to the model prompt, but no sandbox name, physical path, or model-visible conversation entry. forks on the same target OS therefore keep the same prompt prefix for provider cache hits even though they receive different physical workspaces.
 
 tool state belongs to the active remote host. switching targets invalidates target-specific references and background processes.
 

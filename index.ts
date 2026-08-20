@@ -26,6 +26,7 @@ const backend = join(extensionDir, "backend.py");
 const windowsIdentity = join(homedir(), ".ssh", "cua_windows_ed25519");
 const sandboxKnownHosts = join(homedir(), ".ssh", "cua_known_hosts");
 const protocolVersion = 2;
+const executionTargetEntry = "cua-execution-target";
 const localTools = new Set(["cua_sandbox", "report_papercut"]);
 
 const resourceSchema = Type.Object({
@@ -362,11 +363,20 @@ class ToolBridge {
     await this.start();
     if (options.signal?.aborted) throw new Error("aborted");
     return new Promise<T>((resolve, reject) => {
+      let settled = false;
       const finish = (callback: () => void) => {
+        if (settled) return;
+        settled = true;
         options.signal?.removeEventListener("abort", onAbort);
         callback();
       };
-      const onAbort = () => this.send({ type: "cancel", id });
+      const onAbort = () => {
+        try {
+          this.send({ type: "cancel", id });
+        } catch {}
+        this.pending.delete(id);
+        finish(() => reject(new Error("aborted")));
+      };
       options.signal?.addEventListener("abort", onAbort, { once: true });
       this.pending.set(id, {
         resolve: (value) => finish(() => resolve(value as T)),
@@ -669,10 +679,22 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     );
   }
 
+  function loadSessionTarget(ctx: UIContext): ExecutionTarget | undefined {
+    const entries = ctx.sessionManager.getEntries();
+    for (let index = entries.length - 1; index >= 0; index--) {
+      const entry = entries[index];
+      if (entry.type === "custom" && entry.customType === executionTargetEntry)
+        return parseTarget(entry.data);
+    }
+    return undefined;
+  }
+
   async function loadTarget(
     ctx: UIContext,
     previousSessionFile?: string,
-  ): Promise<ExecutionTarget | undefined> {
+  ): Promise<{ target: ExecutionTarget | undefined; persisted: boolean }> {
+    const sessionTarget = loadSessionTarget(ctx);
+    if (sessionTarget) return { target: sessionTarget, persisted: true };
     const current = await runBackend({
       action: "get_execution_target",
       session_id: ctx.sessionManager.getSessionId(),
@@ -680,12 +702,13 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         ctx.sessionManager.getSessionFile() ?? previousSessionFile ?? "",
     });
     const saved = parseTarget(current.target);
-    if (saved || !previousSessionFile) return saved;
+    if (saved || !previousSessionFile)
+      return { target: saved, persisted: false };
     const inherited = await runBackend({
       action: "get_execution_target",
       session_file: previousSessionFile,
     });
-    return parseTarget(inherited.target);
+    return { target: parseTarget(inherited.target), persisted: false };
   }
 
   async function saveTarget(
@@ -698,6 +721,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       session_file: ctx.sessionManager.getSessionFile() ?? "",
       target: next,
     });
+    pi.appendEntry(executionTargetEntry, next);
   }
 
   async function createSandbox(
@@ -917,6 +941,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
   async function activate(
     next: ExecutionTarget,
     ctx: UIContext,
+    options: { persist?: boolean } = {},
   ): Promise<void> {
     const expectedTools = captureToolProviders();
     const nextBridge =
@@ -929,7 +954,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     }
     try {
       await nextBridge?.connect();
-      await saveTarget(next, ctx);
+      if (options.persist !== false) await saveTarget(next, ctx);
     } catch (error) {
       nextBridge?.close();
       pi.events.emit("cua:execution-target-changed", target);
@@ -1074,10 +1099,11 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
 
   pi.on("session_start", async (event, ctx) => {
     try {
-      const saved = await loadTarget(
+      const loaded = await loadTarget(
         ctx,
         event.reason === "fork" ? event.previousSessionFile : undefined,
       );
+      const saved = loaded.target;
       if (saved) {
         if (event.reason === "fork" && saved.kind === "sandbox") {
           const prepared = await prepareTarget(
@@ -1087,7 +1113,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
           );
           await activate(prepared, ctx);
         } else {
-          await activate(saved, ctx);
+          await activate(saved, ctx, { persist: !loaded.persisted });
         }
         return;
       }

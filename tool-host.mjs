@@ -128,6 +128,24 @@ async function execute(request) {
   }
 }
 
+function killChildTree(child) {
+  if (!child.pid) return;
+  if (process.platform === "win32") {
+    const killer = spawn(
+      "taskkill.exe",
+      ["/PID", String(child.pid), "/T", "/F"],
+      { stdio: "ignore", windowsHide: true },
+    );
+    killer.unref();
+    return;
+  }
+  try {
+    process.kill(-child.pid, "SIGKILL");
+  } catch {
+    child.kill("SIGKILL");
+  }
+}
+
 function bash(request) {
   const controller = new AbortController();
   controllers.set(request.id, controller);
@@ -138,13 +156,14 @@ function bash(request) {
   const child = spawn(command[0], command[1], {
     cwd,
     stdio: ["ignore", "pipe", "pipe"],
+    detached: !windows,
   });
   children.set(request.id, child);
   let timedOut = false;
   const timer = request.timeout
     ? setTimeout(() => {
         timedOut = true;
-        child.kill("SIGKILL");
+        killChildTree(child);
       }, request.timeout * 1000)
     : undefined;
   const update = (data) =>
@@ -173,7 +192,7 @@ function bash(request) {
       aborted: controller.signal.aborted,
     });
   });
-  controller.signal.addEventListener("abort", () => child.kill("SIGKILL"), {
+  controller.signal.addEventListener("abort", () => killChildTree(child), {
     once: true,
   });
 }
@@ -199,7 +218,8 @@ function handle(request) {
   }
   if (request.type === "cancel" && typeof request.id === "string") {
     controllers.get(request.id)?.abort();
-    children.get(request.id)?.kill("SIGKILL");
+    const child = children.get(request.id);
+    if (child) killChildTree(child);
     return;
   }
   if (request.type === "shutdown") void shutdown();
