@@ -42,9 +42,19 @@ jobs:
 
           qemu-img resize -f raw disk.raw 30G
           loop=$(sudo losetup --find --show --partscan disk.raw)
-          trap 'sudo losetup -d "$loop" 2>/dev/null || true' EXIT
           sudo sgdisk -e "$loop"
+          sudo losetup -d "$loop"
+
+          # Reattach after repairing the backup GPT. The kernel's first partition
+          # scan used the stale table and growpart cannot operate on that view.
+          loop=$(sudo losetup --find --show --partscan disk.raw)
+          trap 'sudo losetup -d "$loop" 2>/dev/null || true' EXIT
+          sudo udevadm settle
+          sudo lsblk -o NAME,SIZE,TYPE,FSTYPE "$loop"
+          test -b "${loop}p1"
           sudo growpart "$loop" 1
+          sudo partprobe "$loop"
+          sudo udevadm settle
           sudo e2fsck -fy "${loop}p1"
           sudo resize2fs "${loop}p1"
           sudo losetup -d "$loop"
