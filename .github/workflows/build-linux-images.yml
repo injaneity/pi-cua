@@ -47,8 +47,10 @@ jobs:
           printf '%s  %s\n' "$UBUNTU_IMAGE_SHA256" disk.qcow2 | sha256sum -c -
           qemu-img resize disk.qcow2 "${DISK_GB}G"
           virt-customize \
+            --network \
             -a disk.qcow2 \
             --copy-in images/linux/provision.sh:/root \
+            --run-command 'rm -f /etc/resolv.conf && printf "nameserver 1.1.1.1\\nnameserver 8.8.8.8\\n" >/etc/resolv.conf' \
             --run-command 'chmod 700 /root/provision.sh' \
             --run-command '/root/provision.sh' \
             --run-command 'rm -f /root/provision.sh'
