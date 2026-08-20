@@ -9,7 +9,7 @@ permissions:
   packages: read
 
 env:
-  IMAGE: ghcr.io/injaneity/pi-cua-linux@sha256:e95f8fc657470c0f81270b1da5412d5d3977db6cb509b8c05fbd04551db2b4fe
+  IMAGE: ghcr.io/injaneity/pi-cua-linux@sha256:31b5392b69313bf7855945455a9a9a1fd2cf7b09b56ca2deea5d4b1c3f6146cc
 
 jobs:
   boot:
@@ -45,31 +45,34 @@ jobs:
       - name: boot with Fleet-compatible BIOS settings
         run: |
           set +e
+          format=$(qemu-img info --output=json disk.img | jq -r .format)
           qemu-system-x86_64 \
-            -accel kvm \
+            -accel tcg \
             -machine q35 \
-            -cpu host \
+            -cpu max \
             -smp 2 \
             -m 4096 \
-            -drive file=disk.img,format=raw,if=virtio \
+            -drive file=disk.img,format="$format",if=virtio \
             -netdev user,id=net0,hostfwd=tcp::18000-:8000 \
             -device virtio-net-pci,netdev=net0 \
             -display none \
             -monitor none \
             -serial file:serial.log \
-            -pidfile qemu.pid \
-            -daemonize
+            >qemu.stdout 2>qemu.stderr &
+          pid=$!
           booted=false
-          for attempt in $(seq 1 60); do
+          for attempt in $(seq 1 120); do
             if curl -fsS --max-time 2 http://127.0.0.1:18000/status; then
               booted=true
               break
             fi
-            if ! kill -0 "$(cat qemu.pid)" 2>/dev/null; then break; fi
+            if ! kill -0 "$pid" 2>/dev/null; then break; fi
             sleep 5
           done
-          kill "$(cat qemu.pid)" 2>/dev/null || true
-          wait "$(cat qemu.pid)" 2>/dev/null || true
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+          echo "--- qemu stderr ---"
+          cat qemu.stderr
           echo "--- serial console ---"
           cat serial.log
           echo "--- result ---"
