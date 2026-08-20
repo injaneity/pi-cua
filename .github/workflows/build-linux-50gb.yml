@@ -36,32 +36,37 @@ jobs:
         run: |
           docker pull --platform linux/amd64 "$SOURCE_IMAGE"
           container=$(docker create --platform linux/amd64 "$SOURCE_IMAGE" /bin/true)
-          docker cp "$container:/disk/disk.img" disk.raw
+          docker cp "$container:/disk/disk.img" disk.source.qcow2
           docker rm "$container"
           docker image rm "$SOURCE_IMAGE"
 
-          qemu-img resize -f raw disk.raw 30G
-          loop=$(sudo losetup --find --show --partscan disk.raw)
-          sudo sgdisk -e "$loop"
-          sudo losetup -d "$loop"
+          # The published disk is qcow2 despite its .img suffix. Keep it qcow2;
+          # treating it as raw corrupts its header and hides every partition.
+          test "$(qemu-img info --output=json disk.source.qcow2 | jq -r .format)" = qcow2
+          qemu-img resize disk.source.qcow2 30G
+          sudo modprobe nbd max_part=32
+          sudo qemu-nbd --connect=/dev/nbd0 disk.source.qcow2
+          trap 'sudo qemu-nbd --disconnect /dev/nbd0 2>/dev/null || true' EXIT
+          sudo udevadm settle
+          sudo sgdisk -e /dev/nbd0
+          sudo qemu-nbd --disconnect /dev/nbd0
 
-          # Reattach after repairing the backup GPT. The kernel's first partition
-          # scan used the stale table and growpart cannot operate on that view.
-          loop=$(sudo losetup --find --show --partscan disk.raw)
-          trap 'sudo losetup -d "$loop" 2>/dev/null || true' EXIT
+          # Reconnect after repairing the backup GPT so the kernel scans the
+          # corrected table and exposes the original root as partition 1.
+          sudo qemu-nbd --connect=/dev/nbd0 disk.source.qcow2
           sudo udevadm settle
-          sudo lsblk -o NAME,SIZE,TYPE,FSTYPE "$loop"
-          test -b "${loop}p1"
-          sudo growpart "$loop" 1
-          sudo partprobe "$loop"
+          sudo lsblk -o NAME,SIZE,TYPE,FSTYPE /dev/nbd0
+          test -b /dev/nbd0p1
+          sudo growpart /dev/nbd0 1
+          sudo partprobe /dev/nbd0
           sudo udevadm settle
-          sudo e2fsck -fy "${loop}p1"
-          sudo resize2fs "${loop}p1"
-          sudo losetup -d "$loop"
+          sudo e2fsck -fy /dev/nbd0p1
+          sudo resize2fs /dev/nbd0p1
+          sudo qemu-nbd --disconnect /dev/nbd0
           trap - EXIT
 
-          qemu-img convert -p -O qcow2 -c disk.raw disk.qcow2
-          rm disk.raw
+          qemu-img convert -p -O qcow2 -c disk.source.qcow2 disk.qcow2
+          rm disk.source.qcow2
           qemu-img info disk.qcow2
           virt-filesystems -a disk.qcow2 --all --long --uuid -h
           virt-df -h -a disk.qcow2
