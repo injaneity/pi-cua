@@ -88,37 +88,32 @@ WINDOWS_PUBLIC_KEY = HOME / ".ssh" / "cua_windows_ed25519.pub"
 
 PROFILES = {
     "linux": {
-        # Fleet pool/namespace names are a tenant-wide authorization boundary.
+        # Fleet pool/namespace names are a tenant-wide authorization boundary:
+        # if another tenant already owns the default namespace, every pool
+        # operation fails with a persistent 403.
+        "pool": os.environ.get("CUA_PI_LINUX_POOL", "cua-pi-linux"),
         "image": "public.ecr.aws/k5j5w0x5/cua-ubuntu-24.04@sha256:eb68411ed8b4d7c39829cdfe854b9d0485b78ee064c3171fd8e3f7450f7ccee7",
-        "sizes": {
-            "default": {
-                "pool": os.environ.get("CUA_PI_LINUX_POOL", "cua-pi-linux"),
-                "cpu": 8,
-                "memory_mb": 16 * 1024,
-            },
-            "large": {
-                "pool": os.environ.get("CUA_PI_LINUX_LARGE_POOL", "cua-pi-linux-large"),
-                "cpu": 16,
-                "memory_mb": 64 * 1024,
-            },
-        },
+        "cpu": 8,
+        "memory_mb": 16 * 1024,
     },
     "windows": {
+        "pool": os.environ.get("CUA_PI_WINDOWS_POOL", "cua-pi-windows"),
         "image": "public.ecr.aws/k5j5w0x5/cua-windows-2022@sha256:6d341afc26a37c4072d22ba403a89ecdad9a29aebab79570b5a38da6b8e16370",
-        "sizes": {
-            "default": {
-                "pool": os.environ.get("CUA_PI_WINDOWS_POOL", "cua-pi-windows"),
-                "cpu": 10,
-                "memory_mb": 20 * 1024,
-            },
-            "large": {
-                "pool": os.environ.get(
-                    "CUA_PI_WINDOWS_LARGE_POOL", "cua-pi-windows-large"
-                ),
-                "cpu": 16,
-                "memory_mb": 64 * 1024,
-            },
-        },
+        "cpu": 10,
+        "memory_mb": 20 * 1024,
+    },
+}
+
+LARGE_SIZES = {
+    "linux": {
+        "pool": os.environ.get("CUA_PI_LINUX_LARGE_POOL", "cua-pi-linux-large"),
+        "cpu": 16,
+        "memory_mb": 64 * 1024,
+    },
+    "windows": {
+        "pool": os.environ.get("CUA_PI_WINDOWS_LARGE_POOL", "cua-pi-windows-large"),
+        "cpu": 16,
+        "memory_mb": 64 * 1024,
     },
 }
 
@@ -308,9 +303,6 @@ def database() -> Iterator[sqlite3.Connection]:
             tailscale_tailnet TEXT,
             tailscale_device_id TEXT,
             tailscale_addresses TEXT,
-            size TEXT,
-            cpu INTEGER,
-            memory_mb INTEGER,
             updated_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS execution_targets (
@@ -326,17 +318,9 @@ def database() -> Iterator[sqlite3.Connection]:
     sandbox_columns = {
         row["name"] for row in connection.execute("PRAGMA table_info(sandboxes)")
     }
-    migrations = {
-        "tailscale_tailnet": "TEXT",
-        "tailscale_device_id": "TEXT",
-        "tailscale_addresses": "TEXT",
-        "size": "TEXT",
-        "cpu": "INTEGER",
-        "memory_mb": "INTEGER",
-    }
-    for column, kind in migrations.items():
+    for column in ("tailscale_tailnet", "tailscale_device_id", "tailscale_addresses"):
         if column not in sandbox_columns:
-            connection.execute(f"ALTER TABLE sandboxes ADD COLUMN {column} {kind}")
+            connection.execute(f"ALTER TABLE sandboxes ADD COLUMN {column} TEXT")
     try:
         yield connection
         connection.commit()
@@ -403,18 +387,23 @@ class SandboxSize:
     memory_mb: int
 
 
-def sandbox_size(profile: str, requested: str | None = None) -> SandboxSize:
+def size_specs(profile: str) -> dict[str, dict[str, Any]]:
     if profile not in PROFILES:
         raise ValueError("os must be linux or windows")
+    return {"default": PROFILES[profile], "large": LARGE_SIZES[profile]}
+
+
+def sandbox_size(profile: str, requested: str | None = None) -> SandboxSize:
+    sizes = size_specs(profile)
     name = (requested or "default").strip().lower()
-    spec = PROFILES[profile]["sizes"].get(name)
+    spec = sizes.get(name)
     if spec is None:
-        choices = ", ".join(PROFILES[profile]["sizes"])
+        choices = ", ".join(sizes)
         raise ValueError(f"size must be one of: {choices}")
     conflicts = [
         f"{other_profile}/{other_name}"
-        for other_profile, other in PROFILES.items()
-        for other_name, other_size in other["sizes"].items()
+        for other_profile in PROFILES
+        for other_name, other_size in size_specs(other_profile).items()
         if other_size["pool"] == spec["pool"]
         and (other_profile, other_name) != (profile, name)
     ]
@@ -432,19 +421,25 @@ def profile_for_pool(pool: object) -> str | None:
     return next(
         (
             profile
-            for profile, spec in PROFILES.items()
-            if any(size["pool"] == pool for size in spec["sizes"].values())
+            for profile in PROFILES
+            if any(size["pool"] == pool for size in size_specs(profile).values())
         ),
         None,
     )
 
 
-def record_sandbox(
-    name: str,
-    profile: str,
-    reference: dict[str, Any],
-    size: SandboxSize,
-) -> None:
+def size_for_pool(profile: str, pool: str) -> SandboxSize:
+    return next(
+        (
+            sandbox_size(profile, name)
+            for name, spec in size_specs(profile).items()
+            if spec["pool"] == pool
+        ),
+        sandbox_size(profile),
+    )
+
+
+def record_sandbox(name: str, profile: str, reference: dict[str, Any]) -> None:
     pool_name = reference.get("pool")
     if not isinstance(pool_name, str):
         raise TypeError("CUA claim reference has no pool")
@@ -452,28 +447,15 @@ def record_sandbox(
     with database() as connection:
         connection.execute(
             """
-            INSERT INTO sandboxes (
-                name, os, pool_name, claim_reference, size, cpu, memory_mb, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO sandboxes (name, os, pool_name, claim_reference, updated_at)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(name) DO UPDATE SET
                 os = excluded.os,
                 pool_name = excluded.pool_name,
                 claim_reference = excluded.claim_reference,
-                size = excluded.size,
-                cpu = excluded.cpu,
-                memory_mb = excluded.memory_mb,
                 updated_at = excluded.updated_at
             """,
-            (
-                name,
-                profile,
-                pool_name,
-                json.dumps(reference),
-                size.name,
-                size.cpu,
-                size.memory_mb,
-                now,
-            ),
+            (name, profile, pool_name, json.dumps(reference), now),
         )
 
 
@@ -510,23 +492,21 @@ def remove_sandbox_record(name: str) -> None:
 def controller_sandboxes() -> list[dict[str, Any]]:
     with database() as connection:
         rows = connection.execute(
-            """SELECT name, os, pool_name, tailscale_addresses,
-                      size, cpu, memory_mb
-               FROM sandboxes ORDER BY name"""
+            "SELECT name, os, pool_name, tailscale_addresses FROM sandboxes ORDER BY name"
         ).fetchall()
     items = []
     for row in rows:
         addresses = json.loads(row["tailscale_addresses"] or "[]")
-        default = sandbox_size(row["os"])
+        size = size_for_pool(row["os"], row["pool_name"])
         items.append(
             {
                 "name": row["name"],
                 "os": row["os"],
                 "pool": row["pool_name"],
                 "address": addresses[0] if addresses else None,
-                "size": row["size"] or default.name,
-                "cpu": row["cpu"] or default.cpu,
-                "memory_mb": row["memory_mb"] or default.memory_mb,
+                "size": size.name,
+                "cpu": size.cpu,
+                "memory_mb": size.memory_mb,
             }
         )
     return items
@@ -1440,7 +1420,7 @@ async def create_one(
         f"claim.{name}.wait-service",
         960,
     )
-    record_sandbox(name, profile, sb.to_dict(), size)
+    record_sandbox(name, profile, sb.to_dict())
     await disconnect_safely(sb)
     sb = await connect_sandbox(name)
     try:

@@ -23,6 +23,7 @@ class SizeSelectionTests(unittest.TestCase):
         self.assertEqual((large.cpu, large.memory_mb), (16, 64 * 1024))
         self.assertNotEqual(default.pool, large.pool)
         self.assertEqual(backend.profile_for_pool(large.pool), "linux")
+        self.assertEqual(backend.size_for_pool("linux", large.pool), large)
 
     def test_unknown_size_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "default, large"):
@@ -32,41 +33,12 @@ class SizeSelectionTests(unittest.TestCase):
         default_pool = backend.sandbox_size("linux").pool
         with (
             patch.dict(
-                backend.PROFILES["linux"]["sizes"]["large"],
+                backend.LARGE_SIZES["linux"],
                 {"pool": default_pool},
             ),
             self.assertRaisesRegex(ValueError, "requires a distinct pool"),
         ):
             backend.sandbox_size("linux", "large")
-
-    def test_recorded_size_survives_state_file_merge(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            controller_dir = Path(directory)
-            state_dir = controller_dir / "sandboxes"
-            state_dir.mkdir()
-            with (
-                patch.object(backend, "CONTROLLER_DIR", controller_dir),
-                patch.object(
-                    backend, "CONTROLLER_DB", controller_dir / "state.sqlite3"
-                ),
-                patch.object(backend, "STATE_DIR", state_dir),
-                patch.object(backend, "restore_cua_state"),
-            ):
-                size = backend.sandbox_size("linux", "large")
-                backend.record_sandbox("linux-1", "linux", {"pool": size.pool}, size)
-                (state_dir / "linux-1.json").write_text(
-                    json.dumps(
-                        {
-                            "runtime_type": "fleet",
-                            "pool_name": size.pool,
-                            "name": "linux-1",
-                        }
-                    )
-                )
-                item = backend.local_states()[0]
-
-        self.assertEqual(item["size"], "large")
-        self.assertEqual((item["cpu"], item["memory_mb"]), (16, 64 * 1024))
 
 
 class SizeCreationTests(unittest.IsolatedAsyncioTestCase):
