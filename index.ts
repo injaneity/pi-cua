@@ -783,14 +783,14 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     if (!value) return pickDestination(ctx);
     if (value === "local") return { kind: "local" };
     const createMatch = value.match(
-      /^(?:new\s+)?(linux|windows)(?:\s+(default|large))?$/,
+      /^(?:new\s+)?(linux|windows)(?:\s+(\S+))?$/,
     );
-    if (createMatch)
-      return createSandbox(
-        createMatch[1] as SandboxOS,
-        ctx,
-        (createMatch[2] as SandboxSize | undefined) ?? "default",
-      );
+    if (createMatch) {
+      const size = createMatch[2] ?? "default";
+      if (size !== "default" && size !== "large")
+        throw new Error("size must be default or large");
+      return createSandbox(createMatch[1] as SandboxOS, ctx, size);
+    }
     const listed = await runBackend({ action: "list" }, ctx.signal);
     const item = (listed.sandboxes ?? []).find(
       (candidate) => candidate.name === value,
