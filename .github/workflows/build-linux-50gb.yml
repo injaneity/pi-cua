@@ -24,7 +24,7 @@ jobs:
       - name: install diagnostics
         run: |
           sudo apt-get update -qq
-          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq qemu-system-x86 qemu-utils libguestfs-tools linux-image-generic
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq qemu-system-x86 qemu-utils libguestfs-tools linux-image-generic socat imagemagick tesseract-ocr
           sudo chmod 0644 /boot/vmlinuz-*
           sudo chmod 666 /dev/kvm 2>/dev/null || true
 
@@ -56,7 +56,7 @@ jobs:
             -netdev user,id=net0,hostfwd=tcp::18000-:8000 \
             -device virtio-net-pci,netdev=net0 \
             -display none \
-            -monitor none \
+            -monitor unix:qemu-monitor.sock,server=on,wait=off \
             -serial file:serial.log \
             >qemu.stdout 2>qemu.stderr &
           pid=$!
@@ -69,6 +69,12 @@ jobs:
             if ! kill -0 "$pid" 2>/dev/null; then break; fi
             sleep 5
           done
+          printf 'info status\ninfo block\nscreendump boot.ppm\n' | socat - UNIX-CONNECT:qemu-monitor.sock || true
+          convert boot.ppm boot.png 2>/dev/null || true
+          echo "--- boot screen OCR ---"
+          tesseract boot.png stdout 2>/dev/null || true
+          echo "--- monitor ---"
+          printf 'info status\ninfo block\n' | socat - UNIX-CONNECT:qemu-monitor.sock || true
           kill "$pid" 2>/dev/null || true
           wait "$pid" 2>/dev/null || true
           echo "--- qemu stderr ---"
