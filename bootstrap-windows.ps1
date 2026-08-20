@@ -105,8 +105,16 @@ Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $extensions,"$agent\pr
 New-Item -ItemType Directory -Force -Path $agent,$extensions,$projects,$sshDirectory | Out-Null
 Expand-Archive -Force -Path 'C:\Windows\Temp\cua-pi-agent.zip' -DestinationPath $cuaHome
 Copy-Item -Force 'C:\Windows\Temp\cua-authorized-key.pub' $authorizedKeys
-Invoke-Icacls @($cuaHome, '/grant:r', 'cua:(OI)(CI)F', '/T', '/C')
-Invoke-Icacls @($projects, '/grant:r', 'cua:(OI)(CI)F', '/T', '/C')
+# Files expanded by this SYSTEM bootstrap need an explicit grant, but the agent
+# also contains package caches created by cua. Limit recursion to the freshly
+# recreated extensions directory and grant the three uploaded host files
+# directly. Workspace content is created by cua, so only its root needs an
+# inheritable grant.
+Invoke-Icacls @($extensions, '/grant:r', 'cua:(OI)(CI)F', '/T', '/C')
+foreach ($agentFile in @("$agent\cua-tool-host.mjs", "$agent\cua-tool-broker.mjs", "$agent\cua-tool-relay.mjs")) {
+  Invoke-Icacls @($agentFile, '/grant:r', 'cua:F')
+}
+Invoke-Icacls @($projects, '/grant:r', 'cua:(OI)(CI)F')
 Invoke-Icacls @($authorizedKeys, '/inheritance:r', '/grant:r', 'cua:F', 'SYSTEM:F', 'Administrators:F')
 Write-Output '::phase acl-complete'
 $interactiveDesktop = Get-Process explorer -IncludeUserName -ErrorAction SilentlyContinue | Where-Object SessionId -GT 0 | Select-Object -First 1
