@@ -25,7 +25,8 @@ jobs:
       - name: install image tools
         run: |
           sudo apt-get update -qq
-          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq qemu-utils libguestfs-tools
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq qemu-utils libguestfs-tools linux-image-generic
+          sudo chmod 0644 /boot/vmlinuz-*
 
       - name: extract and expand the boot disk
         env:
