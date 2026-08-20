@@ -41,23 +41,26 @@ jobs:
           virt-resize --expand /dev/sda1 source.img expanded.img
           qemu-img info expanded.img
           virt-df -h -a expanded.img
-          mkdir image
-          mv expanded.img image/disk.img
+          qemu-img convert -p -O raw -S 4k expanded.img compact.img
+          rm -f source.img expanded.img
+          docker rm -f "$container"
+          docker image rm "$SOURCE_IMAGE"
+          trap - EXIT
+          mkdir -p layer/disk
+          mv compact.img layer/disk/disk.img
+          tar --sparse -czf disk-layer.tar.gz -C layer disk
+          rm -rf layer
+          ls -lh disk-layer.tar.gz
+          df -h .
 
       - name: publish containerdisk
         run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-          cat > image/Dockerfile <<'EOF'
-          FROM scratch
-          LABEL org.opencontainers.image.source="https://github.com/injaneity/pi-cua"
-          COPY disk.img /disk/disk.img
-          EOF
-          docker buildx build \
-            --platform linux/amd64 \
-            --provenance=false \
-            --push \
-            --tag "$TARGET_IMAGE" \
-            --metadata-file image-metadata.json \
-            image
-          digest=$(jq -r '.["containerimage.digest"]' image-metadata.json)
+          version=0.20.6
+          curl -fsSL "https://github.com/google/go-containerregistry/releases/download/v${version}/go-containerregistry_Linux_x86_64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin crane
+          echo "${{ secrets.GITHUB_TOKEN }}" | crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin
+          crane append \
+            --new_layer disk-layer.tar.gz \
+            --new_tag "$TARGET_IMAGE"
+          digest=$(crane digest "$TARGET_IMAGE")
           echo "image: $TARGET_IMAGE@$digest" >> "$GITHUB_STEP_SUMMARY"
