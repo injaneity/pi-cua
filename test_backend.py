@@ -521,6 +521,31 @@ class WindowsDesktopBrokerTests(unittest.TestCase):
         self.assertIn("cua-tool-broker.mjs", script)
         self.assertIn("cua-tool-broker.token", script)
 
+    def test_bootstrap_limits_recursive_acl_repair_to_pi_agent(self) -> None:
+        script = backend.bootstrap_template("windows")
+
+        self.assertNotIn("Invoke-Icacls @($cuaHome", script)
+        self.assertNotIn(
+            "Invoke-Icacls @($agent, '/grant:r', 'cua:(OI)(CI)F', '/T', '/C')",
+            script,
+        )
+        self.assertIn(
+            "Invoke-Icacls @($extensions, '/grant:r', 'cua:(OI)(CI)F', '/T', '/C')",
+            script,
+        )
+        self.assertIn(
+            "Invoke-Icacls @($agentFile, '/grant:r', 'cua:F')",
+            script,
+        )
+        self.assertIn(
+            "Invoke-Icacls @($projects, '/grant:r', 'cua:(OI)(CI)F')",
+            script,
+        )
+        self.assertIn(
+            "Invoke-Icacls @($authorizedKeys, '/inheritance:r'",
+            script,
+        )
+
 
 class BackgroundJobTests(unittest.IsolatedAsyncioTestCase):
     async def test_poll_returns_result_and_always_cleans_up(self) -> None:
