@@ -1,4 +1,4 @@
-name: build linux 30gb containerdisk
+name: fix linux containerdisk platform
 
 on:
   push:
@@ -9,58 +9,23 @@ permissions:
   packages: write
 
 env:
-  SOURCE_IMAGE: public.ecr.aws/k5j5w0x5/cua-ubuntu-24.04@sha256:85b3f5022bf9ecc864472f5fade5e2f1f54ab88ce429af7873a1415d668dc2ea
-  TARGET_IMAGE: ghcr.io/injaneity/pi-cua-linux:30gb-eb68411
+  SOURCE_IMAGE: ghcr.io/injaneity/pi-cua-linux@sha256:096a0619a7bbe9d2eff7f9263e57762764a25589e1702cd8e04f39ad0d3eb3fd
+  TARGET_IMAGE: ghcr.io/injaneity/pi-cua-linux:30gb-eb68411-amd64
 
 jobs:
-  build:
+  publish:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 10
     steps:
-      - name: reclaim runner storage
-        run: |
-          sudo rm -rf /opt/hostedtoolcache
-          docker system prune -af
-
-      - name: install image tools
-        run: |
-          sudo apt-get update -qq
-          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq qemu-utils libguestfs-tools linux-image-generic
-          sudo chmod 0644 /boot/vmlinuz-*
-
-      - name: extract and expand the boot disk
-        env:
-          LIBGUESTFS_BACKEND: direct
-          LIBGUESTFS_MEMSIZE: "1024"
-        run: |
-          docker pull --platform linux/amd64 "$SOURCE_IMAGE"
-          container=$(docker create --platform linux/amd64 "$SOURCE_IMAGE" /bin/true)
-          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
-          docker cp "$container:/disk/disk.img" source.img
-          qemu-img create -f raw expanded.img 30G
-          virt-resize --expand /dev/sda1 source.img expanded.img
-          qemu-img info expanded.img
-          virt-df -h -a expanded.img
-          qemu-img convert -p -O qcow2 -c expanded.img compact.img
-          rm -f source.img expanded.img
-          docker rm -f "$container"
-          docker image rm "$SOURCE_IMAGE"
-          trap - EXIT
-          mkdir -p layer/disk
-          mv compact.img layer/disk/disk.img
-          tar -czf disk-layer.tar.gz -C layer disk
-          rm -rf layer
-          ls -lh disk-layer.tar.gz
-          df -h .
-
-      - name: publish containerdisk
+      - name: publish amd64 image metadata
         run: |
           version=0.20.6
           curl -fsSL "https://github.com/google/go-containerregistry/releases/download/v${version}/go-containerregistry_Linux_x86_64.tar.gz" \
             | sudo tar -xz -C /usr/local/bin crane
           echo "${{ secrets.GITHUB_TOKEN }}" | crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin
-          crane append \
-            --new_layer disk-layer.tar.gz \
-            --new_tag "$TARGET_IMAGE"
+          crane mutate "$SOURCE_IMAGE" \
+            --set-platform linux/amd64 \
+            --tag "$TARGET_IMAGE"
           digest=$(crane digest "$TARGET_IMAGE")
+          crane config "$TARGET_IMAGE" | jq '{os, architecture, rootfs}'
           echo "image: $TARGET_IMAGE@$digest" >> "$GITHUB_STEP_SUMMARY"
