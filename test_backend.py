@@ -57,6 +57,42 @@ class OperationLockTests(unittest.TestCase):
 
 
 class ResourceCreationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_failed_create_releases_claim_record_and_custom_pool(self) -> None:
+        sandbox = SimpleNamespace(delete=AsyncMock(side_effect=LookupError("gone")))
+        pool = SimpleNamespace(delete=AsyncMock())
+        resources = backend.sandbox_resources("linux", 8, 32 * 1024, PINNED_IMAGE)
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(
+                "sys.modules", {"cua_sandbox": SimpleNamespace(Sandbox=sandbox)}
+            ),
+            patch.object(backend, "STATE_DIR", Path(directory)),
+            patch.object(backend, "restore_cua_state"),
+            patch.object(backend, "remove_sandbox_record") as remove,
+            patch.object(backend, "pool_reference_count", return_value=0),
+        ):
+            await backend.cleanup_failed_create("linux-test", resources, pool)
+
+        sandbox.delete.assert_awaited_once_with("linux-test")
+        remove.assert_called_once_with("linux-test")
+        pool.delete.assert_awaited_once_with()
+
+    async def test_failed_cleanup_keeps_the_managed_record(self) -> None:
+        sandbox = SimpleNamespace(delete=AsyncMock(side_effect=RuntimeError("busy")))
+        pool = SimpleNamespace(delete=AsyncMock())
+        resources = backend.sandbox_resources("linux", 8, 32 * 1024, PINNED_IMAGE)
+        with (
+            patch.dict(
+                "sys.modules", {"cua_sandbox": SimpleNamespace(Sandbox=sandbox)}
+            ),
+            patch.object(backend, "restore_cua_state"),
+            patch.object(backend, "remove_sandbox_record") as remove,
+        ):
+            await backend.cleanup_failed_create("linux-test", resources, pool)
+
+        remove.assert_not_called()
+        pool.delete.assert_not_awaited()
+
     async def test_resources_and_image_reach_the_dedicated_pool(self) -> None:
         pool = Mock()
         pool.apply.return_value = object()
