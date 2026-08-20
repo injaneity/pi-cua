@@ -364,6 +364,7 @@ def set_execution_target(
 @dataclass(frozen=True)
 class SandboxResources:
     pool: str
+    image: str
     cpu: int
     memory_mb: int
 
@@ -371,10 +372,14 @@ class SandboxResources:
 CUSTOM_POOL_PATTERN = re.compile(
     r"^cua-pi-custom-(?P<profile>linux|windows)-[0-9a-f]{16}$"
 )
+PINNED_IMAGE_PATTERN = re.compile(r"^\S+@sha256:[0-9a-f]{64}$")
 
 
 def sandbox_resources(
-    profile: str, cpu: int | None = None, memory_mb: int | None = None
+    profile: str,
+    cpu: int | None = None,
+    memory_mb: int | None = None,
+    image: str | None = None,
 ) -> SandboxResources:
     if profile not in PROFILES:
         raise ValueError("os must be linux or windows")
@@ -382,14 +387,29 @@ def sandbox_resources(
         raise ValueError("cpu and memory_mb must be supplied together")
     spec = PROFILES[profile]
     if cpu is None and memory_mb is None:
-        return SandboxResources(spec["pool"], spec["cpu"], spec["memory_mb"])
+        cpu, memory_mb = spec["cpu"], spec["memory_mb"]
     if type(cpu) is not int or cpu <= 0:
         raise ValueError("cpu must be a positive integer")
     if type(memory_mb) is not int or memory_mb <= 0:
         raise ValueError("memory_mb must be a positive integer")
+    if image is not None and not isinstance(image, str):
+        raise TypeError("image must be a string")
+    image_ref = spec["image"] if image is None else image.strip()
+    if not PINNED_IMAGE_PATTERN.fullmatch(image_ref):
+        raise ValueError("image must be an OCI reference pinned by sha256 digest")
+    if (cpu, memory_mb, image_ref) == (
+        spec["cpu"],
+        spec["memory_mb"],
+        spec["image"],
+    ):
+        return SandboxResources(spec["pool"], image_ref, cpu, memory_mb)
     identity = f"{spec['pool']}\0{profile}\0{cpu}\0{memory_mb}"
+    if image_ref != spec["image"]:
+        identity += f"\0{image_ref}"
     digest = hashlib.sha256(identity.encode()).hexdigest()[:16]
-    return SandboxResources(f"cua-pi-custom-{profile}-{digest}", cpu, memory_mb)
+    return SandboxResources(
+        f"cua-pi-custom-{profile}-{digest}", image_ref, cpu, memory_mb
+    )
 
 
 def profile_for_pool(pool: object) -> str | None:
@@ -1348,8 +1368,9 @@ async def create_one(
     requested_name: str | None,
     cpu: int | None = None,
     memory_mb: int | None = None,
+    image_ref: str | None = None,
 ) -> dict[str, Any]:
-    resources = sandbox_resources(profile, cpu, memory_mb)
+    resources = sandbox_resources(profile, cpu, memory_mb, image_ref)
     name = requested_name or next_name(profile)
     validate_name(name)
     if any(item["name"] == name for item in local_states()):
@@ -1358,8 +1379,7 @@ async def create_one(
 
     from cua_sandbox import Image, Pool, Sandbox, WarmPoolAutoscaling
 
-    spec = PROFILES[profile]
-    image = Image.from_registry(spec["image"], os_type=profile, kind="vm")
+    image = Image.from_registry(resources.image, os_type=profile, kind="vm")
     autoscaling = WarmPoolAutoscaling(
         min_pool_size=0, initial_pool_size=1, max_pool_size=10
     )
@@ -2369,6 +2389,7 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
             request.get("name"),
             request.get("cpu"),
             request.get("memory_mb"),
+            request.get("image"),
         )
     if action == "ensure":
         return await ensure_one(str(request.get("name") or ""))

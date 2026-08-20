@@ -48,6 +48,12 @@ const resourceSchema = Type.Object({
       description: "Memory in MiB; supply with cpu",
     }),
   ),
+  image: Type.Optional(
+    Type.String({
+      minLength: 1,
+      description: "Digest-pinned OCI image for create",
+    }),
+  ),
   confirm: Type.Optional(
     Type.Boolean({
       description: "Required for create or delete when no UI is available",
@@ -521,6 +527,19 @@ function lastJson(stdout: string): BackendResult {
   throw new Error(stdout.trim() || "cua backend returned no result");
 }
 
+function creationDescription(
+  resources?: SandboxResources,
+  image?: string,
+): string {
+  return [
+    resources
+      ? `this provisions ${resources.cpu} CPUs and ${resources.memory_mb} MiB of memory.`
+      : "this provisions the configured default resources.",
+    image ? `image: ${image}` : "image: configured default",
+    "this incurs cost.",
+  ].join("\n");
+}
+
 function formatList(items: SandboxItem[]): string {
   if (items.length === 0) return "no managed sandboxes";
   return items
@@ -689,9 +708,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     if (!ctx.hasUI) return undefined;
     const confirmed = await ctx.ui.confirm(
       `create ${os} sandbox?`,
-      resources
-        ? `this provisions ${resources.cpu} CPUs and ${resources.memory_mb} MiB of memory and incurs cost.`
-        : "this provisions the configured default resources and incurs cost.",
+      creationDescription(resources),
     );
     if (!confirmed) return undefined;
     pi.events.emit("cua:execution-target-changed", {
@@ -936,6 +953,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     promptGuidelines: [
       "Use cua_sandbox for sandbox resources; use /sandbox to choose where the current session executes tools.",
       "For custom resources, cua_sandbox create requires both cpu and memory_mb; omit both to use the OS defaults.",
+      "Use a custom image only when the user explicitly provides a digest-pinned OCI reference.",
       "Do not delete a CUA sandbox unless the user explicitly asks to delete it.",
     ],
     parameters: resourceSchema,
@@ -952,6 +970,8 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         throw new Error("cpu and memory_mb must be supplied together");
       if (input.action !== "create" && hasResources)
         throw new Error("cpu and memory_mb are only valid for create");
+      if (input.image !== undefined && input.action !== "create")
+        throw new Error("image is only valid for create");
       if (["ensure", "delete"].includes(input.action) && !input.name) {
         throw new Error(`${input.action} requires name`);
       }
@@ -966,9 +986,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
                 ? `create ${input.name || input.os} sandbox?`
                 : `delete ${input.name}?`,
               input.action === "create"
-                ? createResources
-                  ? `this provisions ${createResources.cpu} CPUs and ${createResources.memory_mb} MiB of memory and incurs cost.`
-                  : "this provisions the configured default resources and incurs cost."
+                ? creationDescription(createResources, input.image)
                 : "this permanently releases its fleet claim and filesystem.",
             )
           : input.confirm === true;

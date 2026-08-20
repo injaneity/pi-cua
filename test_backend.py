@@ -13,6 +13,8 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import backend
 
+PINNED_IMAGE = "ghcr.io/acme/cua-linux@sha256:" + "a" * 64
+
 
 class ResourceSelectionTests(unittest.TestCase):
     def test_resources_have_a_deterministic_pool(self) -> None:
@@ -32,9 +34,18 @@ class ResourceSelectionTests(unittest.TestCase):
             ):
                 backend.sandbox_resources("linux", cpu, memory_mb)
 
+    def test_custom_image_requires_a_digest_and_changes_the_pool(self) -> None:
+        default = backend.sandbox_resources("linux")
+        custom = backend.sandbox_resources("linux", image=PINNED_IMAGE)
+
+        self.assertEqual(custom.image, PINNED_IMAGE)
+        self.assertNotEqual(custom.pool, default.pool)
+        with self.assertRaisesRegex(ValueError, "pinned by sha256"):
+            backend.sandbox_resources("linux", image="ghcr.io/acme/cua-linux:latest")
+
 
 class ResourceCreationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_resources_reach_the_dedicated_pool(self) -> None:
+    async def test_resources_and_image_reach_the_dedicated_pool(self) -> None:
         pool = Mock()
         pool.apply.return_value = object()
         sdk = SimpleNamespace(
@@ -54,12 +65,17 @@ class ResourceCreationTests(unittest.IsolatedAsyncioTestCase):
             ),
             self.assertRaisesRegex(RuntimeError, "stop after pool apply"),
         ):
-            await backend.create_one("linux", "linux-custom", 16, 64 * 1024)
+            await backend.create_one(
+                "linux", "linux-custom", 16, 64 * 1024, PINNED_IMAGE
+            )
 
-        resources = backend.sandbox_resources("linux", 16, 64 * 1024)
+        resources = backend.sandbox_resources("linux", 16, 64 * 1024, PINNED_IMAGE)
         self.assertEqual(pool.apply.call_args.kwargs["name"], resources.pool)
         self.assertEqual(pool.apply.call_args.kwargs["cpu"], 16)
         self.assertEqual(pool.apply.call_args.kwargs["memory_mb"], 64 * 1024)
+        sdk.Image.from_registry.assert_called_once_with(
+            PINNED_IMAGE, os_type="linux", kind="vm"
+        )
 
     async def test_dispatch_passes_resources_to_create(self) -> None:
         create = AsyncMock(return_value={"name": "linux-1"})
@@ -68,10 +84,16 @@ class ResourceCreationTests(unittest.IsolatedAsyncioTestCase):
             patch.object(backend, "create_one", create),
         ):
             await backend.dispatch(
-                {"action": "create", "os": "linux", "cpu": 16, "memory_mb": 65536}
+                {
+                    "action": "create",
+                    "os": "linux",
+                    "cpu": 16,
+                    "memory_mb": 65536,
+                    "image": PINNED_IMAGE,
+                }
             )
 
-        create.assert_awaited_once_with("linux", None, 16, 65536)
+        create.assert_awaited_once_with("linux", None, 16, 65536, PINNED_IMAGE)
 
 
 class LocalStateTests(unittest.TestCase):

@@ -28,6 +28,8 @@ windows provisioning also requires `~/.ssh/cua_windows_ed25519` and its `.pub` f
 - `/resume` restores placement from the controller database.
 - the footer shows the selected sandbox. no remote tui or conversation session is created.
 
+custom images are available through the structured `cua_sandbox` create action's `image` field. they must be Fleet-compatible CUA containerDisks and pinned by `sha256` digest; mutable tags are rejected.
+
 `cua_sandbox` and `report_papercut` are local control-plane tools. every other registered tool is proxied by name. sandbox activation fails if the remote pi sdk host does not expose a required tool; calls never fall back to local execution.
 
 ## execution path
