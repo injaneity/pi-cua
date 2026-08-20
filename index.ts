@@ -37,11 +37,16 @@ const resourceSchema = Type.Object({
   cpu: Type.Optional(
     Type.Integer({
       minimum: 1,
+      maximum: Number.MAX_SAFE_INTEGER,
       description: "CPU count; supply with memory_mb",
     }),
   ),
   memory_mb: Type.Optional(
-    Type.Integer({ minimum: 1, description: "Memory in MiB; supply with cpu" }),
+    Type.Integer({
+      minimum: 1,
+      maximum: Number.MAX_SAFE_INTEGER,
+      description: "Memory in MiB; supply with cpu",
+    }),
   ),
   confirm: Type.Optional(
     Type.Boolean({
@@ -765,14 +770,20 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     const createMatch = value.match(
       /^(?:new\s+)?(linux|windows)(?:\s+([1-9]\d*)\s+([1-9]\d*))?$/,
     );
-    if (createMatch)
-      return createSandbox(
-        createMatch[1] as SandboxOS,
-        ctx,
-        createMatch[2]
-          ? { cpu: Number(createMatch[2]), memory_mb: Number(createMatch[3]) }
-          : undefined,
-      );
+    if (createMatch) {
+      if (!createMatch[2])
+        return createSandbox(createMatch[1] as SandboxOS, ctx);
+      const resources = {
+        cpu: Number(createMatch[2]),
+        memory_mb: Number(createMatch[3]),
+      };
+      if (
+        !Number.isSafeInteger(resources.cpu) ||
+        !Number.isSafeInteger(resources.memory_mb)
+      )
+        throw new Error("cpu and memory_mb are too large");
+      return createSandbox(createMatch[1] as SandboxOS, ctx, resources);
+    }
     if (/^(?:new\s+)?(?:linux|windows)(?:\s|$)/.test(value))
       throw new Error("usage: /sandbox <linux|windows> [cpu memory_mb]");
     const listed = await runBackend({ action: "list" }, ctx.signal);
