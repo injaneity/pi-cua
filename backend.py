@@ -27,7 +27,7 @@ import time
 import uuid
 import zipfile
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -59,6 +59,7 @@ PI_DIR = HOME / ".pi" / "agent"
 CONTROLLER_DIR = HOME / ".cua" / "pi-controller"
 CONTROLLER_DB = CONTROLLER_DIR / "state.sqlite3"
 CONTROLLER_LOCK = CONTROLLER_DIR / "operations.lock"
+WORKSPACE_LOCK = CONTROLLER_DIR / "workspaces.lock"
 OPERATION_DIR = CONTROLLER_DIR / "operations"
 CURRENT_OPERATION_ID: str | None = None
 CURRENT_PHASE = "startup"
@@ -243,11 +244,22 @@ def bootstrap_digest(profile: str) -> str:
     return digest.hexdigest()[:20]
 
 
+def operation_locks(action: str) -> tuple[Path, ...]:
+    """Keep Fleet mutations separate from workspace preparation."""
+    if action == "create":
+        return (CONTROLLER_LOCK,)
+    if action in {"ensure", "delete"}:
+        return (CONTROLLER_LOCK, WORKSPACE_LOCK)
+    if action in {"prepare_execution", "sync_workspace_to_local"}:
+        return (WORKSPACE_LOCK,)
+    return ()
+
+
 @contextmanager
-def operation_lock() -> Iterator[None]:
-    """Serialize mutating operations across Pi processes and parallel tools."""
+def operation_lock(path: Path) -> Iterator[None]:
+    """Serialize one class of mutations across Pi processes and parallel tools."""
     CONTROLLER_DIR.mkdir(parents=True, exist_ok=True)
-    with CONTROLLER_LOCK.open("a+") as lock_file:
+    with path.open("a+") as lock_file:
         fcntl.flock(lock_file, fcntl.LOCK_EX)
         try:
             yield
@@ -2478,9 +2490,13 @@ def main() -> None:
         if local_read:
             result = asyncio.run(dispatch(request))
         else:
-            progress("lock", "waiting for controller mutation lock")
-            with operation_lock():
-                progress("lock", "acquired controller mutation lock")
+            locks = operation_locks(str(action))
+            with ExitStack() as stack:
+                for lock in locks:
+                    label = "Fleet" if lock == CONTROLLER_LOCK else "workspace"
+                    progress("lock", f"waiting for {label} mutation lock")
+                    stack.enter_context(operation_lock(lock))
+                    progress("lock", f"acquired {label} mutation lock")
                 result = asyncio.run(dispatch(request))
         if not quiet_request:
             progress("complete", "operation succeeded")
