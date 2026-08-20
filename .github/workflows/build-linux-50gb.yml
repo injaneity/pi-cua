@@ -33,7 +33,7 @@ jobs:
           LIBGUESTFS_MEMSIZE: "1024"
         run: |
           docker pull --platform linux/amd64 "$SOURCE_IMAGE"
-          container=$(docker create --platform linux/amd64 "$SOURCE_IMAGE")
+          container=$(docker create --platform linux/amd64 "$SOURCE_IMAGE" /bin/true)
           trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
           docker cp "$container:/disk/disk.img" source.img
           qemu-img create -f raw expanded.img 50G
