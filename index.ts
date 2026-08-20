@@ -26,6 +26,9 @@ const backend = join(extensionDir, "backend.py");
 const windowsIdentity = join(homedir(), ".ssh", "cua_windows_ed25519");
 const sandboxKnownHosts = join(homedir(), ".ssh", "cua_known_hosts");
 const protocolVersion = 2;
+const pinnedImagePattern =
+  "^[a-z0-9.-]+(?::[0-9]+)?/[a-z0-9]+(?:[._/-][a-z0-9]+)*@sha256:[0-9a-f]{64}$";
+const pinnedImageRegex = new RegExp(pinnedImagePattern);
 const localTools = new Set(["cua_sandbox", "report_papercut"]);
 
 const resourceSchema = Type.Object({
@@ -46,6 +49,12 @@ const resourceSchema = Type.Object({
       minimum: 1,
       maximum: Number.MAX_SAFE_INTEGER,
       description: "Memory in MiB; supply with cpu",
+    }),
+  ),
+  image: Type.Optional(
+    Type.String({
+      pattern: pinnedImagePattern,
+      description: "Digest-pinned OCI image for create",
     }),
   ),
   confirm: Type.Optional(
@@ -521,6 +530,19 @@ function lastJson(stdout: string): BackendResult {
   throw new Error(stdout.trim() || "cua backend returned no result");
 }
 
+function creationDescription(
+  resources?: SandboxResources,
+  image?: string,
+): string {
+  return [
+    resources
+      ? `this provisions ${resources.cpu} CPUs and ${resources.memory_mb} MiB of memory.`
+      : "this provisions the configured default resources.",
+    image ? `image: ${image}` : "image: configured default",
+    "this incurs cost.",
+  ].join("\n");
+}
+
 function formatList(items: SandboxItem[]): string {
   if (items.length === 0) return "no managed sandboxes";
   return items
@@ -685,13 +707,12 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     os: SandboxOS,
     ctx: UIContext,
     resources?: SandboxResources,
+    image?: string,
   ): Promise<Destination | undefined> {
     if (!ctx.hasUI) return undefined;
     const confirmed = await ctx.ui.confirm(
       `create ${os} sandbox?`,
-      resources
-        ? `this provisions ${resources.cpu} CPUs and ${resources.memory_mb} MiB of memory and incurs cost.`
-        : "this provisions the configured default resources and incurs cost.",
+      creationDescription(resources, image),
     );
     if (!confirmed) return undefined;
     pi.events.emit("cua:execution-target-changed", {
@@ -701,7 +722,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     });
     try {
       const result = await runBackend(
-        { action: "create", os, ...resources },
+        { action: "create", os, ...resources, ...(image ? { image } : {}) },
         ctx.signal,
         (status) => {
           pi.events.emit("cua:execution-target-changed", {
@@ -768,24 +789,29 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     if (!value) return pickDestination(ctx);
     if (value === "local") return { kind: "local" };
     const createMatch = value.match(
-      /^(?:new\s+)?(linux|windows)(?:\s+([1-9]\d*)\s+([1-9]\d*))?$/,
+      /^(?:new\s+)?(linux|windows)(?:(?:\s+([1-9]\d*)\s+([1-9]\d*)(?:\s+(\S+))?)|\s+(\S+))?$/,
     );
     if (createMatch) {
-      if (!createMatch[2])
-        return createSandbox(createMatch[1] as SandboxOS, ctx);
-      const resources = {
-        cpu: Number(createMatch[2]),
-        memory_mb: Number(createMatch[3]),
-      };
+      const resources = createMatch[2]
+        ? { cpu: Number(createMatch[2]), memory_mb: Number(createMatch[3]) }
+        : undefined;
       if (
-        !Number.isSafeInteger(resources.cpu) ||
-        !Number.isSafeInteger(resources.memory_mb)
+        resources &&
+        (!Number.isSafeInteger(resources.cpu) ||
+          !Number.isSafeInteger(resources.memory_mb))
       )
         throw new Error("cpu and memory_mb are too large");
-      return createSandbox(createMatch[1] as SandboxOS, ctx, resources);
+      const image = createMatch[4] ?? createMatch[5];
+      if (image && !pinnedImageRegex.test(image))
+        throw new Error(
+          "image must be an OCI reference pinned by sha256 digest",
+        );
+      return createSandbox(createMatch[1] as SandboxOS, ctx, resources, image);
     }
     if (/^(?:new\s+)?(?:linux|windows)(?:\s|$)/.test(value))
-      throw new Error("usage: /sandbox <linux|windows> [cpu memory_mb]");
+      throw new Error(
+        "usage: /sandbox <linux|windows> [cpu memory_mb] [image@sha256:digest]",
+      );
     const listed = await runBackend({ action: "list" }, ctx.signal);
     const item = (listed.sandboxes ?? []).find(
       (candidate) => candidate.name === value,
@@ -936,6 +962,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     promptGuidelines: [
       "Use cua_sandbox for sandbox resources; use /sandbox to choose where the current session executes tools.",
       "For custom resources, cua_sandbox create requires both cpu and memory_mb; omit both to use the OS defaults.",
+      "Use a custom image only when the user explicitly provides a digest-pinned OCI reference.",
       "Do not delete a CUA sandbox unless the user explicitly asks to delete it.",
     ],
     parameters: resourceSchema,
@@ -952,6 +979,8 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         throw new Error("cpu and memory_mb must be supplied together");
       if (input.action !== "create" && hasResources)
         throw new Error("cpu and memory_mb are only valid for create");
+      if (input.image && input.action !== "create")
+        throw new Error("image is only valid for create");
       if (["ensure", "delete"].includes(input.action) && !input.name) {
         throw new Error(`${input.action} requires name`);
       }
@@ -966,9 +995,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
                 ? `create ${input.name || input.os} sandbox?`
                 : `delete ${input.name}?`,
               input.action === "create"
-                ? createResources
-                  ? `this provisions ${createResources.cpu} CPUs and ${createResources.memory_mb} MiB of memory and incurs cost.`
-                  : "this provisions the configured default resources and incurs cost."
+                ? creationDescription(createResources, input.image)
                 : "this permanently releases its fleet claim and filesystem.",
             )
           : input.confirm === true;

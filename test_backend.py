@@ -15,12 +15,12 @@ import backend
 
 
 class ResourceSelectionTests(unittest.TestCase):
-    def test_resources_have_a_deterministic_pool(self) -> None:
-        default = backend.sandbox_resources("linux")
-        custom = backend.sandbox_resources("linux", 16, 64 * 1024)
+    def test_configuration_has_a_deterministic_pool(self) -> None:
+        default = backend.sandbox_config("linux")
+        custom = backend.sandbox_config("linux", 16, 64 * 1024)
 
         self.assertEqual((default.cpu, default.memory_mb), (8, 16 * 1024))
-        self.assertEqual(custom, backend.sandbox_resources("linux", 16, 64 * 1024))
+        self.assertEqual(custom, backend.sandbox_config("linux", 16, 64 * 1024))
         self.assertRegex(custom.pool, r"^cua-pi-custom-linux-[0-9a-f]{16}$")
         self.assertEqual(backend.profile_for_pool(custom.pool), "linux")
 
@@ -30,11 +30,21 @@ class ResourceSelectionTests(unittest.TestCase):
                 self.subTest(cpu=cpu, memory_mb=memory_mb),
                 self.assertRaisesRegex(ValueError, "supplied together|positive"),
             ):
-                backend.sandbox_resources("linux", cpu, memory_mb)
+                backend.sandbox_config("linux", cpu, memory_mb)
+
+    def test_custom_image_requires_a_digest_and_changes_the_pool(self) -> None:
+        image = "ghcr.io/acme/cua-linux@sha256:" + "a" * 64
+        default = backend.sandbox_config("linux")
+        custom = backend.sandbox_config("linux", image=image)
+
+        self.assertEqual(custom.image, image)
+        self.assertNotEqual(custom.pool, default.pool)
+        with self.assertRaisesRegex(ValueError, "pinned by sha256"):
+            backend.sandbox_config("linux", image="ghcr.io/acme/cua-linux:latest")
 
 
 class ResourceCreationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_resources_reach_the_dedicated_pool(self) -> None:
+    async def test_resources_and_image_reach_the_dedicated_pool(self) -> None:
         pool = Mock()
         pool.apply.return_value = object()
         sdk = SimpleNamespace(
@@ -43,6 +53,7 @@ class ResourceCreationTests(unittest.IsolatedAsyncioTestCase):
             Sandbox=Mock(),
             WarmPoolAutoscaling=Mock(return_value=object()),
         )
+        image = "ghcr.io/acme/cua-linux@sha256:" + "a" * 64
         with (
             patch.dict("sys.modules", {"cua_sandbox": sdk}),
             patch.object(backend, "local_states", return_value=[]),
@@ -54,31 +65,41 @@ class ResourceCreationTests(unittest.IsolatedAsyncioTestCase):
             ),
             self.assertRaisesRegex(RuntimeError, "stop after pool apply"),
         ):
-            await backend.create_one("linux", "linux-custom", 16, 64 * 1024)
+            await backend.create_one("linux", "linux-custom", 16, 64 * 1024, image)
 
-        resources = backend.sandbox_resources("linux", 16, 64 * 1024)
-        self.assertEqual(pool.apply.call_args.kwargs["name"], resources.pool)
+        config = backend.sandbox_config("linux", 16, 64 * 1024, image)
+        self.assertEqual(pool.apply.call_args.kwargs["name"], config.pool)
         self.assertEqual(pool.apply.call_args.kwargs["cpu"], 16)
         self.assertEqual(pool.apply.call_args.kwargs["memory_mb"], 64 * 1024)
+        sdk.Image.from_registry.assert_called_once_with(
+            image, os_type="linux", kind="vm"
+        )
 
-    async def test_dispatch_passes_resources_to_create(self) -> None:
+    async def test_dispatch_passes_configuration_to_create(self) -> None:
         create = AsyncMock(return_value={"name": "linux-1"})
+        image = "ghcr.io/acme/cua@sha256:" + "b" * 64
         with (
             patch.object(backend, "configure_fleet_auth"),
             patch.object(backend, "create_one", create),
         ):
             await backend.dispatch(
-                {"action": "create", "os": "linux", "cpu": 16, "memory_mb": 65536}
+                {
+                    "action": "create",
+                    "os": "linux",
+                    "cpu": 16,
+                    "memory_mb": 65536,
+                    "image": image,
+                }
             )
 
-        create.assert_awaited_once_with("linux", None, 16, 65536)
+        create.assert_awaited_once_with("linux", None, 16, 65536, image)
 
 
 class LocalStateTests(unittest.TestCase):
     def test_only_managed_fleet_claims_are_listed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state_dir = Path(directory)
-            custom_pool = backend.sandbox_resources("linux", 16, 65536).pool
+            custom_pool = backend.sandbox_config("linux", 16, 65536).pool
             (state_dir / "linux-1.json").write_text(
                 json.dumps(
                     {
