@@ -26,9 +26,6 @@ const backend = join(extensionDir, "backend.py");
 const windowsIdentity = join(homedir(), ".ssh", "cua_windows_ed25519");
 const sandboxKnownHosts = join(homedir(), ".ssh", "cua_known_hosts");
 const protocolVersion = 2;
-const pinnedImagePattern =
-  "^[a-z0-9.-]+(?::[0-9]+)?/[a-z0-9]+(?:[._/-][a-z0-9]+)*@sha256:[0-9a-f]{64}$";
-const pinnedImageRegex = new RegExp(pinnedImagePattern);
 const localTools = new Set(["cua_sandbox", "report_papercut"]);
 
 const resourceSchema = Type.Object({
@@ -52,10 +49,7 @@ const resourceSchema = Type.Object({
     }),
   ),
   image: Type.Optional(
-    Type.String({
-      pattern: pinnedImagePattern,
-      description: "Digest-pinned OCI image for create",
-    }),
+    Type.String({ description: "Digest-pinned OCI image for create" }),
   ),
   confirm: Type.Optional(
     Type.Boolean({
@@ -707,12 +701,11 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     os: SandboxOS,
     ctx: UIContext,
     resources?: SandboxResources,
-    image?: string,
   ): Promise<Destination | undefined> {
     if (!ctx.hasUI) return undefined;
     const confirmed = await ctx.ui.confirm(
       `create ${os} sandbox?`,
-      creationDescription(resources, image),
+      creationDescription(resources),
     );
     if (!confirmed) return undefined;
     pi.events.emit("cua:execution-target-changed", {
@@ -722,7 +715,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     });
     try {
       const result = await runBackend(
-        { action: "create", os, ...resources, ...(image ? { image } : {}) },
+        { action: "create", os, ...resources },
         ctx.signal,
         (status) => {
           pi.events.emit("cua:execution-target-changed", {
@@ -789,29 +782,24 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     if (!value) return pickDestination(ctx);
     if (value === "local") return { kind: "local" };
     const createMatch = value.match(
-      /^(?:new\s+)?(linux|windows)(?:(?:\s+([1-9]\d*)\s+([1-9]\d*)(?:\s+(\S+))?)|\s+(\S+))?$/,
+      /^(?:new\s+)?(linux|windows)(?:\s+([1-9]\d*)\s+([1-9]\d*))?$/,
     );
     if (createMatch) {
-      const resources = createMatch[2]
-        ? { cpu: Number(createMatch[2]), memory_mb: Number(createMatch[3]) }
-        : undefined;
+      if (!createMatch[2])
+        return createSandbox(createMatch[1] as SandboxOS, ctx);
+      const resources = {
+        cpu: Number(createMatch[2]),
+        memory_mb: Number(createMatch[3]),
+      };
       if (
-        resources &&
-        (!Number.isSafeInteger(resources.cpu) ||
-          !Number.isSafeInteger(resources.memory_mb))
+        !Number.isSafeInteger(resources.cpu) ||
+        !Number.isSafeInteger(resources.memory_mb)
       )
         throw new Error("cpu and memory_mb are too large");
-      const image = createMatch[4] ?? createMatch[5];
-      if (image && !pinnedImageRegex.test(image))
-        throw new Error(
-          "image must be an OCI reference pinned by sha256 digest",
-        );
-      return createSandbox(createMatch[1] as SandboxOS, ctx, resources, image);
+      return createSandbox(createMatch[1] as SandboxOS, ctx, resources);
     }
     if (/^(?:new\s+)?(?:linux|windows)(?:\s|$)/.test(value))
-      throw new Error(
-        "usage: /sandbox <linux|windows> [cpu memory_mb] [image@sha256:digest]",
-      );
+      throw new Error("usage: /sandbox <linux|windows> [cpu memory_mb]");
     const listed = await runBackend({ action: "list" }, ctx.signal);
     const item = (listed.sandboxes ?? []).find(
       (candidate) => candidate.name === value,

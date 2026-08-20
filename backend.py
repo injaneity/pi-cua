@@ -378,10 +378,7 @@ class SandboxResources:
 CUSTOM_POOL_PATTERN = re.compile(
     r"^cua-pi-custom-(?P<profile>linux|windows)-[0-9a-f]{16}$"
 )
-PINNED_IMAGE_PATTERN = re.compile(
-    r"^[a-z0-9.-]+(?::[0-9]+)?/[a-z0-9]+(?:[._/-][a-z0-9]+)*"
-    r"@sha256:[0-9a-f]{64}$"
-)
+PINNED_IMAGE_PATTERN = re.compile(r"^\S+@sha256:[0-9a-f]{64}$")
 
 
 def sandbox_resources(

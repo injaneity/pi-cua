@@ -21,14 +21,14 @@ windows provisioning also requires `~/.ssh/cua_windows_ed25519` and its `.pub` f
 
 ## behavior
 
-- `/sandbox` changes the current session's execution target. `/sandbox linux 16 65536` creates a sandbox with 16 CPUs and 65536 MiB of memory; omitting both values uses the existing OS defaults. append a digest-pinned OCI reference to use a compatible custom image, for example `/sandbox linux 16 65536 ghcr.io/acme/cua-linux@sha256:…`.
+- `/sandbox` changes the current session's execution target. `/sandbox linux 16 65536` creates a sandbox with 16 CPUs and 65536 MiB of memory; omitting both values uses the existing OS defaults.
 - `/new` asks for a target before the new thread starts.
 - `/fork` inherits the parent thread's target but starts a new sandbox workspace from the current local checkout.
 - `/tree` changes conversation history but not execution placement.
 - `/resume` restores placement from the controller database.
 - the footer shows the selected sandbox. no remote tui or conversation session is created.
 
-custom images must be Fleet-compatible CUA containerDisks and must be pinned by `sha256` digest; mutable tags are rejected.
+custom images are available through the structured `cua_sandbox` create action's `image` field. they must be Fleet-compatible CUA containerDisks and pinned by `sha256` digest; mutable tags are rejected.
 
 `cua_sandbox` and `report_papercut` are local control-plane tools. every other registered tool is proxied by name. sandbox activation fails if the remote pi sdk host does not expose a required tool; calls never fall back to local execution.
 
