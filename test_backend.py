@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import backend
 
@@ -76,6 +76,32 @@ class LocalStateTests(unittest.TestCase):
                     ],
                 )
 
+    def test_local_state_preserves_controller_tailscale_address(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            (state_dir / "linux-1.json").write_text(
+                json.dumps(
+                    {
+                        "name": "linux-1",
+                        "runtime_type": "fleet",
+                        "pool_name": "cua-pi-linux",
+                    }
+                )
+            )
+            controller = {
+                "name": "linux-1",
+                "os": "linux",
+                "pool": "cua-pi-linux",
+                "address": "100.64.0.2",
+            }
+            with (
+                patch.object(backend, "STATE_DIR", state_dir),
+                patch.object(
+                    backend, "controller_sandboxes", return_value=[controller]
+                ),
+            ):
+                self.assertEqual(backend.local_states(), [controller])
+
 
 class TailscaleTests(unittest.TestCase):
     def test_enrollment_key_is_one_use_and_scoped_to_exact_tailnet(self) -> None:
@@ -119,7 +145,29 @@ class TailscaleTests(unittest.TestCase):
             backend.local_tailscale_identity()
 
 
-class WorkspaceBundleTests(unittest.TestCase):
+class WorkspaceTests(unittest.TestCase):
+    def repository(self, directory: str) -> Path:
+        root = Path(directory)
+        subprocess.run(["git", "init", "-q", root], check=True)
+        for key, value in (
+            ("user.email", "test@example.com"),
+            ("user.name", "Test"),
+        ):
+            subprocess.run(["git", "-C", root, "config", key, value], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                root,
+                "remote",
+                "add",
+                "origin",
+                "https://example.com/repository.git",
+            ],
+            check=True,
+        )
+        return root
+
     def test_remote_config_includes_generic_tool_host(self) -> None:
         files = backend.remote_pi_files()
         self.assertIn(".pi/agent/cua-tool-host.mjs", files)
@@ -143,29 +191,9 @@ class WorkspaceBundleTests(unittest.TestCase):
             {"packages": ["git:github.com/example/tool-package"]},
         )
 
-    def test_bundle_reproduces_modified_untracked_and_deleted_files(self) -> None:
+    def test_bundle_describes_only_the_clean_git_baseline(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            subprocess.run(["git", "init", "-q", root], check=True)
-            subprocess.run(
-                ["git", "-C", root, "config", "user.email", "test@example.com"],
-                check=True,
-            )
-            subprocess.run(
-                ["git", "-C", root, "config", "user.name", "Test"], check=True
-            )
-            subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    root,
-                    "remote",
-                    "add",
-                    "origin",
-                    "https://example.com/repository.git",
-                ],
-                check=True,
-            )
+            root = self.repository(directory)
             (root / "modified.txt").write_text("original\n")
             (root / "deleted.txt").write_text("delete me\n")
             subprocess.run(["git", "-C", root, "add", "."], check=True)
@@ -174,24 +202,236 @@ class WorkspaceBundleTests(unittest.TestCase):
             (root / "untracked.txt").write_text("untracked\n")
             (root / "deleted.txt").unlink()
 
-            bundle = backend.build_workspace_bundle(root)
-            with tarfile.open(
-                fileobj=io.BytesIO(bundle.archive), mode="r:gz"
-            ) as archive:
+            source = backend.inspect_workspace(root)
+            self.assertEqual(source.remote_url, "https://example.com/repository.git")
+            self.assertEqual(source.relative_cwd, Path("."))
+
+            snapshot = backend.git_snapshot(root, source.commit)
+            with tarfile.open(fileobj=io.BytesIO(snapshot), mode="r:gz") as archive:
                 modified = archive.extractfile("modified.txt")
-                untracked = archive.extractfile("untracked.txt")
-                self.assertEqual(modified.read(), b"modified\n")
-                self.assertEqual(untracked.read(), b"untracked\n")
+                self.assertEqual(modified.read(), b"original\n")
+                self.assertNotIn("untracked.txt", archive.getnames())
 
-            self.assertEqual(bundle.deleted_paths, ("deleted.txt",))
-            self.assertEqual(bundle.remote_url, "https://example.com/repository.git")
+    def test_workspace_with_content_filter_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.repository(directory)
+            (root / ".gitattributes").write_text("*.bin filter=lfs\n")
+            subprocess.run(["git", "-C", root, "add", ".gitattributes"], check=True)
+            subprocess.run(["git", "-C", root, "commit", "-qm", "initial"], check=True)
+            (root / "asset.bin").write_bytes(b"content")
 
-            clean = backend.build_workspace_bundle(root, include_overlay=False)
-            with tarfile.open(
-                fileobj=io.BytesIO(clean.archive), mode="r:gz"
-            ) as archive:
-                self.assertEqual(archive.getnames(), [])
-            self.assertEqual(clean.deleted_paths, ())
+            with self.assertRaisesRegex(ValueError, "filter=lfs"):
+                backend.inspect_workspace(root)
+
+    def test_workspace_tree_diff_preserves_dirty_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.repository(directory)
+            (root / "tracked.txt").write_text("committed\n")
+            subprocess.run(["git", "-C", root, "add", "."], check=True)
+            subprocess.run(["git", "-C", root, "commit", "-qm", "initial"], check=True)
+
+            (root / "tracked.txt").write_text("local baseline\n")
+            (root / "untracked.txt").write_text("local untracked\n")
+            _, baseline = backend.workspace_tree(root)
+
+            (root / "tracked.txt").write_text("sandbox edit\n")
+            (root / "untracked.txt").unlink()
+            (root / "created.txt").write_text("sandbox created\n")
+            _, final = backend.workspace_tree(root)
+            patch_bytes = backend.workspace_patch(root, baseline, final)
+
+            (root / "tracked.txt").write_text("local baseline\n")
+            (root / "untracked.txt").write_text("local untracked\n")
+            (root / "created.txt").unlink()
+            backend.apply_workspace_patch(root, patch_bytes, final)
+
+            self.assertEqual((root / "tracked.txt").read_text(), "sandbox edit\n")
+            self.assertFalse((root / "untracked.txt").exists())
+            self.assertEqual((root / "created.txt").read_text(), "sandbox created\n")
+
+    def test_empty_remote_patch_still_retains_and_verifies_the_tree(self) -> None:
+        tree = "1" * 40
+        with (
+            patch.object(backend, "copy_guest_file") as copy,
+            patch.object(backend, "run_guest_ssh") as run,
+            patch.object(
+                backend, "remote_workspace_tree", return_value=tree
+            ) as snapshot,
+        ):
+            backend.apply_remote_workspace_patch(
+                "100.64.0.2",
+                "linux",
+                "/workspace",
+                b"",
+                tree,
+                reference="session/workspace",
+            )
+
+        copy.assert_not_called()
+        run.assert_not_called()
+        snapshot.assert_called_once_with(
+            "100.64.0.2",
+            "linux",
+            "/workspace",
+            reference="session/workspace",
+        )
+
+
+class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.state = backend.WorkspaceState(
+            version=1,
+            localRoot="/local",
+            commit="a" * 40,
+            commitTree="1" * 40,
+            baselineTree="2" * 40,
+        )
+        self.source = backend.SandboxWorkspaceSource(
+            address="100.64.0.1",
+            os="linux",
+            remoteCwd="/source/workspace",
+            state=self.state,
+        )
+        self.repository = backend.WorkspaceRepository(
+            Path("/local"), Path("."), "https://example.com/repo.git", "a" * 40
+        )
+        self.transfer = backend.WorkspaceTransfer(
+            self.state, b"baseline", b"current", "3" * 40
+        )
+
+    def test_local_capture_builds_one_verified_transfer(self) -> None:
+        with (
+            patch.object(
+                backend,
+                "workspace_tree",
+                return_value=(Path("/local"), self.state["baselineTree"]),
+            ),
+            patch.object(backend, "git_output", return_value=self.state["commitTree"]),
+            patch.object(
+                backend, "workspace_patch", return_value=b"baseline"
+            ) as workspace_patch,
+        ):
+            transfer = backend.capture_local_workspace(self.repository)
+
+        self.assertEqual(transfer.state, self.state)
+        self.assertEqual(transfer.baseline_patch, b"baseline")
+        self.assertEqual(transfer.current_patch, b"")
+        self.assertEqual(transfer.final_tree, self.state["baselineTree"])
+        workspace_patch.assert_called_once_with(
+            Path("/local"), self.state["commitTree"], self.state["baselineTree"]
+        )
+
+    def test_sandbox_capture_builds_baseline_and_current_patches(self) -> None:
+        with (
+            patch.object(backend, "workspace_location", return_value=("/source", ".")),
+            patch.object(backend, "remote_workspace_tree", return_value="3" * 40),
+            patch.object(
+                backend,
+                "remote_workspace_patch",
+                side_effect=[b"current", b"baseline"],
+            ) as workspace_patch,
+        ):
+            transfer = backend.capture_sandbox_workspace(self.source)
+
+        self.assertEqual(transfer.baseline_patch, b"baseline")
+        self.assertEqual(transfer.current_patch, b"current")
+        self.assertEqual(transfer.final_tree, "3" * 40)
+        self.assertEqual(workspace_patch.call_count, 2)
+
+    def test_restore_verifies_commit_then_applies_baseline_and_current(self) -> None:
+        with (
+            patch.object(
+                backend,
+                "remote_workspace_tree",
+                return_value=self.state["commitTree"],
+            ),
+            patch.object(backend, "apply_remote_workspace_patch") as apply_patch,
+        ):
+            backend.restore_sandbox_workspace(
+                "100.64.0.2", "windows", r"C:\workspace", self.transfer, "session"
+            )
+
+        self.assertEqual(
+            [call.args[3] for call in apply_patch.call_args_list],
+            [b"baseline", b"current"],
+        )
+        self.assertEqual(
+            apply_patch.call_args_list[0].kwargs["reference"], "session/workspace"
+        )
+
+    def test_restore_rejects_destination_commit_mismatch(self) -> None:
+        with (
+            patch.object(backend, "remote_workspace_tree", return_value="9" * 40),
+            patch.object(backend, "apply_remote_workspace_patch") as apply_patch,
+            self.assertRaisesRegex(RuntimeError, "does not match the Git baseline"),
+        ):
+            backend.restore_sandbox_workspace(
+                "100.64.0.2", "linux", "/workspace", self.transfer, "session"
+            )
+        apply_patch.assert_not_called()
+
+    async def test_prepare_execution_connects_capture_prepare_and_restore(self) -> None:
+        transfer = backend.WorkspaceTransfer(self.state, b"baseline", b"", "2" * 40)
+        with (
+            patch.object(
+                backend,
+                "local_states",
+                return_value=[{"name": "linux-1", "os": "linux"}],
+            ),
+            patch.object(backend, "inspect_workspace", return_value=self.repository),
+            patch.object(backend, "capture_sandbox_workspace", return_value=transfer),
+            patch.object(backend, "healthy_over_ssh", return_value="100.64.0.2"),
+            patch.object(backend, "sync_guest_packages"),
+            patch.object(
+                backend,
+                "prepare_workspace",
+                AsyncMock(return_value="/remote/workspace"),
+            ) as prepare,
+            patch.object(backend, "workspace_location", return_value=("/remote", ".")),
+            patch.object(backend, "restore_sandbox_workspace") as restore,
+        ):
+            result = await backend.prepare_execution(
+                "linux-1", "/local", "session-1", self.source
+            )
+
+        self.assertEqual(result["workspace_state"], self.state)
+        self.assertEqual(prepare.await_args.args[2].commit, self.state["commit"])
+        restore.assert_called_once()
+
+
+class BackgroundJobTests(unittest.IsolatedAsyncioTestCase):
+    async def test_poll_returns_result_and_always_cleans_up(self) -> None:
+        shell = SimpleNamespace()
+        shell.run = AsyncMock(
+            side_effect=[
+                SimpleNamespace(returncode=0, stdout="__DONE__0\nfinished\n"),
+                SimpleNamespace(returncode=0, stdout=""),
+            ]
+        )
+        code, output = await backend.poll_background_job(
+            SimpleNamespace(shell=shell),
+            "poll",
+            "cleanup",
+            "bootstrap.linux",
+            10,
+            "Linux",
+        )
+        self.assertEqual((code, output), (0, "finished"))
+        self.assertEqual(shell.run.await_args_list[-1].args[0], "cleanup")
+
+    async def test_poll_timeout_still_cleans_up(self) -> None:
+        shell = SimpleNamespace()
+        shell.run = AsyncMock(return_value=SimpleNamespace(returncode=0, stdout=""))
+        with self.assertRaisesRegex(RuntimeError, "timed out"):
+            await backend.poll_background_job(
+                SimpleNamespace(shell=shell),
+                "poll",
+                "cleanup",
+                "bootstrap.linux",
+                0,
+                "Linux",
+            )
+        self.assertEqual(shell.run.await_args_list[-1].args[0], "cleanup")
 
 
 class VisibleOperationTests(unittest.IsolatedAsyncioTestCase):
@@ -246,8 +486,16 @@ class ControllerStateTests(unittest.TestCase):
                     "kind": "sandbox",
                     "name": "linux-1",
                     "os": "linux",
+                    "address": "100.64.0.2",
                     "localCwd": "/local",
                     "remoteCwd": "/remote",
+                    "workspaceState": {
+                        "version": 1,
+                        "localRoot": "/local",
+                        "commit": "a" * 40,
+                        "commitTree": "1" * 40,
+                        "baselineTree": "1" * 40,
+                    },
                 }
                 backend.set_execution_target("session-1", str(session_file), target)
                 by_id = backend.get_execution_target(session_id="session-1")

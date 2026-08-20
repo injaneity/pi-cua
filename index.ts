@@ -1,12 +1,5 @@
 import {
   DynamicBorder,
-  createBashToolDefinition,
-  createEditToolDefinition,
-  createFindToolDefinition,
-  createGrepToolDefinition,
-  createLsToolDefinition,
-  createReadToolDefinition,
-  createWriteToolDefinition,
   type AgentToolResult,
   type BashOperations,
   type ExtensionAPI,
@@ -41,12 +34,6 @@ const resourceSchema = Type.Object({
     Type.String({ description: "Managed sandbox name, such as linux-1" }),
   ),
   os: Type.Optional(StringEnum(["linux", "windows"] as const)),
-  image: Type.Optional(
-    Type.String({
-      description:
-        "Optional OCI registry image. Use linux or windows for the built-in default.",
-    }),
-  ),
   confirm: Type.Optional(
     Type.Boolean({
       description: "Required for create or delete when no UI is available",
@@ -61,7 +48,14 @@ type SandboxItem = {
   os: SandboxOS;
   pool: string;
   online: boolean;
-  image?: string | null;
+};
+type WorkspaceState = {
+  version: 1;
+  localRoot: string;
+  // immutable objects captured when this thread first enters a sandbox
+  commit: string;
+  commitTree: string;
+  baselineTree: string;
 };
 type BackendResult = {
   ok: boolean;
@@ -79,6 +73,7 @@ type BackendResult = {
   changed?: boolean;
   state?: string;
   remote_cwd?: string;
+  workspace_state?: WorkspaceState;
   target?: unknown;
 };
 type Destination =
@@ -89,8 +84,10 @@ type ExecutionTarget =
       kind: "sandbox";
       name: string;
       os: SandboxOS;
+      address: string;
       localCwd: string;
       remoteCwd: string;
+      workspaceState: WorkspaceState;
     };
 type UIContext = ExtensionContext | ExtensionCommandContext;
 type PickerItem = SelectItem & { value: string };
@@ -160,7 +157,7 @@ function sshArgs(
     "-o",
     `ControlPath=${homedir()}/.ssh/cua-%C`,
     "-T",
-    `cua@${target.name}`,
+    `cua@${target.address}`,
   ];
 }
 
@@ -187,6 +184,7 @@ class ToolBridge {
   private stderr = "";
   private ready = false;
   private readonly remoteTools = new Map<string, RemoteToolInfo>();
+  private sequence = 0;
 
   constructor(
     private readonly target: Extract<ExecutionTarget, { kind: "sandbox" }>,
@@ -203,6 +201,11 @@ class ToolBridge {
     if (!message.id) return;
     const pending = this.pending.get(message.id);
     if (!pending) return;
+    if (message.type === "manifest" && message.tools) {
+      this.pending.delete(message.id);
+      pending.resolve(message.tools);
+      return;
+    }
     if (message.type === "update" && message.update) {
       pending.onUpdate?.(message.update);
       return;
@@ -326,41 +329,74 @@ class ToolBridge {
     return this.remoteTools.get(name);
   }
 
-  async execute(
+  private async request<T>(
+    id: string,
+    message: Record<string, unknown>,
+    options: {
+      signal?: AbortSignal;
+      onUpdate?: (update: ToolUpdate) => void;
+      onData?: (data: Buffer) => void;
+    } = {},
+  ): Promise<T> {
+    await this.start();
+    if (options.signal?.aborted) throw new Error("aborted");
+    return new Promise<T>((resolve, reject) => {
+      const finish = (callback: () => void) => {
+        options.signal?.removeEventListener("abort", onAbort);
+        callback();
+      };
+      const onAbort = () => this.send({ type: "cancel", id });
+      options.signal?.addEventListener("abort", onAbort, { once: true });
+      this.pending.set(id, {
+        resolve: (value) => finish(() => resolve(value as T)),
+        reject: (error) => finish(() => reject(error)),
+        onUpdate: options.onUpdate,
+        onData: options.onData,
+      });
+      try {
+        this.send(message);
+      } catch (error) {
+        this.pending.delete(id);
+        finish(() =>
+          reject(error instanceof Error ? error : new Error(String(error))),
+        );
+      }
+    });
+  }
+
+  async refresh(expectedTools: string[]): Promise<void> {
+    const id = `manifest-${++this.sequence}`;
+    const tools = await this.request<RemoteToolInfo[]>(id, {
+      type: "manifest",
+      id,
+    });
+    const names = new Set(tools.map((item) => item.name));
+    const missing = expectedTools.filter((name) => !names.has(name));
+    if (missing.length > 0) {
+      throw new Error(`remote tool host is missing: ${missing.join(", ")}`);
+    }
+    this.remoteTools.clear();
+    for (const item of tools) this.remoteTools.set(item.name, item);
+  }
+
+  execute(
     toolName: string,
     id: string,
     input: unknown,
     signal: AbortSignal | undefined,
     onUpdate: ((update: ToolUpdate) => void) | undefined,
   ): Promise<AgentToolResult<unknown>> {
-    await this.start();
-    return new Promise<AgentToolResult<unknown>>((resolve, reject) => {
-      const onAbort = () => this.send({ type: "cancel", id });
-      signal?.addEventListener("abort", onAbort, { once: true });
-      this.pending.set(id, {
-        resolve: (value) => {
-          signal?.removeEventListener("abort", onAbort);
-          resolve(value as AgentToolResult<unknown>);
-        },
-        reject: (error) => {
-          signal?.removeEventListener("abort", onAbort);
-          reject(error);
-        },
+    return this.request(
+      id,
+      { type: "execute", id, tool: toolName, input },
+      {
+        signal,
         onUpdate,
-      });
-      try {
-        this.send({ type: "execute", id, tool: toolName, input });
-      } catch (error) {
-        const pending = this.pending.get(id);
-        this.pending.delete(id);
-        pending?.reject(
-          error instanceof Error ? error : new Error(String(error)),
-        );
-      }
-    });
+      },
+    );
   }
 
-  async bash(
+  bash(
     id: string,
     command: string,
     options: {
@@ -369,31 +405,11 @@ class ToolBridge {
       timeout?: number;
     },
   ): Promise<{ exitCode: number | null }> {
-    await this.start();
-    return new Promise((resolve, reject) => {
-      const onAbort = () => this.send({ type: "cancel", id });
-      options.signal?.addEventListener("abort", onAbort, { once: true });
-      this.pending.set(id, {
-        resolve: (value) => {
-          options.signal?.removeEventListener("abort", onAbort);
-          resolve(value as { exitCode: number | null });
-        },
-        reject: (error) => {
-          options.signal?.removeEventListener("abort", onAbort);
-          reject(error);
-        },
-        onData: options.onData,
-      });
-      try {
-        this.send({ type: "bash", id, command, timeout: options.timeout });
-      } catch (error) {
-        const pending = this.pending.get(id);
-        this.pending.delete(id);
-        pending?.reject(
-          error instanceof Error ? error : new Error(String(error)),
-        );
-      }
-    });
+    return this.request(
+      id,
+      { type: "bash", id, command, timeout: options.timeout },
+      options,
+    );
   }
 
   close(): void {
@@ -514,30 +530,47 @@ function requireSandbox(result: BackendResult): {
 }
 
 function parseTarget(value: unknown): ExecutionTarget | undefined {
-  if (!value || typeof value !== "object") return undefined;
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "object")
+    throw new Error("saved execution target is invalid");
   const data = value as Record<string, unknown>;
   if (data.kind === "local") return { kind: "local" };
   if (
     data.kind !== "sandbox" ||
     typeof data.name !== "string" ||
     (data.os !== "linux" && data.os !== "windows") ||
+    typeof data.address !== "string" ||
     typeof data.localCwd !== "string" ||
     typeof data.remoteCwd !== "string"
   )
-    return undefined;
+    throw new Error("saved execution target is invalid");
+  const sync = data.workspaceState as Record<string, unknown> | undefined;
+  if (
+    !sync ||
+    sync.version !== 1 ||
+    typeof sync.localRoot !== "string" ||
+    typeof sync.commit !== "string" ||
+    typeof sync.commitTree !== "string" ||
+    typeof sync.baselineTree !== "string"
+  )
+    throw new Error("saved sandbox workspace state is unsupported");
   return {
     kind: "sandbox",
     name: data.name,
     os: data.os,
+    address: data.address,
     localCwd: data.localCwd,
     remoteCwd: data.remoteCwd,
+    workspaceState: sync as WorkspaceState,
   };
 }
 
 export default function cuaSandbox(pi: ExtensionAPI): void {
   let target: ExecutionTarget = { kind: "local" };
+  let placementError: Error | undefined;
   let bridge: ToolBridge | undefined;
   const proxiedTools = new Set<string>();
+  const toolPackages = new Set<string>();
 
   async function executeBackend(
     request: Record<string, unknown>,
@@ -565,6 +598,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
   async function runBackend(
     request: Record<string, unknown>,
     signal?: AbortSignal,
+    onStatus?: (status: BackendResult) => void,
   ): Promise<BackendResult> {
     let status = await executeBackend(request, signal);
     const operationId = status.operation_id;
@@ -583,6 +617,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
           action: "operation_status",
           operation_id: operationId,
         });
+        onStatus?.(status);
       }
     } catch (error) {
       if (signal?.aborted) {
@@ -634,7 +669,6 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
   async function createSandbox(
     os: SandboxOS,
     ctx: UIContext,
-    image?: string,
   ): Promise<Destination | undefined> {
     if (!ctx.hasUI) return undefined;
     const confirmed = await ctx.ui.confirm(
@@ -642,20 +676,36 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       "this provisions a persistent fleet claim and incurs cost.",
     );
     if (!confirmed) return undefined;
-    ctx.ui.setStatus(
-      "cua-session",
-      ctx.ui.theme.fg("accent", `creating ${os} sandbox...`),
-    );
+    pi.events.emit("cua:execution-target-changed", {
+      kind: "progress",
+      state: "creating",
+      os,
+    });
     try {
       const result = await runBackend(
-        { action: "create", os, ...(image ? { image } : {}) },
+        { action: "create", os },
         ctx.signal,
+        (status) => {
+          pi.events.emit("cua:execution-target-changed", {
+            kind: "progress",
+            state: "creating",
+            os,
+            phase: status.phase,
+            message: status.message,
+          });
+        },
       );
       const sandbox = requireSandbox(result);
       pi.events.emit("cua:sandboxes-changed", result);
+      pi.events.emit("cua:execution-target-changed", {
+        kind: "sandbox",
+        ...sandbox,
+        state: "connecting",
+      });
       return { kind: "sandbox", ...sandbox };
-    } finally {
-      ctx.ui.setStatus("cua-session", undefined);
+    } catch (error) {
+      pi.events.emit("cua:execution-target-changed", target);
+      throw error;
     }
   }
 
@@ -670,7 +720,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       ...online.map((sandbox) => ({
         value: sandbox.name,
         label: sandbox.name,
-        description: `${sandbox.os} • ${sandbox.image || "default image"} • reachable over Tailscale`,
+        description: `${sandbox.os} • reachable over Tailscale`,
       })),
       {
         value: "create",
@@ -696,17 +746,9 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     args: string,
     ctx: UIContext,
   ): Promise<Destination | undefined> {
-    const raw = args.trim();
-    const value = raw.toLowerCase();
+    const value = args.trim().toLowerCase();
     if (!value) return pickDestination(ctx);
     if (value === "local") return { kind: "local" };
-    const imageMatch = raw.match(/^(linux|windows)\s+(.+)$/i);
-    if (imageMatch)
-      return createSandbox(
-        imageMatch[1].toLowerCase() as SandboxOS,
-        ctx,
-        imageMatch[2].trim(),
-      );
     if (value === "linux" || value === "new linux")
       return createSandbox("linux", ctx);
     if (value === "windows" || value === "new windows")
@@ -719,35 +761,32 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     return { kind: "sandbox", name: item.name, os: item.os };
   }
 
-  function remoteToolPackages(): string[] {
-    return [
-      ...new Set(
-        pi
-          .getAllTools()
-          .filter(
-            (tool) =>
-              !localTools.has(tool.name) &&
-              tool.sourceInfo.origin === "package" &&
-              tool.sourceInfo.scope === "user" &&
-              ["git:", "npm:", "https://", "http://", "ssh://"].some((prefix) =>
-                tool.sourceInfo.source.startsWith(prefix),
-              ),
-          )
-          .map((tool) => tool.sourceInfo.source),
-      ),
-    ];
+  function captureToolProviders(): string[] {
+    const names: string[] = [];
+    for (const tool of pi.getAllTools()) {
+      if (localTools.has(tool.name)) continue;
+      names.push(tool.name);
+      if (
+        tool.sourceInfo.origin === "package" &&
+        tool.sourceInfo.scope === "user" &&
+        ["git:", "npm:", "https://", "http://", "ssh://"].some((prefix) =>
+          tool.sourceInfo.source.startsWith(prefix),
+        ) &&
+        !tool.sourceInfo.source.toLowerCase().includes("pi-cua")
+      ) {
+        toolPackages.add(tool.sourceInfo.source);
+      }
+    }
+    return names;
   }
 
   async function prepareTarget(
     destination: Extract<Destination, { kind: "sandbox" }>,
     ctx: UIContext,
-    options: {
-      transferCurrentWorkspace?: boolean;
-      includeLocalOverlay?: boolean;
-    } = {},
+    options: { inheritWorkspace?: boolean } = {},
   ): Promise<Extract<ExecutionTarget, { kind: "sandbox" }>> {
-    const { transferCurrentWorkspace = true, includeLocalOverlay = true } =
-      options;
+    const { inheritWorkspace = true } = options;
+    captureToolProviders();
     pi.events.emit("cua:execution-target-changed", {
       ...destination,
       state: "connecting",
@@ -759,31 +798,41 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
           name: destination.name,
           source_cwd: ctx.cwd,
           workspace_id: ctx.sessionManager.getSessionId(),
-          tool_packages: remoteToolPackages(),
-          include_local_overlay: includeLocalOverlay,
-          source_sandbox:
-            transferCurrentWorkspace && target.kind === "sandbox"
-              ? target.name
-              : undefined,
-          source_os:
-            transferCurrentWorkspace && target.kind === "sandbox"
-              ? target.os
-              : undefined,
-          source_remote_cwd:
-            transferCurrentWorkspace && target.kind === "sandbox"
-              ? target.remoteCwd
+          tool_packages: [...toolPackages],
+          source:
+            inheritWorkspace && target.kind === "sandbox"
+              ? {
+                  address: target.address,
+                  os: target.os,
+                  remoteCwd: target.remoteCwd,
+                  state: target.workspaceState,
+                }
               : undefined,
         },
         ctx.signal,
+        (status) => {
+          pi.events.emit("cua:execution-target-changed", {
+            ...destination,
+            state: "connecting",
+            phase: status.phase,
+            message: status.message,
+          });
+        },
       );
-      if (typeof result.remote_cwd !== "string") {
-        throw new Error("cua backend returned no remote workspace");
+      if (
+        typeof result.remote_cwd !== "string" ||
+        typeof result.address !== "string" ||
+        !result.workspace_state
+      ) {
+        throw new Error("cua backend returned an invalid execution target");
       }
       pi.events.emit("cua:sandboxes-changed", result);
       return {
         ...destination,
+        address: result.address,
         localCwd: ctx.cwd,
         remoteCwd: result.remote_cwd,
+        workspaceState: result.workspace_state,
       };
     } catch (error) {
       pi.events.emit("cua:execution-target-changed", target);
@@ -791,31 +840,18 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     }
   }
 
-  function installProxies(ctx: UIContext): void {
+  function installProxies(): void {
     if (target.kind !== "sandbox") return;
     const active = pi.getActiveTools();
-    const builtin = new Map<string, AnyToolDefinition>([
-      ["read", createReadToolDefinition(ctx.cwd)],
-      ["write", createWriteToolDefinition(ctx.cwd)],
-      ["edit", createEditToolDefinition(ctx.cwd)],
-      ["bash", createBashToolDefinition(ctx.cwd)],
-      ["grep", createGrepToolDefinition(ctx.cwd)],
-      ["find", createFindToolDefinition(ctx.cwd)],
-      ["ls", createLsToolDefinition(ctx.cwd)],
-    ]);
     for (const info of pi.getAllTools()) {
-      if (localTools.has(info.name) || proxiedTools.has(info.name)) continue;
+      if (localTools.has(info.name)) continue;
+      const owned = info.sourceInfo.path.startsWith(extensionDir);
+      if (owned && proxiedTools.has(info.name)) continue;
       const remote = bridge?.definition(info.name);
       if (!remote)
         throw new Error(`remote tool metadata missing: ${info.name}`);
-      const definition: AnyToolDefinition = builtin.get(info.name) ?? {
-        ...remote,
-        async execute() {
-          throw new Error("unreachable");
-        },
-      };
       pi.registerTool({
-        ...definition,
+        ...remote,
         async execute(id, input, signal, onUpdate) {
           if (target.kind !== "sandbox" || !bridge) {
             throw new Error(`${info.name} has no active sandbox`);
@@ -826,29 +862,13 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       proxiedTools.add(info.name);
     }
     pi.setActiveTools(active);
-    const bypassed = pi
-      .getAllTools()
-      .filter(
-        (info) =>
-          proxiedTools.has(info.name) &&
-          !info.sourceInfo.path.startsWith(extensionDir),
-      )
-      .map((info) => info.name);
-    if (bypassed.length > 0) {
-      throw new Error(
-        `remote tool routing lost extension precedence: ${bypassed.join(", ")}`,
-      );
-    }
   }
 
   async function activate(
     next: ExecutionTarget,
     ctx: UIContext,
   ): Promise<void> {
-    const expectedTools = pi
-      .getAllTools()
-      .map((tool) => tool.name)
-      .filter((name) => !localTools.has(name));
+    const expectedTools = captureToolProviders();
     const nextBridge =
       next.kind === "sandbox" ? new ToolBridge(next, expectedTools) : undefined;
     if (next.kind === "sandbox") {
@@ -867,8 +887,9 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     }
     bridge?.close();
     target = next;
+    placementError = undefined;
     bridge = nextBridge;
-    if (next.kind === "sandbox") installProxies(ctx);
+    if (next.kind === "sandbox") installProxies();
     ctx.ui.setStatus("cua-session", undefined);
     pi.events.emit("cua:execution-target-changed", next);
   }
@@ -887,8 +908,6 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     async execute(_id, input: ResourceInput, signal, onUpdate, ctx) {
       if (input.action === "create" && !input.os)
         throw new Error("create requires os");
-      if (input.image && input.action !== "create")
-        throw new Error("image is only valid for create");
       if (["ensure", "delete"].includes(input.action) && !input.name) {
         throw new Error(`${input.action} requires name`);
       }
@@ -939,8 +958,32 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         if (!destination) return;
         if (destination.kind === "local") {
           if (target.kind === "sandbox") {
-            throw new Error(
-              "switching a sandbox workspace back to local is not yet supported",
+            pi.events.emit("cua:execution-target-changed", {
+              ...target,
+              state: "connecting",
+              phase: "workspace.local.sync",
+              message: "syncing sandbox changes to local",
+            });
+            await runBackend(
+              {
+                action: "sync_workspace_to_local",
+                source: {
+                  address: target.address,
+                  os: target.os,
+                  remoteCwd: target.remoteCwd,
+                  state: target.workspaceState,
+                },
+                local_cwd: target.localCwd,
+              },
+              ctx.signal,
+              (status) => {
+                pi.events.emit("cua:execution-target-changed", {
+                  ...target,
+                  state: "connecting",
+                  phase: status.phase,
+                  message: status.message,
+                });
+              },
             );
           }
           const local: ExecutionTarget = { kind: "local" };
@@ -972,10 +1015,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
           const prepared = await prepareTarget(
             { kind: "sandbox", name: saved.name, os: saved.os },
             ctx,
-            {
-              transferCurrentWorkspace: false,
-              includeLocalOverlay: false,
-            },
+            { inheritWorkspace: false },
           );
           await activate(prepared, ctx);
         } else {
@@ -994,21 +1034,24 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         await activate({ kind: "local" }, ctx);
         return;
       }
-      const prepared = await prepareTarget(destination, ctx, {
-        transferCurrentWorkspace: false,
-      });
+      const prepared = await prepareTarget(destination, ctx);
       await activate(prepared, ctx);
     } catch (error) {
+      placementError =
+        error instanceof Error ? error : new Error(String(error));
       ctx.ui.notify(
-        `sandbox unavailable; using local tools: ${error instanceof Error ? error.message : String(error)}`,
-        "warning",
+        `execution placement blocked: ${placementError.message}; choose a target with /sandbox`,
+        "error",
       );
     }
   });
 
-  pi.on("before_agent_start", (event, ctx) => {
-    if (target.kind !== "sandbox") return;
-    installProxies(ctx);
+  pi.on("before_agent_start", async (event, ctx) => {
+    if (placementError) throw placementError;
+    if (target.kind !== "sandbox" || !bridge) return;
+    const expectedTools = captureToolProviders();
+    await bridge.refresh(expectedTools);
+    installProxies();
     const localCwd = `Current working directory: ${target.localCwd}`;
     const environment = `Execution environment: ${target.os}. All tools and user shell commands run in ${target.os}; use relative workspace paths and answer environment questions for ${target.os}.`;
     return {
@@ -1017,6 +1060,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
   });
 
   pi.on("user_bash", () => {
+    if (placementError) throw placementError;
     if (target.kind !== "sandbox" || !bridge) return;
     const operations: BashOperations = {
       exec: (command, _cwd, options) =>

@@ -8,7 +8,7 @@ pi's tui, agent, model, and conversation sessions stay local. each local session
 pi install git:github.com/injaneity/pi-cua
 ```
 
-this package currently targets macos controllers, CUA Fleet pools named `cua-pi-linux` and `cua-pi-windows`, and a Tailscale network with the `tag:cua-sandbox` ACL tag. store the CUA Fleet and Tailscale OAuth credentials in Keychain:
+this package currently targets macos controllers with `uv` and the Tailscale CLI installed. the controller must be online in a Tailscale network with the `tag:cua-sandbox` ACL tag. its OAuth client must be allowed to create auth keys for that tag, and the tailnet ACL must allow the controller to reach tagged guests, including Tailscale SSH for linux. CUA Fleet pools default to `cua-pi-linux` and `cua-pi-windows`; fleet pool/namespace names are a tenant-wide authorization boundary — if another tenant already owns a default name, pool operations fail with a persistent 403; set `CUA_PI_LINUX_POOL` and `CUA_PI_WINDOWS_POOL` to unclaimed names for your tenant. store the CUA Fleet and Tailscale OAuth credentials in Keychain:
 
 ```bash
 security add-generic-password -U -s cua-sandbox-fleet-api -a client-id -w "$CUA_CLIENT_ID"
@@ -23,7 +23,7 @@ windows provisioning also requires `~/.ssh/cua_windows_ed25519` and its `.pub` f
 
 - `/sandbox` changes the current session's execution target.
 - `/new` asks for a target before the new thread starts.
-- `/fork` inherits the parent thread's target but prepares a clean workspace from the local repository commit.
+- `/fork` inherits the parent thread's target but starts a new sandbox workspace from the current local checkout.
 - `/tree` changes conversation history but not execution placement.
 - `/resume` restores placement from the controller database.
 - the footer shows the selected sandbox. no remote tui or conversation session is created.
@@ -33,18 +33,18 @@ windows provisioning also requires `~/.ssh/cua_windows_ed25519` and its `.pub` f
 ## execution path
 
 1. the controller reuses a persistent ssh connection and takes a direct health fast path for an already bootstrapped sandbox; it contacts Fleet only for repair or bootstrap;
-2. it prepares the session workspace from the local git checkout, or streams the canonical workspace from the previously selected sandbox;
+2. it prepares the destination from the thread's local Git baseline, then applies the accumulated workspace delta from the active sandbox;
 3. the extension starts one non-tty ssh jsonl channel to `cua-tool-host.mjs`;
 4. the host loads pi's normal remote tool registry and reports its protocol and tool manifest;
 5. calls, updates, results, errors, cancellation, and user shell output use that channel.
 
-switching between sandboxes is transactional: the target workspace is restored through a staging directory before the local target mapping and footer change. failure leaves the previous target active. switching a sandbox workspace back to local is intentionally blocked until a safe local restore transaction exists.
+all target changes use one workspace model: Pi records local and sandbox Git trees at sandbox entry, computes the accumulated binary tree diff when leaving a sandbox, verifies the destination baseline, and applies that diff. local divergence or a patch conflict stops the switch, and failure leaves the previous target active.
 
 ## state
 
 execution placement is controller metadata keyed by local pi session id and session file. it is not part of the conversation tree, so `/tree` and compaction cannot change it.
 
-sandbox workspaces are keyed by session id. a new thread starts from the local repository commit and overlay. forks copy only Pi's local conversation history; they receive a clean checkout of the commit and never copy or share the parent's files or uncommitted overlay.
+sandbox workspaces are keyed by session id. new threads and forks start from an exact snapshot of the current local checkout. a fork does not copy its parent's active sandbox workspace, so both threads retain independently verifiable local baselines.
 
 placement adds a stable operating-system instruction and logical `workspace root` cwd to the model prompt, but no sandbox name, physical path, or conversation entry. forks on the same target OS therefore keep the same prompt prefix for provider cache hits even though they receive different physical workspaces.
 
@@ -56,7 +56,7 @@ pi-cua emits `cua:execution-target-changed` with local, connecting, and ready ta
 
 the guest receives the pi sdk version, only the user packages that own routed tools, top-level extension definitions, and the generic tool host. the host activates lifecycle handlers only for extensions that own required tools. it does not receive local model credentials, prompts, conversation sessions, or the sandbox controller.
 
-workspace preparation requires a git repository with a network `origin` and does not support submodules. new threads and existing local threads carry the local overlay, limited to 200 mib; forks intentionally omit it. guests keep a bare repository cache outside all workspaces, so fresh sessions and forks reuse git objects without sharing mutable files. package-manager caches also remain in the guest user profile. sandbox-to-sandbox handoff for the same thread streams the complete workspace, including `.git` and untracked files, over ssh.
+workspace preparation requires a git repository with a network `origin` and does not support submodules, Git content filters, or working-tree encodings. if the guest cannot authenticate to the origin, the controller sends a clean commit snapshot and creates an isolated baseline without copying git credentials. new threads, existing local threads, and forks carry the local changes, limited to 200 mib. guests keep a bare repository cache outside all workspaces, so fresh sessions and forks reuse git objects without sharing mutable files. package-manager caches also remain in the guest user profile. every handoff transfers only the accumulated binary Git tree diff; `.git`, ignored files, credentials, caches, and processes stay with their machine.
 
 ## verification
 
