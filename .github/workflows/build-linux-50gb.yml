@@ -1,4 +1,4 @@
-name: build linux 30gb raw containerdisk
+name: diagnose resized linux boot
 
 on:
   push:
@@ -6,67 +6,72 @@ on:
 
 permissions:
   contents: read
-  packages: write
+  packages: read
 
 env:
-  SOURCE_IMAGE: public.ecr.aws/k5j5w0x5/cua-ubuntu-24.04@sha256:85b3f5022bf9ecc864472f5fade5e2f1f54ab88ce429af7873a1415d668dc2ea
-  STAGING_IMAGE: ghcr.io/injaneity/pi-cua-linux:30gb-raw-staging
-  TARGET_IMAGE: ghcr.io/injaneity/pi-cua-linux:30gb-raw-eb68411-amd64
+  IMAGE: ghcr.io/injaneity/pi-cua-linux@sha256:e95f8fc657470c0f81270b1da5412d5d3977db6cb509b8c05fbd04551db2b4fe
 
 jobs:
-  build:
+  boot:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 30
     steps:
       - name: reclaim runner storage
         run: |
           sudo rm -rf /opt/hostedtoolcache
           docker system prune -af
 
-      - name: install image tools
+      - name: install diagnostics
         run: |
           sudo apt-get update -qq
-          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq qemu-utils libguestfs-tools linux-image-generic
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq qemu-system-x86 qemu-utils libguestfs-tools linux-image-generic
           sudo chmod 0644 /boot/vmlinuz-*
+          sudo chmod 666 /dev/kvm 2>/dev/null || true
 
-      - name: extract and expand the boot disk
+      - name: extract and inspect disk
         env:
           LIBGUESTFS_BACKEND: direct
           LIBGUESTFS_MEMSIZE: "1024"
         run: |
-          docker pull --platform linux/amd64 "$SOURCE_IMAGE"
-          container=$(docker create --platform linux/amd64 "$SOURCE_IMAGE" /bin/true)
-          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
-          docker cp "$container:/disk/disk.img" source.img
-          qemu-img create -f raw expanded.img 30G
-          virt-resize --expand /dev/sda1 source.img expanded.img
-          qemu-img info expanded.img
-          virt-df -h -a expanded.img
-          rm -f source.img
-          docker rm -f "$container"
-          docker image rm "$SOURCE_IMAGE"
-          trap - EXIT
-          mkdir -p layer/disk
-          mv expanded.img layer/disk/disk.img
-          # OCI runtimes reject GNU sparse headers. Store a normal raw file;
-          # gzip keeps the zero-filled free space small in the registry layer.
-          tar -czf disk-layer.tar.gz -C layer disk
-          rm -rf layer
-          ls -lh disk-layer.tar.gz
-          df -h .
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker pull --platform linux/amd64 "$IMAGE"
+          container=$(docker create --platform linux/amd64 "$IMAGE" /bin/true)
+          docker cp "$container:/disk/disk.img" disk.img
+          docker rm "$container"
+          qemu-img info disk.img
+          virt-filesystems -a disk.img --all --long --uuid -h
+          virt-df -h -a disk.img
 
-      - name: publish containerdisk
+      - name: boot with Fleet-compatible BIOS settings
         run: |
-          version=0.20.6
-          curl -fsSL "https://github.com/google/go-containerregistry/releases/download/v${version}/go-containerregistry_Linux_x86_64.tar.gz" \
-            | sudo tar -xz -C /usr/local/bin crane
-          echo "${{ secrets.GITHUB_TOKEN }}" | crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin
-          crane append \
-            --new_layer disk-layer.tar.gz \
-            --new_tag "$STAGING_IMAGE"
-          crane mutate "$STAGING_IMAGE" \
-            --set-platform linux/amd64 \
-            --tag "$TARGET_IMAGE"
-          digest=$(crane digest "$TARGET_IMAGE")
-          crane config "$TARGET_IMAGE" | jq '{os, architecture, rootfs}'
-          echo "image: $TARGET_IMAGE@$digest" >> "$GITHUB_STEP_SUMMARY"
+          set +e
+          qemu-system-x86_64 \
+            -accel kvm \
+            -machine q35 \
+            -cpu host \
+            -smp 2 \
+            -m 4096 \
+            -drive file=disk.img,format=raw,if=virtio \
+            -netdev user,id=net0,hostfwd=tcp::18000-:8000 \
+            -device virtio-net-pci,netdev=net0 \
+            -display none \
+            -monitor none \
+            -serial file:serial.log \
+            -pidfile qemu.pid \
+            -daemonize
+          booted=false
+          for attempt in $(seq 1 60); do
+            if curl -fsS --max-time 2 http://127.0.0.1:18000/status; then
+              booted=true
+              break
+            fi
+            if ! kill -0 "$(cat qemu.pid)" 2>/dev/null; then break; fi
+            sleep 5
+          done
+          kill "$(cat qemu.pid)" 2>/dev/null || true
+          wait "$(cat qemu.pid)" 2>/dev/null || true
+          echo "--- serial console ---"
+          cat serial.log
+          echo "--- result ---"
+          echo "service_ready=$booted"
+          test "$booted" = true
