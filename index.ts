@@ -49,7 +49,10 @@ const resourceSchema = Type.Object({
     }),
   ),
   image: Type.Optional(
-    Type.String({ description: "Digest-pinned OCI image for create" }),
+    Type.String({
+      minLength: 1,
+      description: "Digest-pinned OCI image for create",
+    }),
   ),
   confirm: Type.Optional(
     Type.Boolean({
@@ -967,7 +970,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         throw new Error("cpu and memory_mb must be supplied together");
       if (input.action !== "create" && hasResources)
         throw new Error("cpu and memory_mb are only valid for create");
-      if (input.image && input.action !== "create")
+      if (input.image !== undefined && input.action !== "create")
         throw new Error("image is only valid for create");
       if (["ensure", "delete"].includes(input.action) && !input.name) {
         throw new Error(`${input.action} requires name`);
