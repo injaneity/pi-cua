@@ -15,10 +15,7 @@ import {
   Text,
 } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
-import {
-  formatSandboxProgress,
-  preferPickerItem,
-} from "./session-targets.mjs";
+import { preferPickerItem } from "./session-targets.mjs";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { homedir } from "node:os";
@@ -117,6 +114,29 @@ type ExecutionTarget =
     };
 type UIContext = ExtensionContext | ExtensionCommandContext;
 type PickerItem = SelectItem & { value: string };
+
+function formatSandboxProgress(
+  name: string,
+  phase?: string,
+  message?: string,
+): string {
+  if (phase === "lock")
+    return `${name} (waiting for another sandbox operation)`;
+
+  let activity = "connecting";
+  if (
+    phase?.startsWith("bootstrap.") ||
+    phase?.startsWith("upload.windows.")
+  )
+    activity = "repairing guest";
+  else if (phase?.startsWith("workspace.")) activity = "syncing workspace";
+
+  const detail =
+    message && !["started", "completed"].includes(message)
+      ? ` • ${message}`
+      : "";
+  return `${name} (${activity})${detail}`;
+}
 type AnyToolDefinition = ToolDefinition<any, any, any>;
 type ToolUpdate = Parameters<
   NonNullable<Parameters<AnyToolDefinition["execute"]>[3]>
