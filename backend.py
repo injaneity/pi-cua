@@ -994,9 +994,12 @@ def next_name(profile: str) -> str:
 
 def remote_pi_files() -> dict[str, bytes]:
     files = {
-        ".pi/agent/cua-tool-host.mjs": (
-            Path(__file__).parent / "tool-host.mjs"
-        ).read_bytes()
+        f".pi/agent/{remote}": (Path(__file__).parent / source).read_bytes()
+        for remote, source in {
+            "cua-tool-host.mjs": "tool-host.mjs",
+            "cua-tool-broker.mjs": "tool-broker.mjs",
+            "cua-tool-relay.mjs": "tool-relay.mjs",
+        }.items()
     }
     extensions = PI_DIR / "extensions"
     if extensions.exists():
