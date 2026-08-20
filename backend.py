@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import fcntl
 import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -72,8 +73,13 @@ def cancel_worker(_signum: int, _frame: Any) -> None:
     raise OperationCancelled("operation cancelled")
 
 
-CLOUD_ACTIONS = {"create", "ensure", "delete", "prepare_execution"}
-LONG_ACTIONS = CLOUD_ACTIONS | {"sync_workspace_to_local"}
+LONG_ACTIONS = {
+    "create",
+    "ensure",
+    "delete",
+    "prepare_execution",
+    "sync_workspace_to_local",
+}
 FLEET_KEYCHAIN_SERVICE = "cua-sandbox-fleet-api"
 TAILSCALE_KEYCHAIN_SERVICE = "cua-sandbox-tailscale-oauth"
 TAILSCALE_TOKEN_URL = "https://api.tailscale.com/api/v2/oauth/token"
@@ -499,30 +505,6 @@ def restore_cua_state(name: str) -> None:
     os.replace(temporary, state_path)
 
 
-def worker_command(request: dict[str, Any]) -> list[str]:
-    backend = str(Path(__file__).resolve())
-    payload = json.dumps(request)
-    if request.get("action") not in CLOUD_ACTIONS:
-        return [sys.executable, backend, payload]
-    return [
-        "uv",
-        "run",
-        "--quiet",
-        "--no-project",
-        "--python",
-        "3.11",
-        "--with",
-        "cua-sandbox==0.3.4",
-        "--extra-index-url",
-        "https://wheels.cua.ai/simple",
-        "--index-strategy",
-        "unsafe-best-match",
-        "python",
-        backend,
-        payload,
-    ]
-
-
 def submit_operation(request: dict[str, Any], operation_id: str) -> dict[str, Any]:
     now = datetime.now(timezone.utc).isoformat()
     action = str(request.get("action") or "")
@@ -547,7 +529,7 @@ def submit_operation(request: dict[str, Any], operation_id: str) -> dict[str, An
     try:
         with console_path.open("ab", buffering=0) as console:
             process = subprocess.Popen(
-                worker_command(request),
+                [sys.executable, str(Path(__file__).resolve()), json.dumps(request)],
                 stdin=subprocess.DEVNULL,
                 stdout=console,
                 stderr=console,
@@ -2402,6 +2384,40 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def ensure_cloud_runtime(action: object, request: dict[str, Any]) -> None:
+    cloud_actions = LONG_ACTIONS - {"sync_workspace_to_local"}
+    if (
+        action not in cloud_actions
+        or importlib.util.find_spec("cua_sandbox") is not None
+    ):
+        return
+    if action == "prepare_execution":
+        name = request.get("name")
+        state = next((item for item in local_states() if item["name"] == name), None)
+        if state and healthy_over_ssh(
+            state.get("address") or state["name"], state["os"]
+        ):
+            return
+    command = [
+        "uv",
+        "run",
+        "--quiet",
+        "--no-project",
+        "--python",
+        "3.11",
+        "--with",
+        "cua-sandbox==0.3.4",
+        "--extra-index-url",
+        "https://wheels.cua.ai/simple",
+        "--index-strategy",
+        "unsafe-best-match",
+        "python",
+        str(Path(__file__).resolve()),
+        sys.argv[1],
+    ]
+    os.execvp(command[0], command)
+
+
 def main() -> None:
     global CURRENT_OPERATION_ID
     try:
@@ -2424,6 +2440,7 @@ def main() -> None:
             print(json.dumps({"ok": True, **result}, separators=(",", ":")))
             return
 
+        ensure_cloud_runtime(action, request)
         if worker:
             with database() as connection:
                 connection.execute(

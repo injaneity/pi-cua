@@ -574,15 +574,6 @@ class ControllerStateTests(unittest.TestCase):
             self.assertEqual(completed["state"], "succeeded")
             self.assertEqual(completed["result"], {"name": "linux-1"})
             popen.assert_called_once()
-            self.assertEqual(
-                popen.call_args.args[0][:4], ["uv", "run", "--quiet", "--no-project"]
-            )
-
-    def test_local_worker_uses_the_current_python(self) -> None:
-        command = backend.worker_command({"action": "sync_workspace_to_local"})
-
-        self.assertEqual(command[0], backend.sys.executable)
-        self.assertNotIn("uv", command)
 
 
 if __name__ == "__main__":
