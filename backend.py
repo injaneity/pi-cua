@@ -368,7 +368,7 @@ def set_execution_target(
 
 
 @dataclass(frozen=True)
-class SandboxConfig:
+class SandboxResources:
     pool: str
     image: str
     cpu: int
@@ -384,12 +384,12 @@ PINNED_IMAGE_PATTERN = re.compile(
 )
 
 
-def sandbox_config(
+def sandbox_resources(
     profile: str,
     cpu: int | None = None,
     memory_mb: int | None = None,
     image: str | None = None,
-) -> SandboxConfig:
+) -> SandboxResources:
     if profile not in PROFILES:
         raise ValueError("os must be linux or windows")
     if (cpu is None) != (memory_mb is None):
@@ -411,12 +411,14 @@ def sandbox_config(
         spec["memory_mb"],
         spec["image"],
     ):
-        return SandboxConfig(spec["pool"], image_ref, cpu, memory_mb)
+        return SandboxResources(spec["pool"], image_ref, cpu, memory_mb)
     identity = f"{spec['pool']}\0{profile}\0{cpu}\0{memory_mb}"
     if image_ref != spec["image"]:
         identity += f"\0{image_ref}"
     digest = hashlib.sha256(identity.encode()).hexdigest()[:16]
-    return SandboxConfig(f"cua-pi-custom-{profile}-{digest}", image_ref, cpu, memory_mb)
+    return SandboxResources(
+        f"cua-pi-custom-{profile}-{digest}", image_ref, cpu, memory_mb
+    )
 
 
 def profile_for_pool(pool: object) -> str | None:
@@ -1353,7 +1355,7 @@ async def create_one(
     memory_mb: int | None = None,
     image_ref: str | None = None,
 ) -> dict[str, Any]:
-    config = sandbox_config(profile, cpu, memory_mb, image_ref)
+    resources = sandbox_resources(profile, cpu, memory_mb, image_ref)
     name = requested_name or next_name(profile)
     validate_name(name)
     if any(item["name"] == name for item in local_states()):
@@ -1362,20 +1364,20 @@ async def create_one(
 
     from cua_sandbox import Image, Pool, Sandbox, WarmPoolAutoscaling
 
-    image = Image.from_registry(config.image, os_type=profile, kind="vm")
+    image = Image.from_registry(resources.image, os_type=profile, kind="vm")
     autoscaling = WarmPoolAutoscaling(
         min_pool_size=0, initial_pool_size=1, max_pool_size=10
     )
     pool = None
     for attempt in range(1, 13):
-        phase = f"pool.{config.pool}.reconcile.attempt-{attempt}"
+        phase = f"pool.{resources.pool}.reconcile.attempt-{attempt}"
         try:
             pool = await wait_for_step(
                 Pool.apply(
                     image,
-                    name=config.pool,
-                    cpu=config.cpu,
-                    memory_mb=config.memory_mb,
+                    name=resources.pool,
+                    cpu=resources.cpu,
+                    memory_mb=resources.memory_mb,
                     services={"server": 8000},
                     autoscaling=autoscaling,
                 ),
@@ -1388,7 +1390,7 @@ async def create_one(
             if "status=403" in detail and "osgymsandboxwarmpools" in detail:
                 variable = f"CUA_PI_{profile.upper()}_POOL"
                 raise RuntimeError(
-                    f"Fleet pool {config.pool!r} is unavailable to this tenant; "
+                    f"Fleet pool {resources.pool!r} is unavailable to this tenant; "
                     f"set {variable} to an unclaimed base pool name"
                 ) from error
             transient = "NamespaceTerminating" in detail
@@ -1397,7 +1399,7 @@ async def create_one(
             progress(phase, "Fleet namespace is converging; retrying in 10 seconds")
             await asyncio.sleep(10)
     if pool is None:
-        raise RuntimeError(f"pool {config.pool} reconciliation produced no pool")
+        raise RuntimeError(f"pool {resources.pool} reconciliation produced no pool")
     sb = await wait_for_step(
         Sandbox.create(pool=pool, name=name, service="server", time_to_start=900),
         f"claim.{name}.wait-service",
