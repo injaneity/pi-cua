@@ -41,14 +41,14 @@ jobs:
           virt-resize --expand /dev/sda1 source.img expanded.img
           qemu-img info expanded.img
           virt-df -h -a expanded.img
-          qemu-img convert -p -O raw -S 4k expanded.img compact.img
+          qemu-img convert -p -O qcow2 -c expanded.img compact.img
           rm -f source.img expanded.img
           docker rm -f "$container"
           docker image rm "$SOURCE_IMAGE"
           trap - EXIT
           mkdir -p layer/disk
           mv compact.img layer/disk/disk.img
-          tar --sparse -czf disk-layer.tar.gz -C layer disk
+          tar -czf disk-layer.tar.gz -C layer disk
           rm -rf layer
           ls -lh disk-layer.tar.gz
           df -h .
