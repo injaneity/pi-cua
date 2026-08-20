@@ -1,4 +1,4 @@
-name: build linux 50gb containerdisk
+name: build linux 30gb containerdisk
 
 on:
   push:
@@ -10,7 +10,7 @@ permissions:
 
 env:
   SOURCE_IMAGE: public.ecr.aws/k5j5w0x5/cua-ubuntu-24.04@sha256:85b3f5022bf9ecc864472f5fade5e2f1f54ab88ce429af7873a1415d668dc2ea
-  TARGET_IMAGE: ghcr.io/injaneity/pi-cua-linux:50gb-eb68411
+  TARGET_IMAGE: ghcr.io/injaneity/pi-cua-linux:30gb-eb68411
 
 jobs:
   build:
@@ -37,7 +37,7 @@ jobs:
           container=$(docker create --platform linux/amd64 "$SOURCE_IMAGE" /bin/true)
           trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
           docker cp "$container:/disk/disk.img" source.img
-          qemu-img create -f raw expanded.img 50G
+          qemu-img create -f raw expanded.img 30G
           virt-resize --expand /dev/sda1 source.img expanded.img
           qemu-img info expanded.img
           virt-df -h -a expanded.img
