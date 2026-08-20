@@ -484,6 +484,15 @@ def remove_sandbox_record(name: str) -> None:
         connection.execute("DELETE FROM sandboxes WHERE name = ?", (name,))
 
 
+def pool_reference_count(pool_name: str) -> int:
+    with database() as connection:
+        row = connection.execute(
+            "SELECT COUNT(*) AS count FROM sandboxes WHERE pool_name = ?",
+            (pool_name,),
+        ).fetchone()
+    return int(row["count"])
+
+
 def controller_sandboxes() -> list[dict[str, Any]]:
     with database() as connection:
         rows = connection.execute(
@@ -1375,6 +1384,32 @@ async def ensure_one(name: str) -> dict[str, Any]:
         await disconnect_safely(sb)
 
 
+async def cleanup_failed_create(
+    name: str, resources: SandboxResources, pool: Any
+) -> None:
+    from cua_sandbox import Sandbox
+
+    restore_cua_state(name)
+    try:
+        await Sandbox.delete(name)
+    except LookupError:
+        (STATE_DIR / f"{name}.json").unlink(missing_ok=True)
+    except Exception as error:  # noqa: BLE001 - preserve the record for explicit cleanup
+        progress(
+            "claim.cleanup", "failed; sandbox remains managed", error=error_text(error)
+        )
+        return
+    remove_sandbox_record(name)
+    if (
+        CUSTOM_POOL_PATTERN.fullmatch(resources.pool)
+        and pool_reference_count(resources.pool) == 0
+    ):
+        try:
+            await pool.delete()
+        except Exception as error:  # noqa: BLE001 - claim cleanup already succeeded
+            progress("pool.cleanup", "failed", error=error_text(error))
+
+
 async def create_one(
     profile: str,
     requested_name: str | None,
@@ -1427,11 +1462,21 @@ async def create_one(
             await asyncio.sleep(10)
     if pool is None:
         raise RuntimeError(f"pool {resources.pool} reconciliation produced no pool")
-    sb = await wait_for_step(
-        Sandbox.create(pool=pool, name=name, service="server", time_to_start=900),
-        f"claim.{name}.wait-service",
-        960,
+    record_sandbox(
+        name,
+        profile,
+        {"name": name, "pool": resources.pool, "status": "provisioning"},
     )
+    restore_cua_state(name)
+    try:
+        sb = await wait_for_step(
+            Sandbox.create(pool=pool, name=name, service="server", time_to_start=900),
+            f"claim.{name}.wait-service",
+            960,
+        )
+    except Exception:
+        await cleanup_failed_create(name, resources, pool)
+        raise
     record_sandbox(name, profile, sb.to_dict())
     await disconnect_safely(sb)
     sb = await connect_sandbox(name)
