@@ -28,6 +28,17 @@ class SizeSelectionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "default, large"):
             backend.sandbox_size("linux", "huge")
 
+    def test_sizes_cannot_share_a_pool(self) -> None:
+        default_pool = backend.sandbox_size("linux").pool
+        with (
+            patch.dict(
+                backend.PROFILES["linux"]["sizes"]["large"],
+                {"pool": default_pool},
+            ),
+            self.assertRaisesRegex(ValueError, "requires a distinct pool"),
+        ):
+            backend.sandbox_size("linux", "large")
+
     def test_recorded_size_survives_state_file_merge(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             controller_dir = Path(directory)

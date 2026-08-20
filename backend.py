@@ -411,6 +411,18 @@ def sandbox_size(profile: str, requested: str | None = None) -> SandboxSize:
     if spec is None:
         choices = ", ".join(PROFILES[profile]["sizes"])
         raise ValueError(f"size must be one of: {choices}")
+    conflicts = [
+        f"{other_profile}/{other_name}"
+        for other_profile, other in PROFILES.items()
+        for other_name, other_size in other["sizes"].items()
+        if other_size["pool"] == spec["pool"]
+        and (other_profile, other_name) != (profile, name)
+    ]
+    if conflicts:
+        raise ValueError(
+            f"Fleet pool {spec['pool']!r} is shared with {', '.join(conflicts)}; "
+            "each OS and size requires a distinct pool"
+        )
     return SandboxSize(name, spec["pool"], spec["cpu"], spec["memory_mb"])
 
 
