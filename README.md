@@ -8,7 +8,7 @@ pi's tui, agent, model, and conversation sessions stay local. each local session
 pi install git:github.com/injaneity/pi-cua
 ```
 
-this package currently targets macos controllers with `uv` and the Tailscale CLI installed. the controller must be online in a Tailscale network with the `tag:cua-sandbox` ACL tag. its OAuth client must be allowed to create auth keys for that tag, and the tailnet ACL must allow the controller to reach tagged guests, including Tailscale SSH for linux. CUA Fleet pools default to `cua-pi-linux` and `cua-pi-windows`; fleet pool/namespace names are a tenant-wide authorization boundary — if another tenant already owns a default name, pool operations fail with a persistent 403; set `CUA_PI_LINUX_POOL` and `CUA_PI_WINDOWS_POOL` to unclaimed names for your tenant. store the CUA Fleet and Tailscale OAuth credentials in Keychain:
+this package currently targets macos controllers with `uv` and the Tailscale CLI installed. the controller must be online in a Tailscale network with the `tag:cua-sandbox` ACL tag. its OAuth client must be allowed to create auth keys for that tag, and the tailnet ACL must allow the controller to reach tagged guests, including Tailscale SSH for linux. CUA Fleet pools default to `cua-pi-linux`, `cua-pi-linux-large`, `cua-pi-windows`, and `cua-pi-windows-large`; fleet pool/namespace names are a tenant-wide authorization boundary — if another tenant already owns a default name, pool operations fail with a persistent 403. set `CUA_PI_LINUX_POOL`, `CUA_PI_LINUX_LARGE_POOL`, `CUA_PI_WINDOWS_POOL`, or `CUA_PI_WINDOWS_LARGE_POOL` to unclaimed names for your tenant. store the CUA Fleet and Tailscale OAuth credentials in Keychain:
 
 ```bash
 security add-generic-password -U -s cua-sandbox-fleet-api -a client-id -w "$CUA_CLIENT_ID"
@@ -21,7 +21,7 @@ windows provisioning also requires `~/.ssh/cua_windows_ed25519` and its `.pub` f
 
 ## behavior
 
-- `/sandbox` changes the current session's execution target.
+- `/sandbox` changes the current session's execution target. `/sandbox linux large` and `/sandbox windows large` create 16 CPU, 64 GiB sandboxes; omitting the size uses the existing default pools.
 - `/new` asks for a target before the new thread starts.
 - `/fork` inherits the parent thread's target but starts a new sandbox workspace from the current local checkout.
 - `/tree` changes conversation history but not execution placement.

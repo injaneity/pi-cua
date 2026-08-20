@@ -9,29 +9,82 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import backend
 
 
-class ImageSelectionTests(unittest.TestCase):
-    def test_builtin_and_registry_images(self) -> None:
-        default = backend.PROFILES["linux"]["image"]
-        self.assertEqual(backend.normalize_image("linux", "linux"), default)
-        self.assertEqual(
-            backend.normalize_image("linux", "oci://ghcr.io/acme/linux:64gb"),
-            "ghcr.io/acme/linux:64gb",
-        )
+class SizeSelectionTests(unittest.TestCase):
+    def test_default_and_large_sizes_use_distinct_pools(self) -> None:
+        default = backend.sandbox_size("linux")
+        large = backend.sandbox_size("linux", "large")
 
-    def test_registry_image_requires_matching_os_and_reference(self) -> None:
-        with self.assertRaisesRegex(ValueError, "does not match"):
-            backend.normalize_image("linux", "windows")
-        with self.assertRaisesRegex(ValueError, "OCI registry reference"):
-            backend.normalize_image("linux", "ubuntu:24.04")
-        self.assertEqual(
-            backend.normalize_image("linux", "https://registry.example/linux:64gb"),
-            "registry.example/linux:64gb",
+        self.assertEqual((default.cpu, default.memory_mb), (8, 16 * 1024))
+        self.assertEqual((large.cpu, large.memory_mb), (16, 64 * 1024))
+        self.assertNotEqual(default.pool, large.pool)
+        self.assertEqual(backend.profile_for_pool(large.pool), "linux")
+
+    def test_unknown_size_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "default, large"):
+            backend.sandbox_size("linux", "huge")
+
+    def test_recorded_size_survives_state_file_merge(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            controller_dir = Path(directory)
+            state_dir = controller_dir / "sandboxes"
+            state_dir.mkdir()
+            with (
+                patch.object(backend, "CONTROLLER_DIR", controller_dir),
+                patch.object(
+                    backend, "CONTROLLER_DB", controller_dir / "state.sqlite3"
+                ),
+                patch.object(backend, "STATE_DIR", state_dir),
+                patch.object(backend, "restore_cua_state"),
+            ):
+                size = backend.sandbox_size("linux", "large")
+                backend.record_sandbox("linux-1", "linux", {"pool": size.pool}, size)
+                (state_dir / "linux-1.json").write_text(
+                    json.dumps(
+                        {
+                            "runtime_type": "fleet",
+                            "pool_name": size.pool,
+                            "name": "linux-1",
+                        }
+                    )
+                )
+                item = backend.local_states()[0]
+
+        self.assertEqual(item["size"], "large")
+        self.assertEqual((item["cpu"], item["memory_mb"]), (16, 64 * 1024))
+
+
+class SizeCreationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_large_resources_reach_the_dedicated_pool(self) -> None:
+        pool = Mock()
+        pool.apply.return_value = object()
+        sdk = SimpleNamespace(
+            Image=SimpleNamespace(from_registry=Mock(return_value=object())),
+            Pool=pool,
+            Sandbox=Mock(),
+            WarmPoolAutoscaling=Mock(return_value=object()),
         )
+        with (
+            patch.dict("sys.modules", {"cua_sandbox": sdk}),
+            patch.object(backend, "local_states", return_value=[]),
+            patch.object(backend, "local_tailscale_identity", return_value={}),
+            patch.object(
+                backend,
+                "wait_for_step",
+                AsyncMock(side_effect=RuntimeError("stop after pool apply")),
+            ),
+            self.assertRaisesRegex(RuntimeError, "stop after pool apply"),
+        ):
+            await backend.create_one("linux", "linux-large", "large")
+
+        size = backend.sandbox_size("linux", "large")
+        self.assertEqual(pool.apply.call_args.kwargs["name"], size.pool)
+        self.assertEqual(pool.apply.call_args.kwargs["cpu"], 16)
+        self.assertEqual(pool.apply.call_args.kwargs["memory_mb"], 64 * 1024)
 
 
 class LocalStateTests(unittest.TestCase):

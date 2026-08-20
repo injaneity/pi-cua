@@ -34,6 +34,7 @@ const resourceSchema = Type.Object({
     Type.String({ description: "Managed sandbox name, such as linux-1" }),
   ),
   os: Type.Optional(StringEnum(["linux", "windows"] as const)),
+  size: Type.Optional(StringEnum(["default", "large"] as const)),
   confirm: Type.Optional(
     Type.Boolean({
       description: "Required for create or delete when no UI is available",
@@ -43,11 +44,25 @@ const resourceSchema = Type.Object({
 
 type ResourceInput = Static<typeof resourceSchema>;
 type SandboxOS = "linux" | "windows";
+type SandboxSize = "default" | "large";
+const SIZE_RESOURCES = {
+  linux: {
+    default: { cpu: 8, memoryGiB: 16 },
+    large: { cpu: 16, memoryGiB: 64 },
+  },
+  windows: {
+    default: { cpu: 10, memoryGiB: 20 },
+    large: { cpu: 16, memoryGiB: 64 },
+  },
+} as const;
 type SandboxItem = {
   name: string;
   os: SandboxOS;
   pool: string;
   online: boolean;
+  size: SandboxSize;
+  cpu: number;
+  memory_mb: number;
 };
 type WorkspaceState = {
   version: 1;
@@ -71,6 +86,9 @@ type BackendResult = {
   os?: SandboxOS;
   address?: string;
   changed?: boolean;
+  size?: SandboxSize;
+  cpu?: number;
+  memory_mb?: number;
   state?: string;
   remote_cwd?: string;
   workspace_state?: WorkspaceState;
@@ -511,7 +529,7 @@ function formatList(items: SandboxItem[]): string {
   return items
     .map(
       (item) =>
-        `${item.name}\t${item.os}\t${item.online ? "online" : "offline"}`,
+        `${item.name}\t${item.os}\t${item.size}\t${item.cpu} CPUs\t${Math.round(item.memory_mb / 1024)} GiB\t${item.online ? "online" : "offline"}`,
     )
     .join("\n");
 }
@@ -669,11 +687,13 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
   async function createSandbox(
     os: SandboxOS,
     ctx: UIContext,
+    size: SandboxSize = "default",
   ): Promise<Destination | undefined> {
     if (!ctx.hasUI) return undefined;
+    const resources = SIZE_RESOURCES[os][size];
     const confirmed = await ctx.ui.confirm(
-      `create ${os} sandbox?`,
-      "this provisions a persistent fleet claim and incurs cost.",
+      `create ${size} ${os} sandbox?`,
+      `this provisions ${resources.cpu} CPUs and ${resources.memoryGiB} GiB of memory and incurs cost.`,
     );
     if (!confirmed) return undefined;
     pi.events.emit("cua:execution-target-changed", {
@@ -683,7 +703,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     });
     try {
       const result = await runBackend(
-        { action: "create", os },
+        { action: "create", os, size },
         ctx.signal,
         (status) => {
           pi.events.emit("cua:execution-target-changed", {
@@ -720,7 +740,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       ...online.map((sandbox) => ({
         value: sandbox.name,
         label: sandbox.name,
-        description: `${sandbox.os} • reachable over Tailscale`,
+        description: `${sandbox.os} • ${sandbox.size} • ${sandbox.cpu} CPUs • ${Math.round(sandbox.memory_mb / 1024)} GiB • reachable over Tailscale`,
       })),
       {
         value: "create",
@@ -736,7 +756,20 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         { value: "windows", label: "windows", description: "Windows Server" },
       ]);
       if (os !== "linux" && os !== "windows") return undefined;
-      return createSandbox(os, ctx);
+      const size = await themedSelect(ctx, "Sandbox size", [
+        {
+          value: "default",
+          label: "default",
+          description: `${SIZE_RESOURCES[os].default.cpu} CPUs • ${SIZE_RESOURCES[os].default.memoryGiB} GiB`,
+        },
+        {
+          value: "large",
+          label: "large",
+          description: `${SIZE_RESOURCES[os].large.cpu} CPUs • ${SIZE_RESOURCES[os].large.memoryGiB} GiB`,
+        },
+      ]);
+      if (size !== "default" && size !== "large") return undefined;
+      return createSandbox(os, ctx, size);
     }
     const item = online.find((sandbox) => sandbox.name === choice);
     return item ? { kind: "sandbox", name: item.name, os: item.os } : undefined;
@@ -749,10 +782,15 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     const value = args.trim().toLowerCase();
     if (!value) return pickDestination(ctx);
     if (value === "local") return { kind: "local" };
-    if (value === "linux" || value === "new linux")
-      return createSandbox("linux", ctx);
-    if (value === "windows" || value === "new windows")
-      return createSandbox("windows", ctx);
+    const createMatch = value.match(
+      /^(?:new\s+)?(linux|windows)(?:\s+(default|large))?$/,
+    );
+    if (createMatch)
+      return createSandbox(
+        createMatch[1] as SandboxOS,
+        ctx,
+        (createMatch[2] as SandboxSize | undefined) ?? "default",
+      );
     const listed = await runBackend({ action: "list" }, ctx.signal);
     const item = (listed.sandboxes ?? []).find(
       (candidate) => candidate.name === value,
@@ -902,23 +940,31 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     promptSnippet: "Manage isolated Linux and Windows CUA sandbox resources",
     promptGuidelines: [
       "Use cua_sandbox for sandbox resources; use /sandbox to choose where the current session executes tools.",
+      "Use size=large only when the task needs 16 CPUs and 64 GiB; otherwise use the default size.",
       "Do not delete a CUA sandbox unless the user explicitly asks to delete it.",
     ],
     parameters: resourceSchema,
     async execute(_id, input: ResourceInput, signal, onUpdate, ctx) {
       if (input.action === "create" && !input.os)
         throw new Error("create requires os");
+      if (input.size && input.action !== "create")
+        throw new Error("size is only valid for create");
       if (["ensure", "delete"].includes(input.action) && !input.name) {
         throw new Error(`${input.action} requires name`);
       }
       if (input.action === "create" || input.action === "delete") {
+        const createSize = input.size ?? "default";
+        const createResources =
+          input.action === "create" && input.os
+            ? SIZE_RESOURCES[input.os][createSize]
+            : undefined;
         const allowed = ctx.hasUI
           ? await ctx.ui.confirm(
               input.action === "create"
-                ? `create ${input.name || input.os} sandbox?`
+                ? `create ${createSize} ${input.name || input.os} sandbox?`
                 : `delete ${input.name}?`,
-              input.action === "create"
-                ? "this provisions a persistent fleet claim and incurs cost."
+              createResources
+                ? `this provisions ${createResources.cpu} CPUs and ${createResources.memoryGiB} GiB of memory and incurs cost.`
                 : "this permanently releases its fleet claim and filesystem.",
             )
           : input.confirm === true;
