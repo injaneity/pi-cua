@@ -114,6 +114,29 @@ type ExecutionTarget =
     };
 type UIContext = ExtensionContext | ExtensionCommandContext;
 type PickerItem = SelectItem & { value: string };
+
+function formatSandboxProgress(
+  name: string,
+  phase?: string,
+  message?: string,
+): string {
+  if (phase === "lock")
+    return `${name} (waiting for another sandbox operation)`;
+
+  let activity = "connecting";
+  if (
+    phase?.startsWith("bootstrap.") ||
+    phase?.startsWith("upload.windows.")
+  )
+    activity = "repairing guest";
+  else if (phase?.startsWith("workspace.")) activity = "syncing workspace";
+
+  const detail =
+    message && !["started", "completed"].includes(message)
+      ? ` • ${message}`
+      : "";
+  return `${name} (${activity})${detail}`;
+}
 type AnyToolDefinition = ToolDefinition<any, any, any>;
 type ToolUpdate = Parameters<
   NonNullable<Parameters<AnyToolDefinition["execute"]>[3]>
@@ -878,6 +901,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       return target;
     }
     captureToolProviders();
+    ctx.ui.setStatus("cua-session", formatSandboxProgress(destination.name));
     pi.events.emit("cua:execution-target-changed", {
       ...destination,
       state: "connecting",
@@ -902,6 +926,14 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         },
         ctx.signal,
         (status) => {
+          ctx.ui.setStatus(
+            "cua-session",
+            formatSandboxProgress(
+              destination.name,
+              status.phase,
+              status.message,
+            ),
+          );
           pi.events.emit("cua:execution-target-changed", {
             ...destination,
             state: "connecting",
@@ -926,6 +958,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         workspaceState: result.workspace_state,
       };
     } catch (error) {
+      ctx.ui.setStatus("cua-session", undefined);
       pi.events.emit("cua:execution-target-changed", target);
       throw error;
     }
@@ -968,6 +1001,14 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     const nextBridge =
       next.kind === "sandbox" ? new ToolBridge(next, expectedTools) : undefined;
     if (next.kind === "sandbox") {
+      ctx.ui.setStatus(
+        "cua-session",
+        formatSandboxProgress(
+          next.name,
+          "connect.tools",
+          "starting remote tools",
+        ),
+      );
       pi.events.emit("cua:execution-target-changed", {
         ...next,
         state: "connecting",
@@ -978,6 +1019,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       if (options.persist !== false) await saveTarget(next, ctx);
     } catch (error) {
       nextBridge?.close();
+      ctx.ui.setStatus("cua-session", undefined);
       pi.events.emit("cua:execution-target-changed", target);
       throw error;
     }
