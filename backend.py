@@ -90,8 +90,7 @@ PROFILES = {
     "linux": {
         # Fleet pool/namespace names are a tenant-wide authorization boundary:
         # if another tenant already owns the default namespace, every pool
-        # operation fails with a persistent 403. CUA_PI_LINUX_POOL /
-        # CUA_PI_WINDOWS_POOL let each tenant pick unclaimed names.
+        # operation fails with a persistent 403.
         "pool": os.environ.get("CUA_PI_LINUX_POOL", "cua-pi-linux"),
         "image": "public.ecr.aws/k5j5w0x5/cua-ubuntu-24.04@sha256:eb68411ed8b4d7c39829cdfe854b9d0485b78ee064c3171fd8e3f7450f7ccee7",
         "cpu": 8,
@@ -104,6 +103,7 @@ PROFILES = {
         "memory_mb": 20 * 1024,
     },
 }
+
 
 EXTENSION_DIR = Path(__file__).resolve().parent
 BOOTSTRAP_FILES = {
@@ -365,6 +365,47 @@ def set_execution_target(
             ),
         )
     return {"target": target}
+
+
+@dataclass(frozen=True)
+class SandboxResources:
+    pool: str
+    cpu: int
+    memory_mb: int
+
+
+CUSTOM_POOL_PATTERN = re.compile(
+    r"^cua-pi-custom-(?P<profile>linux|windows)-[0-9a-f]{16}$"
+)
+
+
+def sandbox_resources(
+    profile: str, cpu: int | None = None, memory_mb: int | None = None
+) -> SandboxResources:
+    if profile not in PROFILES:
+        raise ValueError("os must be linux or windows")
+    if (cpu is None) != (memory_mb is None):
+        raise ValueError("cpu and memory_mb must be supplied together")
+    spec = PROFILES[profile]
+    if cpu is None and memory_mb is None:
+        return SandboxResources(spec["pool"], spec["cpu"], spec["memory_mb"])
+    if type(cpu) is not int or cpu <= 0:
+        raise ValueError("cpu must be a positive integer")
+    if type(memory_mb) is not int or memory_mb <= 0:
+        raise ValueError("memory_mb must be a positive integer")
+    identity = f"{spec['pool']}\0{profile}\0{cpu}\0{memory_mb}"
+    digest = hashlib.sha256(identity.encode()).hexdigest()[:16]
+    return SandboxResources(f"cua-pi-custom-{profile}-{digest}", cpu, memory_mb)
+
+
+def profile_for_pool(pool: object) -> str | None:
+    if not isinstance(pool, str):
+        return None
+    default = next(
+        (profile for profile, spec in PROFILES.items() if spec["pool"] == pool), None
+    )
+    match = CUSTOM_POOL_PATTERN.fullmatch(pool)
+    return default or (match.group("profile") if match else None)
 
 
 def record_sandbox(name: str, profile: str, reference: dict[str, Any]) -> None:
@@ -711,9 +752,7 @@ def local_states() -> list[dict[str, Any]]:
         except (OSError, json.JSONDecodeError):
             continue
         pool = state.get("pool_name")
-        profile = next(
-            (name for name, item in PROFILES.items() if item["pool"] == pool), None
-        )
+        profile = profile_for_pool(pool)
         if state.get("runtime_type") == "fleet" and profile:
             name = state.get("name", path.stem)
             if isinstance(name, str):
@@ -1276,14 +1315,23 @@ async def ensure_one(name: str) -> dict[str, Any]:
                 else bootstrap_windows(sb, name, tailnet)
             )
         await complete_tailscale_enrollment(sb, profile, name, address, tailnet)
-        return {"name": name, "os": profile, "address": address, "changed": changed}
+        return {
+            "name": name,
+            "os": profile,
+            "address": address,
+            "changed": changed,
+        }
     finally:
         await disconnect_safely(sb)
 
 
-async def create_one(profile: str, requested_name: str | None) -> dict[str, Any]:
-    if profile not in PROFILES:
-        raise ValueError("os must be linux or windows")
+async def create_one(
+    profile: str,
+    requested_name: str | None,
+    cpu: int | None = None,
+    memory_mb: int | None = None,
+) -> dict[str, Any]:
+    resources = sandbox_resources(profile, cpu, memory_mb)
     name = requested_name or next_name(profile)
     validate_name(name)
     if any(item["name"] == name for item in local_states()):
@@ -1299,14 +1347,14 @@ async def create_one(profile: str, requested_name: str | None) -> dict[str, Any]
     )
     pool = None
     for attempt in range(1, 13):
-        phase = f"pool.{spec['pool']}.reconcile.attempt-{attempt}"
+        phase = f"pool.{resources.pool}.reconcile.attempt-{attempt}"
         try:
             pool = await wait_for_step(
                 Pool.apply(
                     image,
-                    name=spec["pool"],
-                    cpu=spec["cpu"],
-                    memory_mb=spec["memory_mb"],
+                    name=resources.pool,
+                    cpu=resources.cpu,
+                    memory_mb=resources.memory_mb,
                     services={"server": 8000},
                     autoscaling=autoscaling,
                 ),
@@ -1317,12 +1365,10 @@ async def create_one(profile: str, requested_name: str | None) -> dict[str, Any]
         except RuntimeError as error:
             detail = error_text(error)
             if "status=403" in detail and "osgymsandboxwarmpools" in detail:
-                variable = (
-                    "CUA_PI_LINUX_POOL" if profile == "linux" else "CUA_PI_WINDOWS_POOL"
-                )
+                variable = f"CUA_PI_{profile.upper()}_POOL"
                 raise RuntimeError(
-                    f"Fleet pool {spec['pool']!r} is unavailable to this tenant; "
-                    f"set {variable} to an unclaimed pool name"
+                    f"Fleet pool {resources.pool!r} is unavailable to this tenant; "
+                    f"set {variable} to an unclaimed base pool name"
                 ) from error
             transient = "NamespaceTerminating" in detail
             if not transient or attempt == 12:
@@ -1330,7 +1376,7 @@ async def create_one(profile: str, requested_name: str | None) -> dict[str, Any]
             progress(phase, "Fleet namespace is converging; retrying in 10 seconds")
             await asyncio.sleep(10)
     if pool is None:
-        raise RuntimeError(f"pool {spec['pool']} reconciliation produced no pool")
+        raise RuntimeError(f"pool {resources.pool} reconciliation produced no pool")
     sb = await wait_for_step(
         Sandbox.create(pool=pool, name=name, service="server", time_to_start=900),
         f"claim.{name}.wait-service",
@@ -1346,7 +1392,12 @@ async def create_one(profile: str, requested_name: str | None) -> dict[str, Any]
             else bootstrap_windows(sb, name, tailnet)
         )
         await complete_tailscale_enrollment(sb, profile, name, address, tailnet)
-        return {"name": name, "os": profile, "address": address, "changed": True}
+        return {
+            "name": name,
+            "os": profile,
+            "address": address,
+            "changed": True,
+        }
     finally:
         await disconnect_safely(sb)
 
@@ -2295,7 +2346,12 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         return sync_workspace_to_local(source, local_cwd)
     configure_fleet_auth()
     if action == "create":
-        return await create_one(str(request.get("os") or ""), request.get("name"))
+        return await create_one(
+            str(request.get("os") or ""),
+            request.get("name"),
+            request.get("cpu"),
+            request.get("memory_mb"),
+        )
     if action == "ensure":
         return await ensure_one(str(request.get("name") or ""))
     if action == "delete":

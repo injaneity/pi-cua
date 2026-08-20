@@ -34,6 +34,20 @@ const resourceSchema = Type.Object({
     Type.String({ description: "Managed sandbox name, such as linux-1" }),
   ),
   os: Type.Optional(StringEnum(["linux", "windows"] as const)),
+  cpu: Type.Optional(
+    Type.Integer({
+      minimum: 1,
+      maximum: Number.MAX_SAFE_INTEGER,
+      description: "CPU count; supply with memory_mb",
+    }),
+  ),
+  memory_mb: Type.Optional(
+    Type.Integer({
+      minimum: 1,
+      maximum: Number.MAX_SAFE_INTEGER,
+      description: "Memory in MiB; supply with cpu",
+    }),
+  ),
   confirm: Type.Optional(
     Type.Boolean({
       description: "Required for create or delete when no UI is available",
@@ -43,6 +57,7 @@ const resourceSchema = Type.Object({
 
 type ResourceInput = Static<typeof resourceSchema>;
 type SandboxOS = "linux" | "windows";
+type SandboxResources = { cpu: number; memory_mb: number };
 type SandboxItem = {
   name: string;
   os: SandboxOS;
@@ -669,11 +684,14 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
   async function createSandbox(
     os: SandboxOS,
     ctx: UIContext,
+    resources?: SandboxResources,
   ): Promise<Destination | undefined> {
     if (!ctx.hasUI) return undefined;
     const confirmed = await ctx.ui.confirm(
       `create ${os} sandbox?`,
-      "this provisions a persistent fleet claim and incurs cost.",
+      resources
+        ? `this provisions ${resources.cpu} CPUs and ${resources.memory_mb} MiB of memory and incurs cost.`
+        : "this provisions the configured default resources and incurs cost.",
     );
     if (!confirmed) return undefined;
     pi.events.emit("cua:execution-target-changed", {
@@ -683,7 +701,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     });
     try {
       const result = await runBackend(
-        { action: "create", os },
+        { action: "create", os, ...resources },
         ctx.signal,
         (status) => {
           pi.events.emit("cua:execution-target-changed", {
@@ -749,10 +767,25 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     const value = args.trim().toLowerCase();
     if (!value) return pickDestination(ctx);
     if (value === "local") return { kind: "local" };
-    if (value === "linux" || value === "new linux")
-      return createSandbox("linux", ctx);
-    if (value === "windows" || value === "new windows")
-      return createSandbox("windows", ctx);
+    const createMatch = value.match(
+      /^(?:new\s+)?(linux|windows)(?:\s+([1-9]\d*)\s+([1-9]\d*))?$/,
+    );
+    if (createMatch) {
+      if (!createMatch[2])
+        return createSandbox(createMatch[1] as SandboxOS, ctx);
+      const resources = {
+        cpu: Number(createMatch[2]),
+        memory_mb: Number(createMatch[3]),
+      };
+      if (
+        !Number.isSafeInteger(resources.cpu) ||
+        !Number.isSafeInteger(resources.memory_mb)
+      )
+        throw new Error("cpu and memory_mb are too large");
+      return createSandbox(createMatch[1] as SandboxOS, ctx, resources);
+    }
+    if (/^(?:new\s+)?(?:linux|windows)(?:\s|$)/.test(value))
+      throw new Error("usage: /sandbox <linux|windows> [cpu memory_mb]");
     const listed = await runBackend({ action: "list" }, ctx.signal);
     const item = (listed.sandboxes ?? []).find(
       (candidate) => candidate.name === value,
@@ -902,23 +935,40 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     promptSnippet: "Manage isolated Linux and Windows CUA sandbox resources",
     promptGuidelines: [
       "Use cua_sandbox for sandbox resources; use /sandbox to choose where the current session executes tools.",
+      "For custom resources, cua_sandbox create requires both cpu and memory_mb; omit both to use the OS defaults.",
       "Do not delete a CUA sandbox unless the user explicitly asks to delete it.",
     ],
     parameters: resourceSchema,
     async execute(_id, input: ResourceInput, signal, onUpdate, ctx) {
       if (input.action === "create" && !input.os)
         throw new Error("create requires os");
+      const hasResources =
+        input.cpu !== undefined || input.memory_mb !== undefined;
+      if (
+        input.action === "create" &&
+        hasResources &&
+        (input.cpu === undefined || input.memory_mb === undefined)
+      )
+        throw new Error("cpu and memory_mb must be supplied together");
+      if (input.action !== "create" && hasResources)
+        throw new Error("cpu and memory_mb are only valid for create");
       if (["ensure", "delete"].includes(input.action) && !input.name) {
         throw new Error(`${input.action} requires name`);
       }
       if (input.action === "create" || input.action === "delete") {
+        const createResources =
+          input.cpu !== undefined && input.memory_mb !== undefined
+            ? { cpu: input.cpu, memory_mb: input.memory_mb }
+            : undefined;
         const allowed = ctx.hasUI
           ? await ctx.ui.confirm(
               input.action === "create"
                 ? `create ${input.name || input.os} sandbox?`
                 : `delete ${input.name}?`,
               input.action === "create"
-                ? "this provisions a persistent fleet claim and incurs cost."
+                ? createResources
+                  ? `this provisions ${createResources.cpu} CPUs and ${createResources.memory_mb} MiB of memory and incurs cost.`
+                  : "this provisions the configured default resources and incurs cost."
                 : "this permanently releases its fleet claim and filesystem.",
             )
           : input.confirm === true;
