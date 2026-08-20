@@ -15,7 +15,10 @@ import {
   Text,
 } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
-import { preferPickerItem } from "./session-targets.mjs";
+import {
+  formatSandboxProgress,
+  preferPickerItem,
+} from "./session-targets.mjs";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { homedir } from "node:os";
@@ -878,6 +881,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       return target;
     }
     captureToolProviders();
+    ctx.ui.setStatus("cua-session", formatSandboxProgress(destination.name));
     pi.events.emit("cua:execution-target-changed", {
       ...destination,
       state: "connecting",
@@ -902,6 +906,14 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         },
         ctx.signal,
         (status) => {
+          ctx.ui.setStatus(
+            "cua-session",
+            formatSandboxProgress(
+              destination.name,
+              status.phase,
+              status.message,
+            ),
+          );
           pi.events.emit("cua:execution-target-changed", {
             ...destination,
             state: "connecting",
@@ -926,6 +938,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         workspaceState: result.workspace_state,
       };
     } catch (error) {
+      ctx.ui.setStatus("cua-session", undefined);
       pi.events.emit("cua:execution-target-changed", target);
       throw error;
     }
@@ -968,6 +981,14 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     const nextBridge =
       next.kind === "sandbox" ? new ToolBridge(next, expectedTools) : undefined;
     if (next.kind === "sandbox") {
+      ctx.ui.setStatus(
+        "cua-session",
+        formatSandboxProgress(
+          next.name,
+          "connect.tools",
+          "starting remote tools",
+        ),
+      );
       pi.events.emit("cua:execution-target-changed", {
         ...next,
         state: "connecting",
@@ -978,6 +999,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       if (options.persist !== false) await saveTarget(next, ctx);
     } catch (error) {
       nextBridge?.close();
+      ctx.ui.setStatus("cua-session", undefined);
       pi.events.emit("cua:execution-target-changed", target);
       throw error;
     }
