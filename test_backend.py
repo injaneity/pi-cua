@@ -483,6 +483,25 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
             )
         apply_patch.assert_not_called()
 
+    async def test_windows_workspace_fetches_a_missing_cached_commit(self) -> None:
+        with (
+            patch.object(backend, "guest_repository_available", return_value=True),
+            patch.object(backend, "copy_guest_file") as copy,
+            patch.object(backend, "run_guest_ssh"),
+        ):
+            await backend.prepare_workspace(
+                "100.64.0.2", "windows", self.repository, "session"
+            )
+
+        script = copy.call_args.args[2].decode("utf-8-sig")
+        self.assertIn("function Test-GitCommit", script)
+        self.assertIn(
+            "elseif (-not (Test-GitCommit $cache 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'))",
+            script,
+        )
+        self.assertIn("git -C $cache fetch --quiet origin", script)
+        self.assertNotIn("git -C $cache cat-file -e", script.split("$root =", 1)[1])
+
     async def test_prepare_execution_connects_capture_prepare_and_restore(self) -> None:
         transfer = backend.WorkspaceTransfer(self.state, b"baseline", b"", "2" * 40)
         with (
