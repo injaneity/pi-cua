@@ -194,7 +194,7 @@ function hostCommand(
   if (target.os === "windows") {
     return [
       `Set-Location ${powershellQuote(target.remoteCwd)}`,
-      `& 'C:\\cua\\node-v22.20.0-win-x64\\node.exe' $HOME/.pi/agent/cua-tool-host.mjs ${powershellQuote(target.remoteCwd)} ${powershellQuote(manifest)}`,
+      `& 'C:\\cua\\node-v22.20.0-win-x64\\node.exe' $HOME/.pi/agent/cua-tool-relay.mjs ${powershellQuote(target.remoteCwd)} ${powershellQuote(manifest)}`,
     ].join("; ");
   }
   return `cd ${shellQuote(target.remoteCwd)} && exec node /home/cua/.pi/agent/cua-tool-host.mjs ${shellQuote(target.remoteCwd)} ${shellQuote(manifest)}`;

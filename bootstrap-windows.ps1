@@ -109,6 +109,34 @@ Invoke-Icacls @($cuaHome, '/grant:r', 'cua:(OI)(CI)F', '/T', '/C')
 Invoke-Icacls @($projects, '/grant:r', 'cua:(OI)(CI)F', '/T', '/C')
 Invoke-Icacls @($authorizedKeys, '/inheritance:r', '/grant:r', 'cua:F', 'SYSTEM:F', 'Administrators:F')
 Write-Output '::phase acl-complete'
+$interactiveDesktop = Get-Process explorer -IncludeUserName -ErrorAction SilentlyContinue | Where-Object SessionId -GT 0 | Select-Object -First 1
+$interactiveUser = $interactiveDesktop.UserName
+if (-not $interactiveUser) { throw 'No interactive Windows desktop user is available for the Pi tool broker' }
+$brokerToken = "$agent\cua-tool-broker.token"
+if (-not (Test-Path $brokerToken)) {
+  $tokenBytes = New-Object byte[] 32
+  $random = [Security.Cryptography.RandomNumberGenerator]::Create()
+  try { $random.GetBytes($tokenBytes) } finally { $random.Dispose() }
+  Set-Content -Encoding ascii -NoNewline -Path $brokerToken -Value ([Convert]::ToBase64String($tokenBytes))
+}
+$brokerTask = 'CuaPiDesktopToolBroker'
+$brokerRunner = 'C:\ProgramData\cua-pi\start-desktop-tool-broker.vbs'
+New-Item -ItemType Directory -Force -Path (Split-Path $brokerRunner) | Out-Null
+Set-Content -Encoding ascii -Path $brokerRunner -Value ('CreateObject("WScript.Shell").Run """{0}"" ""{1}""", 0, True' -f $node, "$agent\cua-tool-broker.mjs")
+Stop-ScheduledTask -TaskName $brokerTask -ErrorAction SilentlyContinue
+Unregister-ScheduledTask -TaskName $brokerTask -Confirm:$false -ErrorAction SilentlyContinue
+$brokerAction = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$brokerRunner`""
+$brokerTrigger = New-ScheduledTaskTrigger -AtLogOn -User $interactiveUser
+$brokerPrincipal = New-ScheduledTaskPrincipal -UserId $interactiveUser -LogonType Interactive -RunLevel Highest
+$brokerSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero)
+Register-ScheduledTask -TaskName $brokerTask -Action $brokerAction -Trigger $brokerTrigger -Principal $brokerPrincipal -Settings $brokerSettings | Out-Null
+Start-ScheduledTask -TaskName $brokerTask
+for ($attempt = 0; $attempt -lt 50; $attempt++) {
+  Start-Sleep -Milliseconds 200
+  try { $client = [Net.Sockets.TcpClient]::new('127.0.0.1', 43121); $client.Dispose(); break } catch {}
+}
+if ($attempt -eq 50) { throw 'Interactive Pi tool broker did not become ready' }
+Write-Output '::phase desktop-broker-ready'
 New-Item -Path 'HKLM:\SOFTWARE\OpenSSH' -Force | Out-Null
 New-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name 'DefaultShell' -Value 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' -PropertyType String -Force | Out-Null
 $sshdConfig = @'

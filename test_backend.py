@@ -282,6 +282,8 @@ class WorkspaceTests(unittest.TestCase):
     def test_remote_config_includes_generic_tool_host(self) -> None:
         files = backend.remote_pi_files()
         self.assertIn(".pi/agent/cua-tool-host.mjs", files)
+        self.assertIn(".pi/agent/cua-tool-broker.mjs", files)
+        self.assertIn(".pi/agent/cua-tool-relay.mjs", files)
         self.assertIn(
             b'request.type === "execute"', files[".pi/agent/cua-tool-host.mjs"]
         )
@@ -508,6 +510,16 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["workspace_state"], self.state)
         self.assertEqual(prepare.await_args.args[2].commit, self.state["commit"])
         restore.assert_called_once()
+
+
+class WindowsDesktopBrokerTests(unittest.TestCase):
+    def test_bootstrap_registers_an_interactive_logon_task(self) -> None:
+        script = backend.bootstrap_template("windows")
+
+        self.assertIn("New-ScheduledTaskPrincipal", script)
+        self.assertIn("-LogonType Interactive", script)
+        self.assertIn("cua-tool-broker.mjs", script)
+        self.assertIn("cua-tool-broker.token", script)
 
 
 class BackgroundJobTests(unittest.IsolatedAsyncioTestCase):

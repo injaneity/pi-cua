@@ -36,7 +36,7 @@ custom images are available through the structured `cua_sandbox` create action's
 
 1. the controller reuses a persistent ssh connection and takes a direct health fast path for an already bootstrapped sandbox; it contacts Fleet only for repair or bootstrap;
 2. it prepares the destination from the thread's local Git baseline, then applies the accumulated workspace delta from the active sandbox;
-3. the extension starts one non-tty ssh jsonl channel to `cua-tool-host.mjs`;
+3. the extension starts one non-tty ssh jsonl channel; linux runs `cua-tool-host.mjs` directly, while windows authenticates a loopback relay to a broker in the existing interactive desktop session;
 4. the host loads pi's normal remote tool registry and reports its protocol and tool manifest;
 5. calls, updates, results, errors, cancellation, and user shell output use that channel. `Esc` rejects the local request immediately and asks the host to kill the full remote command process tree.
 
@@ -60,6 +60,8 @@ the guest receives the pi sdk version, only the user packages that own routed to
 
 workspace preparation requires a git repository with a network `origin` and does not support submodules, Git content filters, or working-tree encodings. if the guest cannot authenticate to the origin, the controller sends a clean commit snapshot and creates an isolated baseline without copying git credentials. new threads, existing local threads, and forks carry the local changes, limited to 200 mib. guests keep a bare repository cache outside all workspaces, so fresh sessions and forks reuse git objects without sharing mutable files. package-manager caches also remain in the guest user profile. every handoff transfers only the accumulated binary Git tree diff; `.git`, ignored files, credentials, caches, and processes stay with their machine.
 
+on Windows, OpenSSH remains in Session 0. it can reach only an authenticated loopback relay. the relay starts the tool host under the logged-in desktop user's scheduled-task broker, so GUI tools and shell commands share Session 1 without exposing the broker off-machine.
+
 ## verification
 
 ```bash
@@ -67,7 +69,8 @@ uvx --quiet ruff format --check backend.py test_backend.py
 uvx --quiet ruff check backend.py test_backend.py
 python3 -m unittest -q test_backend.py
 node test-session-targets.mjs
-npm exec --yes --package=prettier -- prettier --check index.ts session-targets.mjs test-session-targets.mjs tool-host.mjs
+node test-tool-broker.mjs
+npm exec --yes --package=prettier -- prettier --check index.ts session-targets.mjs test-session-targets.mjs tool-host.mjs tool-broker.mjs tool-relay.mjs test-tool-broker.mjs
 node --check tool-host.mjs
 pi --list-models
 ```
