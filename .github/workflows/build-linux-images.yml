@@ -35,35 +35,80 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            qemu-system-x86 qemu-utils libguestfs-tools linux-image-generic
+            cloud-image-utils qemu-system-x86 qemu-utils libguestfs-tools linux-image-generic socat
           sudo chmod 0644 /boot/vmlinuz-*
+          if test -e /dev/kvm; then sudo chmod 0666 /dev/kvm; fi
 
       - name: build fresh ubuntu disk
-        env:
-          LIBGUESTFS_BACKEND: direct
-          LIBGUESTFS_MEMSIZE: "1024"
         run: |
           curl -fL "$UBUNTU_IMAGE_URL" -o disk.qcow2
           printf '%s  %s\n' "$UBUNTU_IMAGE_SHA256" disk.qcow2 | sha256sum -c -
           qemu-img resize disk.qcow2 "${DISK_GB}G"
-          virt-customize \
-            --network \
-            -a disk.qcow2 \
-            --copy-in images/linux/provision.sh:/root \
-            --run-command 'rm -f /etc/resolv.conf && printf "nameserver 1.1.1.1\\nnameserver 8.8.8.8\\n" >/etc/resolv.conf' \
-            --run-command 'chmod 700 /root/provision.sh' \
-            --run-command '/root/provision.sh' \
-            --run-command 'rm -f /root/provision.sh'
+
+          cat >user-data <<'EOF'
+          #cloud-config
+          growpart:
+            mode: auto
+            devices: ['/']
+          resize_rootfs: true
+          write_files:
+            - path: /root/provision.sh
+              permissions: '0700'
+              content: |
+          EOF
+          sed 's/^/        /' images/linux/provision.sh >>user-data
+          cat >>user-data <<'EOF'
+          runcmd:
+            - [bash, /root/provision.sh]
+          EOF
+          printf 'instance-id: cua-image-build\nlocal-hostname: cua-image-build\n' >meta-data
+          cloud-localds seed.img user-data meta-data
+
+          set +e
+          qemu-system-x86_64 \
+            -accel kvm -accel tcg \
+            -machine q35 \
+            -smp 4 \
+            -m 6144 \
+            -drive file=disk.qcow2,format=qcow2,if=virtio \
+            -drive file=seed.img,format=raw,if=virtio,readonly=on \
+            -netdev user,id=net0,hostfwd=tcp::18000-:8000 \
+            -device virtio-net-pci,netdev=net0 \
+            -display none \
+            -monitor unix:qemu-monitor.sock,server=on,wait=off \
+            -serial file:build-serial.log \
+            >qemu.stdout 2>qemu.stderr &
+          pid=$!
+          built=false
+          for attempt in $(seq 1 360); do
+            if curl -fsS --max-time 2 http://127.0.0.1:18000/status; then
+              built=true
+              break
+            fi
+            if ! kill -0 "$pid" 2>/dev/null; then break; fi
+            sleep 5
+          done
+          printf 'system_powerdown\n' | socat - UNIX-CONNECT:qemu-monitor.sock 2>/dev/null || true
+          for attempt in $(seq 1 60); do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 2
+          done
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+          echo "--- build serial console ---"
+          tail -800 build-serial.log
+          echo "image_built=$built"
+          test "$built" = true
+          rm -f seed.img user-data meta-data qemu-monitor.sock
           qemu-img info disk.qcow2
           virt-filesystems -a disk.qcow2 --all --long --uuid -h
 
-      - name: boot-test image
+      - name: boot-test image without build media
         run: |
           set +e
           qemu-system-x86_64 \
-            -accel tcg \
+            -accel kvm -accel tcg \
             -machine q35 \
-            -cpu max \
             -smp 2 \
             -m 4096 \
             -drive file=disk.qcow2,format=qcow2,if=virtio \

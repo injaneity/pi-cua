@@ -75,8 +75,10 @@ StandardError=journal+console
 WantedBy=multi-user.target
 UNIT
 
-systemctl enable cua-display.service cua-desktop.service computer-server.service ssh.service
+systemctl daemon-reload
+systemctl enable --now cua-display.service cua-desktop.service computer-server.service ssh.service
 systemctl set-default multi-user.target
-cloud-init clean --logs --seed || true
+touch /etc/cloud/cloud-init.disabled
 rm -f /etc/machine-id
 : >/etc/machine-id
+touch /var/lib/cua-image-ready
