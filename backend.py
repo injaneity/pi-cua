@@ -104,22 +104,6 @@ PROFILES = {
     },
 }
 
-LARGE_SIZES = {
-    "linux": {
-        "pool": os.environ.get(
-            "CUA_PI_LINUX_LARGE_POOL", f"{PROFILES['linux']['pool']}-large"
-        ),
-        "cpu": 16,
-        "memory_mb": 64 * 1024,
-    },
-    "windows": {
-        "pool": os.environ.get(
-            "CUA_PI_WINDOWS_LARGE_POOL", f"{PROFILES['windows']['pool']}-large"
-        ),
-        "cpu": 16,
-        "memory_mb": 64 * 1024,
-    },
-}
 
 EXTENSION_DIR = Path(__file__).resolve().parent
 BOOTSTRAP_FILES = {
@@ -384,62 +368,50 @@ def set_execution_target(
 
 
 @dataclass(frozen=True)
-class SandboxSize:
-    name: str
+class SandboxResources:
     pool: str
     cpu: int
     memory_mb: int
 
 
-def size_specs(profile: str) -> dict[str, dict[str, Any]]:
+CUSTOM_POOL_SUFFIX = re.compile(r"(?P<cpu>[1-9]\d*)c-(?P<memory_mb>[1-9]\d*)m")
+
+
+def sandbox_resources(
+    profile: str, cpu: int | None = None, memory_mb: int | None = None
+) -> SandboxResources:
     if profile not in PROFILES:
         raise ValueError("os must be linux or windows")
-    return {"default": PROFILES[profile], "large": LARGE_SIZES[profile]}
+    if (cpu is None) != (memory_mb is None):
+        raise ValueError("cpu and memory_mb must be supplied together")
+    spec = PROFILES[profile]
+    if cpu is None and memory_mb is None:
+        return SandboxResources(spec["pool"], spec["cpu"], spec["memory_mb"])
+    if type(cpu) is not int or cpu <= 0:
+        raise ValueError("cpu must be a positive integer")
+    if type(memory_mb) is not int or memory_mb <= 0:
+        raise ValueError("memory_mb must be a positive integer")
+    return SandboxResources(f"{spec['pool']}-{cpu}c-{memory_mb}m", cpu, memory_mb)
 
 
-def sandbox_size(profile: str, requested: str | None = None) -> SandboxSize:
-    sizes = size_specs(profile)
-    name = (requested or "default").strip().lower()
-    spec = sizes.get(name)
-    if spec is None:
-        choices = ", ".join(sizes)
-        raise ValueError(f"size must be one of: {choices}")
-    conflicts = [
-        f"{other_profile}/{other_name}"
-        for other_profile in PROFILES
-        for other_name, other_size in size_specs(other_profile).items()
-        if other_size["pool"] == spec["pool"]
-        and (other_profile, other_name) != (profile, name)
-    ]
-    if conflicts:
-        raise ValueError(
-            f"Fleet pool {spec['pool']!r} is shared with {', '.join(conflicts)}; "
-            "each OS and size requires a distinct pool"
-        )
-    return SandboxSize(name, spec["pool"], spec["cpu"], spec["memory_mb"])
+def resources_for_pool(profile: str, pool: str) -> SandboxResources | None:
+    default = sandbox_resources(profile)
+    if pool == default.pool:
+        return default
+    prefix = f"{default.pool}-"
+    match = CUSTOM_POOL_SUFFIX.fullmatch(pool.removeprefix(prefix))
+    if not pool.startswith(prefix) or match is None:
+        return None
+    return SandboxResources(
+        pool, int(match.group("cpu")), int(match.group("memory_mb"))
+    )
 
 
 def profile_for_pool(pool: object) -> str | None:
     if not isinstance(pool, str):
         return None
     return next(
-        (
-            profile
-            for profile in PROFILES
-            if any(size["pool"] == pool for size in size_specs(profile).values())
-        ),
-        None,
-    )
-
-
-def size_for_pool(profile: str, pool: str) -> SandboxSize:
-    return next(
-        (
-            sandbox_size(profile, name)
-            for name, spec in size_specs(profile).items()
-            if spec["pool"] == pool
-        ),
-        sandbox_size(profile),
+        (profile for profile in PROFILES if resources_for_pool(profile, pool)), None
     )
 
 
@@ -501,16 +473,17 @@ def controller_sandboxes() -> list[dict[str, Any]]:
     items = []
     for row in rows:
         addresses = json.loads(row["tailscale_addresses"] or "[]")
-        size = size_for_pool(row["os"], row["pool_name"])
+        resources = resources_for_pool(
+            row["os"], row["pool_name"]
+        ) or sandbox_resources(row["os"])
         items.append(
             {
                 "name": row["name"],
                 "os": row["os"],
                 "pool": row["pool_name"],
                 "address": addresses[0] if addresses else None,
-                "size": size.name,
-                "cpu": size.cpu,
-                "memory_mb": size.memory_mb,
+                "cpu": resources.cpu,
+                "memory_mb": resources.memory_mb,
             }
         )
     return items
@@ -795,15 +768,16 @@ def local_states() -> list[dict[str, Any]]:
         if state.get("runtime_type") == "fleet" and profile:
             name = state.get("name", path.stem)
             if isinstance(name, str):
-                size = size_for_pool(profile, pool)
+                resources = resources_for_pool(profile, pool)
+                if resources is None:
+                    continue
                 by_name[name] = {
                     **by_name.get(name, {}),
                     "name": name,
                     "os": profile,
                     "pool": pool,
-                    "size": size.name,
-                    "cpu": size.cpu,
-                    "memory_mb": size.memory_mb,
+                    "cpu": resources.cpu,
+                    "memory_mb": resources.memory_mb,
                 }
     return sorted(by_name.values(), key=lambda item: item["name"])
 
@@ -1345,7 +1319,7 @@ async def ensure_one(name: str) -> dict[str, Any]:
         raise ValueError(f"unknown managed sandbox: {name}")
     state = states[name]
     profile = state["os"]
-    default_size = sandbox_size(profile)
+    defaults = sandbox_resources(profile)
     tailnet = local_tailscale_identity()
 
     restore_cua_state(name)
@@ -1363,9 +1337,8 @@ async def ensure_one(name: str) -> dict[str, Any]:
         return {
             "name": name,
             "os": profile,
-            "size": state.get("size", default_size.name),
-            "cpu": state.get("cpu", default_size.cpu),
-            "memory_mb": state.get("memory_mb", default_size.memory_mb),
+            "cpu": state.get("cpu", defaults.cpu),
+            "memory_mb": state.get("memory_mb", defaults.memory_mb),
             "address": address,
             "changed": changed,
         }
@@ -1374,9 +1347,12 @@ async def ensure_one(name: str) -> dict[str, Any]:
 
 
 async def create_one(
-    profile: str, requested_name: str | None, requested_size: str | None = None
+    profile: str,
+    requested_name: str | None,
+    cpu: int | None = None,
+    memory_mb: int | None = None,
 ) -> dict[str, Any]:
-    size = sandbox_size(profile, requested_size)
+    resources = sandbox_resources(profile, cpu, memory_mb)
     name = requested_name or next_name(profile)
     validate_name(name)
     if any(item["name"] == name for item in local_states()):
@@ -1392,14 +1368,14 @@ async def create_one(
     )
     pool = None
     for attempt in range(1, 13):
-        phase = f"pool.{size.pool}.reconcile.attempt-{attempt}"
+        phase = f"pool.{resources.pool}.reconcile.attempt-{attempt}"
         try:
             pool = await wait_for_step(
                 Pool.apply(
                     image,
-                    name=size.pool,
-                    cpu=size.cpu,
-                    memory_mb=size.memory_mb,
+                    name=resources.pool,
+                    cpu=resources.cpu,
+                    memory_mb=resources.memory_mb,
                     services={"server": 8000},
                     autoscaling=autoscaling,
                 ),
@@ -1410,11 +1386,10 @@ async def create_one(
         except RuntimeError as error:
             detail = error_text(error)
             if "status=403" in detail and "osgymsandboxwarmpools" in detail:
-                qualifier = "" if size.name == "default" else f"_{size.name.upper()}"
-                variable = f"CUA_PI_{profile.upper()}{qualifier}_POOL"
+                variable = f"CUA_PI_{profile.upper()}_POOL"
                 raise RuntimeError(
-                    f"Fleet pool {size.pool!r} is unavailable to this tenant; "
-                    f"set {variable} to an unclaimed pool name"
+                    f"Fleet pool {resources.pool!r} is unavailable to this tenant; "
+                    f"set {variable} to an unclaimed base pool name"
                 ) from error
             transient = "NamespaceTerminating" in detail
             if not transient or attempt == 12:
@@ -1422,7 +1397,7 @@ async def create_one(
             progress(phase, "Fleet namespace is converging; retrying in 10 seconds")
             await asyncio.sleep(10)
     if pool is None:
-        raise RuntimeError(f"pool {size.pool} reconciliation produced no pool")
+        raise RuntimeError(f"pool {resources.pool} reconciliation produced no pool")
     sb = await wait_for_step(
         Sandbox.create(pool=pool, name=name, service="server", time_to_start=900),
         f"claim.{name}.wait-service",
@@ -1441,9 +1416,8 @@ async def create_one(
         return {
             "name": name,
             "os": profile,
-            "size": size.name,
-            "cpu": size.cpu,
-            "memory_mb": size.memory_mb,
+            "cpu": resources.cpu,
+            "memory_mb": resources.memory_mb,
             "address": address,
             "changed": True,
         }
@@ -2395,11 +2369,11 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         return sync_workspace_to_local(source, local_cwd)
     configure_fleet_auth()
     if action == "create":
-        requested_size = request.get("size")
-        if requested_size is not None and not isinstance(requested_size, str):
-            raise TypeError("size must be a string")
         return await create_one(
-            str(request.get("os") or ""), request.get("name"), requested_size
+            str(request.get("os") or ""),
+            request.get("name"),
+            request.get("cpu"),
+            request.get("memory_mb"),
         )
     if action == "ensure":
         return await ensure_one(str(request.get("name") or ""))

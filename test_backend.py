@@ -14,43 +14,27 @@ from unittest.mock import AsyncMock, Mock, patch
 import backend
 
 
-class SizeSelectionTests(unittest.TestCase):
-    def test_default_and_large_sizes_use_distinct_pools(self) -> None:
-        default = backend.sandbox_size("linux")
-        large = backend.sandbox_size("linux", "large")
+class ResourceSelectionTests(unittest.TestCase):
+    def test_resources_round_trip_through_the_pool_name(self) -> None:
+        default = backend.sandbox_resources("linux")
+        custom = backend.sandbox_resources("linux", 16, 64 * 1024)
 
         self.assertEqual((default.cpu, default.memory_mb), (8, 16 * 1024))
-        self.assertEqual((large.cpu, large.memory_mb), (16, 64 * 1024))
-        self.assertEqual(
-            (
-                backend.sandbox_size("windows").cpu,
-                backend.sandbox_size("windows").memory_mb,
-            ),
-            (10, 20 * 1024),
-        )
-        self.assertEqual(backend.sandbox_size("linux", "large"), large)
-        self.assertNotEqual(default.pool, large.pool)
-        self.assertEqual(backend.profile_for_pool(large.pool), "linux")
-        self.assertEqual(backend.size_for_pool("linux", large.pool), large)
+        self.assertEqual(custom.pool, f"{default.pool}-16c-65536m")
+        self.assertEqual(backend.resources_for_pool("linux", custom.pool), custom)
+        self.assertEqual(backend.profile_for_pool(custom.pool), "linux")
 
-    def test_unknown_size_is_rejected(self) -> None:
-        with self.assertRaisesRegex(ValueError, "default, large"):
-            backend.sandbox_size("linux", "huge")
-
-    def test_sizes_cannot_share_a_pool(self) -> None:
-        default_pool = backend.sandbox_size("linux").pool
-        with (
-            patch.dict(
-                backend.LARGE_SIZES["linux"],
-                {"pool": default_pool},
-            ),
-            self.assertRaisesRegex(ValueError, "requires a distinct pool"),
-        ):
-            backend.sandbox_size("linux", "large")
+    def test_custom_resources_require_two_positive_integers(self) -> None:
+        for cpu, memory_mb in ((1, None), (None, 1), (0, 1), (1, -1)):
+            with (
+                self.subTest(cpu=cpu, memory_mb=memory_mb),
+                self.assertRaisesRegex(ValueError, "supplied together|positive"),
+            ):
+                backend.sandbox_resources("linux", cpu, memory_mb)
 
 
-class SizeCreationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_large_resources_reach_the_dedicated_pool(self) -> None:
+class ResourceCreationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_resources_reach_the_dedicated_pool(self) -> None:
         pool = Mock()
         pool.apply.return_value = object()
         sdk = SimpleNamespace(
@@ -70,22 +54,24 @@ class SizeCreationTests(unittest.IsolatedAsyncioTestCase):
             ),
             self.assertRaisesRegex(RuntimeError, "stop after pool apply"),
         ):
-            await backend.create_one("linux", "linux-large", "large")
+            await backend.create_one("linux", "linux-custom", 16, 64 * 1024)
 
-        size = backend.sandbox_size("linux", "large")
-        self.assertEqual(pool.apply.call_args.kwargs["name"], size.pool)
+        resources = backend.sandbox_resources("linux", 16, 64 * 1024)
+        self.assertEqual(pool.apply.call_args.kwargs["name"], resources.pool)
         self.assertEqual(pool.apply.call_args.kwargs["cpu"], 16)
         self.assertEqual(pool.apply.call_args.kwargs["memory_mb"], 64 * 1024)
 
-    async def test_dispatch_passes_size_to_create(self) -> None:
+    async def test_dispatch_passes_resources_to_create(self) -> None:
         create = AsyncMock(return_value={"name": "linux-1"})
         with (
             patch.object(backend, "configure_fleet_auth"),
             patch.object(backend, "create_one", create),
         ):
-            await backend.dispatch({"action": "create", "os": "linux", "size": "large"})
+            await backend.dispatch(
+                {"action": "create", "os": "linux", "cpu": 16, "memory_mb": 65536}
+            )
 
-        create.assert_awaited_once_with("linux", None, "large")
+        create.assert_awaited_once_with("linux", None, 16, 65536)
 
 
 class LocalStateTests(unittest.TestCase):
@@ -97,7 +83,7 @@ class LocalStateTests(unittest.TestCase):
                     {
                         "name": "linux-1",
                         "runtime_type": "fleet",
-                        "pool_name": "cua-pi-linux",
+                        "pool_name": "cua-pi-linux-16c-65536m",
                     }
                 )
             )
@@ -125,10 +111,9 @@ class LocalStateTests(unittest.TestCase):
                         {
                             "name": "linux-1",
                             "os": "linux",
-                            "pool": "cua-pi-linux",
-                            "size": "default",
-                            "cpu": 8,
-                            "memory_mb": 16 * 1024,
+                            "pool": "cua-pi-linux-16c-65536m",
+                            "cpu": 16,
+                            "memory_mb": 65536,
                         }
                     ],
                 )
@@ -150,7 +135,6 @@ class LocalStateTests(unittest.TestCase):
                 "os": "linux",
                 "pool": "cua-pi-linux",
                 "address": "100.64.0.2",
-                "size": "default",
                 "cpu": 8,
                 "memory_mb": 16 * 1024,
             }
