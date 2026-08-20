@@ -1,0 +1,62 @@
+name: build linux 50gb containerdisk
+
+on:
+  push:
+    branches: [build/linux-50gb]
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  SOURCE_IMAGE: public.ecr.aws/k5j5w0x5/cua-ubuntu-24.04@sha256:85b3f5022bf9ecc864472f5fade5e2f1f54ab88ce429af7873a1415d668dc2ea
+  TARGET_IMAGE: ghcr.io/injaneity/pi-cua-linux:50gb-eb68411
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: reclaim runner storage
+        run: |
+          sudo rm -rf /opt/hostedtoolcache
+          docker system prune -af
+
+      - name: install image tools
+        run: |
+          sudo apt-get update -qq
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq qemu-utils libguestfs-tools
+
+      - name: extract and expand the boot disk
+        env:
+          LIBGUESTFS_BACKEND: direct
+          LIBGUESTFS_MEMSIZE: "1024"
+        run: |
+          docker pull --platform linux/amd64 "$SOURCE_IMAGE"
+          container=$(docker create --platform linux/amd64 "$SOURCE_IMAGE")
+          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+          docker cp "$container:/disk/disk.img" source.img
+          qemu-img create -f raw expanded.img 50G
+          virt-resize --expand /dev/sda1 source.img expanded.img
+          qemu-img info expanded.img
+          virt-df -h -a expanded.img
+          mkdir image
+          mv expanded.img image/disk.img
+
+      - name: publish containerdisk
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          cat > image/Dockerfile <<'EOF'
+          FROM scratch
+          LABEL org.opencontainers.image.source="https://github.com/injaneity/pi-cua"
+          COPY disk.img /disk/disk.img
+          EOF
+          docker buildx build \
+            --platform linux/amd64 \
+            --provenance=false \
+            --push \
+            --tag "$TARGET_IMAGE" \
+            --metadata-file image-metadata.json \
+            image
+          digest=$(jq -r '.["containerimage.digest"]' image-metadata.json)
+          echo "image: $TARGET_IMAGE@$digest" >> "$GITHUB_STEP_SUMMARY"
