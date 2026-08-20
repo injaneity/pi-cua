@@ -26,13 +26,9 @@ jobs:
       - name: install image tools
         run: |
           sudo apt-get update -qq
-          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq qemu-system-x86 qemu-utils cloud-guest-utils gdisk libguestfs-tools linux-image-generic socat imagemagick tesseract-ocr
-          sudo chmod 0644 /boot/vmlinuz-*
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq qemu-system-x86 qemu-utils cloud-guest-utils gdisk socat imagemagick tesseract-ocr
 
       - name: resize root without changing partition numbers
-        env:
-          LIBGUESTFS_BACKEND: direct
-          LIBGUESTFS_MEMSIZE: "1024"
         run: |
           docker pull --platform linux/amd64 "$SOURCE_IMAGE"
           container=$(docker create --platform linux/amd64 "$SOURCE_IMAGE" /bin/true)
@@ -70,8 +66,7 @@ jobs:
           qemu-img convert -p -O qcow2 -c disk.source.qcow2 disk.qcow2
           rm disk.source.qcow2
           qemu-img info disk.qcow2
-          virt-filesystems -a disk.qcow2 --all --long --uuid -h
-          virt-df -h -a disk.qcow2
+          qemu-img check disk.qcow2
 
       - name: boot-test resized disk
         run: |
