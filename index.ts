@@ -660,7 +660,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
   function loadSessionTarget(ctx: UIContext): ExecutionTarget | undefined {
     return parseTarget(
       latestCustomEntryData(
-        ctx.sessionManager.getBranch(),
+        ctx.sessionManager.getEntries(),
         executionTargetEntry,
       ),
     );
@@ -672,7 +672,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     if (!previousSessionFile) return undefined;
     const previous = SessionManager.open(previousSessionFile);
     return parseTarget(
-      latestCustomEntryData(previous.getBranch(), executionTargetHandoffEntry),
+      latestCustomEntryData(previous.getEntries(), executionTargetHandoffEntry),
     );
   }
 

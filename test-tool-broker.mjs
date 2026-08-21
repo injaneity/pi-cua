@@ -55,33 +55,11 @@ try {
   let errors = "";
   relay.stdout.on("data", (chunk) => (output += chunk));
   relay.stderr.on("data", (chunk) => (errors += chunk));
-  const waitForOutput = (text) => {
-    if (output.includes(text)) return Promise.resolve();
-    return new Promise((resolve, reject) => {
-      const timeout = setTimeout(
-        () => finish(new Error(`timed out waiting for ${text}`)),
-        5_000,
-      );
-      const onData = () => {
-        if (output.includes(text)) finish();
-      };
-      const onClose = (code) =>
-        finish(
-          new Error(`relay exited with ${code} while waiting for ${text}`),
-        );
-      const finish = (error) => {
-        clearTimeout(timeout);
-        relay.stdout.off("data", onData);
-        relay.off("close", onClose);
-        error ? reject(error) : resolve();
-      };
-      relay.stdout.on("data", onData);
-      relay.once("close", onClose);
-    });
-  };
-  await waitForOutput('"type":"ready"');
   relay.stdin.write("hello\n");
-  await waitForOutput("hello");
+  const signal = AbortSignal.timeout(5_000);
+  while (!output.includes("hello")) {
+    await once(relay.stdout, "data", { signal });
+  }
   relay.stdin.end();
   const [code] = await once(relay, "close");
 

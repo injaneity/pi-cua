@@ -39,15 +39,15 @@ custom images are available through the structured `cua_sandbox` create action's
 5. the host loads pi's normal remote tool registry and reports its protocol and tool manifest;
 6. calls, updates, results, errors, cancellation, and user shell output use that channel. `Esc` rejects the local request immediately and asks the host to kill the full remote command process tree.
 
-all target changes use one workspace model: Pi records local and sandbox Git trees at sandbox entry, computes one accumulated binary tree diff from the original commit to the source's final tree, verifies the destination tree, and applies that diff. after a successful local sync or sandbox-to-sandbox handoff, it removes the source workspace, including ignored build outputs. graceful quit, new-session, resume, and fork shutdowns sync to local, persist local placement, and remove the remote workspace; reload keeps it because the same session immediately reconnects. local divergence, a patch conflict, or cleanup failure is reported explicitly, and a failed sync retains the remote workspace rather than deleting the only copy of changes.
+all target changes use one workspace model: Pi records local and sandbox Git trees at sandbox entry, computes one accumulated binary tree diff from the original commit to the source's final tree, verifies the destination tree, and applies that diff. after a successful move to local or another sandbox, it removes the source workspace, including ignored build outputs. graceful quit and resume shutdowns sync to local and remove the remote workspace. `/new`, `/fork`, and reload retain the active workspace because the replacement session or runtime immediately reconnects. local divergence, a patch conflict, or cleanup failure is reported explicitly, and a failed sync retains the remote workspace rather than deleting the only copy of changes.
 
 ## state
 
-execution placement is stored as non-context session metadata and mirrored in the controller database. restore reads the latest placement across the full session rather than the active branch, so `/tree` and compaction cannot change it.
+execution placement is stored only as non-context Pi session metadata. restore reads the latest placement across the full session rather than the active branch, so `/tree` and compaction cannot change it.
 
-sandbox workspaces are keyed by session id while the session is active on that sandbox. new threads and forks start from an exact snapshot of the current local checkout. a fork does not copy its parent's active sandbox workspace, so both threads retain independently verifiable local baselines. failed destination setup removes its incomplete workspace before returning the error.
+sandbox workspaces receive an opaque id when prepared. `/new` and `/fork` transfer ownership of the active workspace to the replacement session; the previous session records local placement. failed destination setup removes its incomplete workspace before returning the error.
 
-placement adds a stable operating-system instruction and logical `workspace root` cwd to the model prompt, but no sandbox name, physical path, or model-visible conversation entry. forks on the same target OS therefore keep the same prompt prefix for provider cache hits even though they receive different physical workspaces.
+placement adds a stable operating-system instruction and logical `workspace root` cwd to the model prompt, but no sandbox name, physical path, or model-visible conversation entry. replacement sessions on the same target OS therefore keep the same prompt prefix for provider cache hits.
 
 tool state belongs to the active remote host. switching targets invalidates target-specific references and background processes.
 
