@@ -53,14 +53,36 @@ try {
   );
   let output = "";
   let errors = "";
+  relay.stdout.on("data", (chunk) => (output += chunk));
   relay.stderr.on("data", (chunk) => (errors += chunk));
-  await new Promise((resolve) => {
-    relay.stdout.on("data", (chunk) => {
-      output += chunk;
-      if (output.includes('"type":"ready"')) resolve();
+  const waitForOutput = (text) => {
+    if (output.includes(text)) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(
+        () => finish(new Error(`timed out waiting for ${text}`)),
+        5_000,
+      );
+      const onData = () => {
+        if (output.includes(text)) finish();
+      };
+      const onClose = (code) =>
+        finish(
+          new Error(`relay exited with ${code} while waiting for ${text}`),
+        );
+      const finish = (error) => {
+        clearTimeout(timeout);
+        relay.stdout.off("data", onData);
+        relay.off("close", onClose);
+        error ? reject(error) : resolve();
+      };
+      relay.stdout.on("data", onData);
+      relay.once("close", onClose);
     });
-  });
-  relay.stdin.end("hello\n");
+  };
+  await waitForOutput('"type":"ready"');
+  relay.stdin.write("hello\n");
+  await waitForOutput("hello");
+  relay.stdin.end();
   const [code] = await once(relay, "close");
 
   assert.equal(code, 0, errors);
@@ -68,7 +90,9 @@ try {
   assert.match(output, /hello/);
   console.log("desktop tool broker test passed");
 } finally {
-  broker?.kill();
-  if (broker) await once(broker, "close");
+  if (broker?.exitCode === null) {
+    broker.kill();
+    await once(broker, "close");
+  }
   await rm(directory, { recursive: true, force: true });
 }
