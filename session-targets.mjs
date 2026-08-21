@@ -1,7 +1,10 @@
-export function preferPickerItem(items, value) {
-  const index = items.findIndex((item) => item.value === value);
-  if (index <= 0) return items;
-  return [items[index], ...items.slice(0, index), ...items.slice(index + 1)];
+export function latestCustomEntryData(entries, customType) {
+  for (let index = entries.length - 1; index >= 0; index--) {
+    const entry = entries[index];
+    if (entry.type === "custom" && entry.customType === customType)
+      return entry.data;
+  }
+  return undefined;
 }
 
 export function isControllerClipboardImagePath(value) {

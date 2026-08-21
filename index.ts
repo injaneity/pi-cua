@@ -4,6 +4,7 @@ import {
   type ExtensionAPI,
   type ExtensionCommandContext,
   type ExtensionContext,
+  SessionManager,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -16,6 +17,7 @@ import {
 } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import {
+  latestCustomEntryData,
   shouldCleanupExecutionTarget,
   shouldHandoffExecutionTarget,
   shouldUseControllerTool,
@@ -32,6 +34,7 @@ const windowsIdentity = join(homedir(), ".ssh", "cua_windows_ed25519");
 const sandboxKnownHosts = join(homedir(), ".ssh", "cua_known_hosts");
 const protocolVersion = 2;
 const executionTargetEntry = "cua-execution-target";
+const executionTargetHandoffEntry = "cua-execution-target-handoff";
 const localTools = new Set(["cua_sandbox", "report_papercut"]);
 
 const resourceSchema = Type.Object({
@@ -655,64 +658,25 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
   }
 
   function loadSessionTarget(ctx: UIContext): ExecutionTarget | undefined {
-    const entries = ctx.sessionManager.getEntries();
-    for (let index = entries.length - 1; index >= 0; index--) {
-      const entry = entries[index];
-      if (entry.type === "custom" && entry.customType === executionTargetEntry)
-        return parseTarget(entry.data);
-    }
-    return undefined;
+    return parseTarget(
+      latestCustomEntryData(
+        ctx.sessionManager.getBranch(),
+        executionTargetEntry,
+      ),
+    );
   }
 
-  async function loadTarget(
-    ctx: UIContext,
+  function loadHandoffTarget(
     previousSessionFile?: string,
-  ): Promise<{
-    target: ExecutionTarget | undefined;
-    persisted: boolean;
-    inherited: boolean;
-  }> {
-    const current = await runBackend({
-      action: "get_execution_target",
-      session_id: ctx.sessionManager.getSessionId(),
-      session_file: ctx.sessionManager.getSessionFile() ?? "",
-    });
-    if (current.target != null)
-      return {
-        target: parseTarget(current.target),
-        persisted: false,
-        inherited: false,
-      };
-    const sessionTarget = loadSessionTarget(ctx);
-    if (sessionTarget)
-      return {
-        target: sessionTarget,
-        persisted: true,
-        inherited: Boolean(previousSessionFile),
-      };
-    if (!previousSessionFile)
-      return { target: undefined, persisted: false, inherited: false };
-    const previous = await runBackend({
-      action: "get_execution_target",
-      session_file: previousSessionFile,
-    });
-    return {
-      target: parseTarget(previous.target),
-      persisted: false,
-      inherited: previous.target != null,
-    };
+  ): ExecutionTarget | undefined {
+    if (!previousSessionFile) return undefined;
+    const previous = SessionManager.open(previousSessionFile);
+    return parseTarget(
+      latestCustomEntryData(previous.getBranch(), executionTargetHandoffEntry),
+    );
   }
 
-  async function saveTarget(
-    next: ExecutionTarget,
-    ctx: UIContext,
-  ): Promise<void> {
-    await runBackend({
-      action: "set_execution_target",
-      session_id: ctx.sessionManager.getSessionId(),
-      session_file: ctx.sessionManager.getSessionFile() ?? "",
-      target: next,
-    });
+  function saveTarget(next: ExecutionTarget): void {
     pi.appendEntry(executionTargetEntry, next);
   }
 
@@ -1212,7 +1176,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     options: { persist?: boolean } = {},
   ): Promise<void> {
     if (next === target && bridge) {
-      if (options.persist !== false) await saveTarget(next, ctx);
+      if (options.persist !== false) saveTarget(next);
       return;
     }
     const expectedTools = captureToolProviders();
@@ -1236,7 +1200,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     }
     try {
       await nextBridge?.connect();
-      if (options.persist !== false) await saveTarget(next, ctx);
+      if (options.persist !== false) saveTarget(next);
     } catch (error) {
       nextBridge?.close();
       ctx.ui.setStatus("cua-session", undefined);
@@ -1374,23 +1338,17 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
 
   pi.on("session_start", async (event, ctx) => {
     try {
-      const inheritPrevious = shouldHandoffExecutionTarget(event.reason);
-      const loaded = await loadTarget(
-        ctx,
-        inheritPrevious ? event.previousSessionFile : undefined,
-      );
-      const saved = loaded.target;
-      if (saved) {
-        await activate(saved, ctx, {
-          persist: loaded.inherited || !loaded.persisted,
-        });
-        if (loaded.inherited && event.previousSessionFile) {
-          await runBackend({
-            action: "set_execution_target",
-            session_file: event.previousSessionFile,
-            target: { kind: "local" },
-          });
-        }
+      const current = loadSessionTarget(ctx);
+      if (current) {
+        await activate(current, ctx, { persist: false });
+        return;
+      }
+      const inherited = shouldHandoffExecutionTarget(event.reason)
+        ? loadHandoffTarget(event.previousSessionFile)
+        : undefined;
+      if (inherited) {
+        saveTarget(inherited);
+        await activate(inherited, ctx, { persist: false });
         return;
       }
       await activate({ kind: "local" }, ctx);
@@ -1438,10 +1396,15 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
   pi.on("session_shutdown", async (event, ctx) => {
     const source = target.kind === "sandbox" ? target : undefined;
     try {
-      if (source && shouldCleanupExecutionTarget(event.reason)) {
+      if (source && shouldHandoffExecutionTarget(event.reason)) {
+        pi.appendEntry(executionTargetHandoffEntry, source);
+        const local: ExecutionTarget = { kind: "local" };
+        saveTarget(local);
+        target = local;
+      } else if (source && shouldCleanupExecutionTarget(event.reason)) {
         await syncTargetToLocal(source);
         const local: ExecutionTarget = { kind: "local" };
-        await saveTarget(local, ctx);
+        saveTarget(local);
         target = local;
         await cleanupTarget(source, ctx);
       }

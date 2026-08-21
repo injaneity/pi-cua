@@ -3,20 +3,39 @@
 import assert from "node:assert/strict";
 import {
   isControllerClipboardImagePath,
-  preferPickerItem,
+  latestCustomEntryData,
   shouldCleanupExecutionTarget,
   shouldHandoffExecutionTarget,
   shouldUseControllerTool,
 } from "./session-targets.mjs";
 
-const items = ["local", "cua-windows", "cua-linux", "create"].map((value) => ({
-  value,
-}));
+const sessionEntries = [
+  {
+    type: "custom",
+    customType: "cua-execution-target",
+    data: { kind: "sandbox", name: "old" },
+  },
+  { type: "message", message: { role: "user", content: "work" } },
+  {
+    type: "custom",
+    customType: "cua-execution-target-handoff",
+    data: { kind: "sandbox", name: "handoff" },
+  },
+  {
+    type: "custom",
+    customType: "cua-execution-target",
+    data: { kind: "local" },
+  },
+];
 assert.deepEqual(
-  preferPickerItem(items, "cua-linux").map((item) => item.value),
-  ["cua-linux", "local", "cua-windows", "create"],
+  latestCustomEntryData(sessionEntries, "cua-execution-target"),
+  { kind: "local" },
 );
-assert.equal(preferPickerItem(items, undefined), items);
+assert.deepEqual(
+  latestCustomEntryData(sessionEntries, "cua-execution-target-handoff"),
+  { kind: "sandbox", name: "handoff" },
+);
+assert.equal(latestCustomEntryData(sessionEntries, "missing"), undefined);
 
 assert.equal(
   isControllerClipboardImagePath(

@@ -330,14 +330,14 @@ class WorkspaceTests(unittest.TestCase):
             patch.object(backend, "remote_pi_files", return_value={"one": b"1"}),
         ):
             first_bootstrap = backend.bootstrap_digest("linux")
-            first_config = backend.guest_config_digest()
+            first_config = backend.guest_config_archive()[1]
         with (
             patch.object(backend, "pi_version", return_value="1.2.3"),
             patch.object(backend, "bootstrap_template", return_value="bootstrap"),
             patch.object(backend, "remote_pi_files", return_value={"one": b"2"}),
         ):
             self.assertEqual(backend.bootstrap_digest("linux"), first_bootstrap)
-            self.assertNotEqual(backend.guest_config_digest(), first_config)
+            self.assertNotEqual(backend.guest_config_archive()[1], first_config)
 
     def test_linux_preflight_combines_health_config_disk_and_repository(self) -> None:
         with patch.object(
@@ -435,8 +435,8 @@ class WorkspaceTests(unittest.TestCase):
 
     def test_guest_bundle_digest_includes_tool_packages(self) -> None:
         self.assertNotEqual(
-            backend.guest_config_digest(()),
-            backend.guest_config_digest(("git:github.com/example/tool-package",)),
+            backend.guest_config_archive(())[1],
+            backend.guest_config_archive(("git:github.com/example/tool-package",))[1],
         )
 
     def test_bundle_describes_only_the_clean_git_baseline(self) -> None:
@@ -1026,41 +1026,6 @@ class VisibleOperationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ControllerStateTests(unittest.TestCase):
-    def test_execution_target_is_session_metadata(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            controller_dir = Path(directory)
-            session_file = Path(directory) / "session.jsonl"
-            with (
-                patch.object(backend, "CONTROLLER_DIR", controller_dir),
-                patch.object(
-                    backend, "CONTROLLER_DB", controller_dir / "state.sqlite3"
-                ),
-            ):
-                target = {
-                    "kind": "sandbox",
-                    "name": "linux-1",
-                    "os": "linux",
-                    "address": "100.64.0.2",
-                    "localCwd": "/local",
-                    "remoteCwd": "/remote",
-                    "workspaceState": {
-                        "version": 1,
-                        "localRoot": "/local",
-                        "commit": "a" * 40,
-                        "commitTree": "1" * 40,
-                        "baselineTree": "1" * 40,
-                    },
-                }
-                backend.set_execution_target("session-1", str(session_file), target)
-                by_id = backend.get_execution_target(session_id="session-1")
-                by_file = backend.get_execution_target(session_file=str(session_file))
-                backend.set_execution_target("", str(session_file), {"kind": "local"})
-                transferred = backend.get_execution_target(session_id="session-1")
-
-            self.assertEqual(by_id["target"], target)
-            self.assertEqual(by_file["target"], target)
-            self.assertEqual(transferred["target"], {"kind": "local"})
-
     def test_long_operation_submission_returns_without_running_inline(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             controller_dir = Path(directory)

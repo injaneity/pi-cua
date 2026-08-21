@@ -267,11 +267,6 @@ def config_digest(files: dict[str, bytes]) -> str:
     return digest.hexdigest()[:20]
 
 
-def guest_config_digest(packages: tuple[str, ...] = ()) -> str:
-    """Hash mutable Pi files that can be synchronized without guest repair."""
-    return config_digest(guest_config_files(packages))
-
-
 def operation_locks(action: str) -> tuple[Path, ...]:
     """Keep Fleet mutations separate from workspace preparation."""
     if action == "create":
@@ -331,14 +326,6 @@ def database() -> Iterator[sqlite3.Connection]:
             tailscale_addresses TEXT,
             updated_at TEXT NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS execution_targets (
-            session_id TEXT PRIMARY KEY,
-            session_file TEXT,
-            target_json TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        CREATE UNIQUE INDEX IF NOT EXISTS execution_targets_session_file
-            ON execution_targets(session_file) WHERE session_file IS NOT NULL;
         """
     )
     sandbox_columns = {
@@ -355,63 +342,6 @@ def database() -> Iterator[sqlite3.Connection]:
         raise
     finally:
         connection.close()
-
-
-def get_execution_target(
-    session_id: str = "", session_file: str = ""
-) -> dict[str, Any]:
-    with database() as connection:
-        row = None
-        if session_id:
-            row = connection.execute(
-                "SELECT target_json FROM execution_targets WHERE session_id = ?",
-                (session_id,),
-            ).fetchone()
-        if row is None and session_file:
-            row = connection.execute(
-                "SELECT target_json FROM execution_targets WHERE session_file = ?",
-                (str(Path(session_file).expanduser().resolve()),),
-            ).fetchone()
-    return {"target": json.loads(row["target_json"]) if row else None}
-
-
-def set_execution_target(
-    session_id: str, session_file: str, target: object
-) -> dict[str, Any]:
-    if not session_id and not session_file:
-        raise ValueError("set_execution_target requires session_id or session_file")
-    if not isinstance(target, dict) or target.get("kind") not in {"local", "sandbox"}:
-        raise ValueError("set_execution_target requires a valid target")
-    resolved_file = (
-        str(Path(session_file).expanduser().resolve()) if session_file else None
-    )
-    target_json = json.dumps(target, separators=(",", ":"))
-    updated_at = datetime.now(timezone.utc).isoformat()
-    with database() as connection:
-        if session_id:
-            connection.execute(
-                """
-                INSERT INTO execution_targets (session_id, session_file, target_json, updated_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(session_id) DO UPDATE SET
-                    session_file = excluded.session_file,
-                    target_json = excluded.target_json,
-                    updated_at = excluded.updated_at
-                """,
-                (session_id, resolved_file, target_json, updated_at),
-            )
-        else:
-            cursor = connection.execute(
-                """
-                UPDATE execution_targets
-                SET target_json = ?, updated_at = ?
-                WHERE session_file = ?
-                """,
-                (target_json, updated_at, resolved_file),
-            )
-            if cursor.rowcount != 1:
-                raise ValueError("saved execution target was not found")
-    return {"target": target}
 
 
 @dataclass(frozen=True)
@@ -2725,17 +2655,6 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
             for item in local_states()
         ]
         return {"sandboxes": items}
-    if action == "get_execution_target":
-        return get_execution_target(
-            str(request.get("session_id") or ""),
-            str(request.get("session_file") or ""),
-        )
-    if action == "set_execution_target":
-        return set_execution_target(
-            str(request.get("session_id") or ""),
-            str(request.get("session_file") or ""),
-            request.get("target"),
-        )
     if action == "operation_status":
         return operation_status(str(request.get("operation_id") or ""))
     if action == "operation_cancel":
@@ -2787,7 +2706,7 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
             tuple(dict.fromkeys(tool_packages)),
         )
     raise ValueError(
-        "action must be list, create, ensure, delete, prepare_execution, sync_workspace_to_local, cleanup_workspace, workspace_diff_status, get_execution_target, or set_execution_target"
+        "action must be list, create, ensure, delete, prepare_execution, sync_workspace_to_local, cleanup_workspace, or workspace_diff_status"
     )
 
 
@@ -2830,8 +2749,6 @@ def main() -> None:
                 )
         quiet_request = action in {
             "list",
-            "get_execution_target",
-            "set_execution_target",
             "operation_status",
             "workspace_diff_status",
         }
@@ -2839,8 +2756,6 @@ def main() -> None:
             progress("request", "accepted", action=action, name=request.get("name"))
         local_read = action in {
             "list",
-            "get_execution_target",
-            "set_execution_target",
             "operation_status",
             "operation_cancel",
             "workspace_diff_status",
