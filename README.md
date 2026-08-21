@@ -24,7 +24,7 @@ windows provisioning also requires `~/.ssh/cua_windows_ed25519` and its `.pub` f
 - `/sandbox` opens a compact action search. while a sandbox is active, the first action syncs back to the local directory; staying on the current target requires no action, so Escape closes the search without changing it. every session can connect to another online sandbox or create a sandbox; the connect action shows the number of online choices after excluding the active sandbox. connect and create open focused nested searches where Escape returns to the action search, and create entries use the prompt-template heading accent when selected. `/sandbox linux 16 65536` creates a sandbox with 16 CPUs and 65536 MiB of memory; omitting both values uses the existing OS defaults.
 - `/new` and `/fork` start local; use `/sandbox` to opt into sandbox execution for the new thread.
 - `/tree` changes conversation history but never changes execution placement.
-- `/resume` restores placement from durable session metadata, with the controller database as a compatibility fallback for older sessions.
+- `/resume` restores placement from durable session metadata, with the controller database as a compatibility fallback for older sessions. a session that shut down cleanly after sandbox use resumes locally because shutdown first syncs and removes its generated workspace.
 - the footer shows the selected sandbox. no remote tui or conversation session is created.
 
 custom images are available through the structured `cua_sandbox` create action's `image` field. they must be Fleet-compatible CUA containerDisks and pinned by `sha256` digest; mutable tags are rejected.
@@ -39,13 +39,13 @@ custom images are available through the structured `cua_sandbox` create action's
 4. the host loads pi's normal remote tool registry and reports its protocol and tool manifest;
 5. calls, updates, results, errors, cancellation, and user shell output use that channel. `Esc` rejects the local request immediately and asks the host to kill the full remote command process tree.
 
-all target changes use one workspace model: Pi records local and sandbox Git trees at sandbox entry, computes the accumulated binary tree diff when leaving a sandbox, verifies the destination baseline, and applies that diff. local divergence or a patch conflict stops the switch, and failure leaves the previous target active.
+all target changes use one workspace model: Pi records local and sandbox Git trees at sandbox entry, computes the accumulated binary tree diff when leaving a sandbox, verifies the destination baseline, and applies that diff. after a successful local sync or sandbox-to-sandbox handoff, it removes the source workspace, including ignored build outputs. graceful quit, new-session, resume, and fork shutdowns sync to local, persist local placement, and remove the remote workspace; reload keeps it because the same session immediately reconnects. local divergence, a patch conflict, or cleanup failure is reported explicitly, and a failed sync retains the remote workspace rather than deleting the only copy of changes.
 
 ## state
 
 execution placement is stored as non-context session metadata and mirrored in the controller database. restore reads the latest placement across the full session rather than the active branch, so `/tree` and compaction cannot change it.
 
-sandbox workspaces are keyed by session id. new threads and forks start from an exact snapshot of the current local checkout. a fork does not copy its parent's active sandbox workspace, so both threads retain independently verifiable local baselines.
+sandbox workspaces are keyed by session id while the session is active on that sandbox. new threads and forks start from an exact snapshot of the current local checkout. a fork does not copy its parent's active sandbox workspace, so both threads retain independently verifiable local baselines. failed destination setup removes its incomplete workspace before returning the error.
 
 placement adds a stable operating-system instruction and logical `workspace root` cwd to the model prompt, but no sandbox name, physical path, or model-visible conversation entry. forks on the same target OS therefore keep the same prompt prefix for provider cache hits even though they receive different physical workspaces.
 
@@ -55,9 +55,9 @@ pi-cua emits `cua:execution-target-changed` with local, connecting, and ready ta
 
 ## guest boundary
 
-the guest receives the pi sdk version, only the user packages that own routed tools, top-level extension definitions, and the generic tool host. the host activates lifecycle handlers only for extensions that own required tools. it does not receive local model credentials, prompts, conversation sessions, or the sandbox controller.
+the guest receives the pi sdk version, only the user packages that own routed tools, top-level extension definitions, and the generic tool host. machine bootstrap and mutable Pi configuration have separate content digests, so an extension edit synchronizes a small archive instead of reinstalling or repairing the sandbox. the host activates lifecycle handlers only for extensions that own required tools. it does not receive local model credentials, prompts, conversation sessions, or the sandbox controller.
 
-workspace preparation requires a git repository with a network `origin` and does not support submodules, Git content filters, or working-tree encodings. if the guest cannot authenticate to the origin, the controller sends a clean commit snapshot and creates an isolated baseline without copying git credentials. new threads, existing local threads, and forks carry the local changes, limited to 200 mib. guests keep a bare repository cache outside all workspaces, so fresh sessions and forks reuse git objects without sharing mutable files. package-manager caches also remain in the guest user profile. every handoff transfers only the accumulated binary Git tree diff; `.git`, ignored files, credentials, caches, and processes stay with their machine.
+workspace preparation requires a git repository with a network `origin` and does not support submodules, Git content filters, or working-tree encodings. if the guest cannot authenticate to the origin, the controller sends a clean commit snapshot and creates an isolated baseline without copying git credentials. new threads, existing local threads, and forks carry the local changes, limited to 200 mib. guests keep one bare repository cache outside all workspaces; isolated per-session clones borrow its objects through Git alternates instead of duplicating packs or sharing mutable Git configuration. package-manager caches remain in the guest user profile. every handoff transfers only the accumulated binary Git tree diff, then removes the generated source workspace; ignored files, credentials, caches, and processes are neither transferred nor retained as task state.
 
 on Windows, OpenSSH remains in Session 0. it can reach only an authenticated loopback relay. the relay starts the tool host under the logged-in desktop user's scheduled-task broker, so GUI tools and shell commands share Session 1 without exposing the broker off-machine.
 

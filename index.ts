@@ -101,6 +101,7 @@ type BackendResult = {
   deletions?: number;
   pending_sync?: boolean;
   sync_safe?: boolean;
+  removed?: boolean;
   target?: unknown;
 };
 type Destination =
@@ -1058,6 +1059,51 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     }
   }
 
+  function sandboxSource(
+    active: Extract<ExecutionTarget, { kind: "sandbox" }>,
+  ): Record<string, unknown> {
+    return {
+      address: active.address,
+      os: active.os,
+      remoteCwd: active.remoteCwd,
+      state: active.workspaceState,
+    };
+  }
+
+  async function cleanupTarget(
+    active: Extract<ExecutionTarget, { kind: "sandbox" }>,
+    ctx: UIContext,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    try {
+      await runBackend(
+        { action: "cleanup_workspace", source: sandboxSource(active) },
+        signal,
+      );
+    } catch (error) {
+      ctx.ui.notify(
+        `workspace cleanup failed on ${active.name}: ${error instanceof Error ? error.message : String(error)}`,
+        "warning",
+      );
+    }
+  }
+
+  async function syncTargetToLocal(
+    active: Extract<ExecutionTarget, { kind: "sandbox" }>,
+    signal?: AbortSignal,
+    onStatus?: (status: BackendResult) => void,
+  ): Promise<void> {
+    await runBackend(
+      {
+        action: "sync_workspace_to_local",
+        source: sandboxSource(active),
+        local_cwd: active.localCwd,
+      },
+      signal,
+      onStatus,
+    );
+  }
+
   async function refreshWorkspaceDiff(): Promise<void> {
     const generation = ++workspaceDiffGeneration;
     const active = target;
@@ -1069,12 +1115,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       const result = await runBackend(
         {
           action: "workspace_diff_status",
-          source: {
-            address: active.address,
-            os: active.os,
-            remoteCwd: active.remoteCwd,
-            state: active.workspaceState,
-          },
+          source: sandboxSource(active),
           local_cwd: active.localCwd,
         },
         new AbortController().signal,
@@ -1263,44 +1304,35 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         const destination = await destinationFromArgument(args, ctx);
         if (!destination) return;
         if (destination.kind === "local") {
-          if (target.kind === "sandbox") {
+          const source = target.kind === "sandbox" ? target : undefined;
+          if (source) {
             pi.events.emit("cua:execution-target-changed", {
-              ...target,
+              ...source,
               state: "connecting",
               phase: "workspace.local.sync",
               message: "syncing sandbox changes to local",
             });
-            await runBackend(
-              {
-                action: "sync_workspace_to_local",
-                source: {
-                  address: target.address,
-                  os: target.os,
-                  remoteCwd: target.remoteCwd,
-                  state: target.workspaceState,
-                },
-                local_cwd: target.localCwd,
-              },
-              ctx.signal,
-              (status) => {
-                pi.events.emit("cua:execution-target-changed", {
-                  ...target,
-                  state: "connecting",
-                  phase: status.phase,
-                  message: status.message,
-                });
-              },
-            );
+            await syncTargetToLocal(source, ctx.signal, (status) => {
+              pi.events.emit("cua:execution-target-changed", {
+                ...source,
+                state: "connecting",
+                phase: status.phase,
+                message: status.message,
+              });
+            });
           }
           const local: ExecutionTarget = { kind: "local" };
           await activate(local, ctx);
+          if (source) await cleanupTarget(source, ctx, ctx.signal);
           await ctx.reload();
           return;
         }
         if (target.kind === "sandbox" && target.name === destination.name)
           return;
+        const source = target.kind === "sandbox" ? target : undefined;
         const prepared = await prepareTarget(destination, ctx);
         await activate(prepared, ctx);
+        if (source) await cleanupTarget(source, ctx, ctx.signal);
       } catch (error) {
         ctx.ui.notify(
           error instanceof Error ? error.message : String(error),
@@ -1364,8 +1396,24 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     return { operations };
   });
 
-  pi.on("session_shutdown", () => {
-    bridge?.close();
-    bridge = undefined;
+  pi.on("session_shutdown", async (event, ctx) => {
+    const source = target.kind === "sandbox" ? target : undefined;
+    try {
+      if (source && event.reason !== "reload") {
+        await syncTargetToLocal(source);
+        const local: ExecutionTarget = { kind: "local" };
+        await saveTarget(local, ctx);
+        target = local;
+        await cleanupTarget(source, ctx);
+      }
+    } catch (error) {
+      ctx.ui.notify(
+        `sandbox shutdown retained ${source?.name ?? "workspace"}: ${error instanceof Error ? error.message : String(error)}`,
+        "error",
+      );
+    } finally {
+      bridge?.close();
+      bridge = undefined;
+    }
   });
 }
