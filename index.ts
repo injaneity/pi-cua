@@ -15,7 +15,10 @@ import {
   Text,
 } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
-import { preferPickerItem } from "./session-targets.mjs";
+import {
+  preferPickerItem,
+  shouldUseControllerTool,
+} from "./session-targets.mjs";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { homedir } from "node:os";
@@ -617,6 +620,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
   let placementError: Error | undefined;
   let bridge: ToolBridge | undefined;
   const proxiedTools = new Set<string>();
+  const localToolDefinitions = new Map<string, AnyToolDefinition>();
   const toolPackages = new Set<string>();
 
   async function executeBackend(
@@ -849,6 +853,8 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     const names: string[] = [];
     for (const tool of pi.getAllTools()) {
       if (localTools.has(tool.name)) continue;
+      if (!proxiedTools.has(tool.name) && !localToolDefinitions.has(tool.name))
+        localToolDefinitions.set(tool.name, tool);
       names.push(tool.name);
       if (
         tool.sourceInfo.origin === "package" &&
@@ -943,7 +949,15 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         throw new Error(`remote tool metadata missing: ${info.name}`);
       pi.registerTool({
         ...remote,
-        async execute(id, input, signal, onUpdate) {
+        async execute(id, input, signal, onUpdate, toolCtx) {
+          if (shouldUseControllerTool(info.name, input)) {
+            const localRead = localToolDefinitions.get("read");
+            if (!localRead)
+              throw new Error(
+                "local read tool is unavailable for clipboard image",
+              );
+            return localRead.execute(id, input, signal, onUpdate, toolCtx);
+          }
           if (target.kind !== "sandbox" || !bridge) {
             throw new Error(`${info.name} has no active sandbox`);
           }
