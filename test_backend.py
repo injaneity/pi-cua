@@ -240,6 +240,47 @@ class TailscaleTests(unittest.TestCase):
 
         self.assertIn("--until-direct=false", run.call_args.args[0])
 
+    def test_verified_host_key_is_left_unchanged_when_it_matches(self) -> None:
+        key = "ssh-ed25519 AAAA-current"
+        scan = subprocess.CompletedProcess(
+            ["ssh-keyscan"], 0, stdout=f"100.64.0.2 {key}\n", stderr=""
+        )
+        found = subprocess.CompletedProcess(
+            ["ssh-keygen"], 0, stdout=f"100.64.0.2 {key}\n", stderr=""
+        )
+        with patch.object(backend.subprocess, "run", side_effect=[scan, found]) as run:
+            backend.pin_verified_ssh_host_key("100.64.0.2")
+
+        self.assertEqual(run.call_count, 2)
+
+    def test_verified_host_key_replaces_a_stale_entry(self) -> None:
+        scan = subprocess.CompletedProcess(
+            ["ssh-keyscan"],
+            0,
+            stdout="100.64.0.2 ssh-ed25519 AAAA-current\n",
+            stderr="",
+        )
+        found = subprocess.CompletedProcess(
+            ["ssh-keygen"],
+            0,
+            stdout="100.64.0.2 ssh-ed25519 AAAA-stale\n",
+            stderr="",
+        )
+        removed = subprocess.CompletedProcess(["ssh-keygen"], 0, stdout="", stderr="")
+        with tempfile.TemporaryDirectory() as directory:
+            known_hosts = Path(directory) / "known_hosts"
+            known_hosts.write_text("100.64.0.2 ssh-ed25519 AAAA-stale\n")
+            with (
+                patch.object(backend, "SANDBOX_KNOWN_HOSTS", known_hosts),
+                patch.object(
+                    backend.subprocess, "run", side_effect=[scan, found, removed]
+                ) as run,
+            ):
+                backend.pin_verified_ssh_host_key("100.64.0.2")
+
+            self.assertIn("100.64.0.2 ssh-ed25519 AAAA-current", known_hosts.read_text())
+            self.assertEqual(run.call_args_list[2].args[0][1:3], ["-R", "100.64.0.2"])
+
     def test_offline_controller_fails_before_provisioning(self) -> None:
         status = {
             "BackendState": "Running",
@@ -703,6 +744,7 @@ class ControllerStateTests(unittest.TestCase):
             self.assertEqual(
                 popen.call_args.args[0][:4], ["uv", "run", "--quiet", "--no-project"]
             )
+            self.assertIn("cua-sandbox==0.4.2", popen.call_args.args[0])
 
     def test_local_worker_uses_the_current_python(self) -> None:
         command = backend.worker_command({"action": "sync_workspace_to_local"})

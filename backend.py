@@ -80,6 +80,7 @@ TAILSCALE_KEYCHAIN_SERVICE = "cua-sandbox-tailscale-oauth"
 TAILSCALE_TOKEN_URL = "https://api.tailscale.com/api/v2/oauth/token"
 TAILSCALE_API_URL = "https://api.tailscale.com/api/v2"
 WINDOWS_PUBLIC_KEY = HOME / ".ssh" / "cua_windows_ed25519.pub"
+SANDBOX_KNOWN_HOSTS = HOME / ".ssh" / "cua_known_hosts"
 
 PROFILES = {
     "linux": {
@@ -553,7 +554,7 @@ def worker_command(request: dict[str, Any]) -> list[str]:
         "--python",
         "3.11",
         "--with",
-        "cua-sandbox==0.3.4",
+        "cua-sandbox==0.4.2",
         "--extra-index-url",
         "https://wheels.cua.ai/simple",
         "--index-strategy",
@@ -960,6 +961,62 @@ async def verify_tailscale_enrollment(
     return node_id, addresses
 
 
+def pin_verified_ssh_host_key(address: str) -> None:
+    """Pin the SSH key after Fleet and the controller netmap verify the guest."""
+    try:
+        scanned = subprocess.run(
+            ["ssh-keyscan", "-T", "5", "-t", "ed25519", address],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError(f"could not scan the SSH host key for {address}") from error
+    keys = [line for line in scanned.stdout.splitlines() if line and not line.startswith("#")]
+    if scanned.returncode != 0 or not keys:
+        detail = scanned.stderr.strip()
+        raise RuntimeError(
+            f"could not scan the SSH host key for {address}: "
+            f"{detail or f'exit {scanned.returncode}'}"
+        )
+
+    known = subprocess.run(
+        ["ssh-keygen", "-F", address, "-f", str(SANDBOX_KNOWN_HOSTS)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    scanned_material = {" ".join(line.split()[1:3]) for line in keys}
+    known_material = {
+        " ".join(line.split()[1:3])
+        for line in known.stdout.splitlines()
+        if line and not line.startswith("#") and len(line.split()) >= 3
+    }
+    if scanned_material & known_material:
+        return
+
+    SANDBOX_KNOWN_HOSTS.parent.mkdir(parents=True, exist_ok=True)
+    SANDBOX_KNOWN_HOSTS.touch(mode=0o600, exist_ok=True)
+    removed = subprocess.run(
+        ["ssh-keygen", "-R", address, "-f", str(SANDBOX_KNOWN_HOSTS)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if removed.returncode != 0:
+        raise RuntimeError(
+            f"could not replace the verified SSH host key for {address}: "
+            f"{removed.stderr.strip() or f'exit {removed.returncode}'}"
+        )
+    with SANDBOX_KNOWN_HOSTS.open("a") as known_hosts:
+        known_hosts.write("\n".join(keys) + "\n")
+    SANDBOX_KNOWN_HOSTS.chmod(0o600)
+    progress("ssh.host-key", f"pinned verified host key for {address}")
+
+
 def online_tailscale_hosts() -> set[str]:
     status = local_tailscale_status(timeout=3)
     if status is None:
@@ -1350,6 +1407,7 @@ async def complete_tailscale_enrollment(
     node_id, addresses = await verify_tailscale_enrollment(
         sb, profile, name, address, tailnet
     )
+    pin_verified_ssh_host_key(address)
     record_tailscale_enrollment(
         name,
         tailnet,
@@ -1866,7 +1924,7 @@ def ssh_options(profile: str) -> list[str]:
         "-o",
         "StrictHostKeyChecking=accept-new",
         "-o",
-        f"UserKnownHostsFile={HOME / '.ssh' / 'cua_known_hosts'}",
+        f"UserKnownHostsFile={SANDBOX_KNOWN_HOSTS}",
         "-o",
         "ConnectTimeout=10",
         "-o",
@@ -2003,7 +2061,6 @@ def copy_guest_file(name: str, profile: str, content: bytes, remote_path: str) -
         process = subprocess.Popen(
             [
                 "scp",
-                "-q",
                 *ssh_options(profile),
                 source.name,
                 f"cua@{name}:{target_path}",
