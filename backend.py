@@ -378,30 +378,39 @@ def get_execution_target(
 def set_execution_target(
     session_id: str, session_file: str, target: object
 ) -> dict[str, Any]:
-    if not session_id:
-        raise ValueError("set_execution_target requires session_id")
+    if not session_id and not session_file:
+        raise ValueError("set_execution_target requires session_id or session_file")
     if not isinstance(target, dict) or target.get("kind") not in {"local", "sandbox"}:
         raise ValueError("set_execution_target requires a valid target")
     resolved_file = (
         str(Path(session_file).expanduser().resolve()) if session_file else None
     )
+    target_json = json.dumps(target, separators=(",", ":"))
+    updated_at = datetime.now(timezone.utc).isoformat()
     with database() as connection:
-        connection.execute(
-            """
-            INSERT INTO execution_targets (session_id, session_file, target_json, updated_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(session_id) DO UPDATE SET
-                session_file = excluded.session_file,
-                target_json = excluded.target_json,
-                updated_at = excluded.updated_at
-            """,
-            (
-                session_id,
-                resolved_file,
-                json.dumps(target, separators=(",", ":")),
-                datetime.now(timezone.utc).isoformat(),
-            ),
-        )
+        if session_id:
+            connection.execute(
+                """
+                INSERT INTO execution_targets (session_id, session_file, target_json, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    session_file = excluded.session_file,
+                    target_json = excluded.target_json,
+                    updated_at = excluded.updated_at
+                """,
+                (session_id, resolved_file, target_json, updated_at),
+            )
+        else:
+            cursor = connection.execute(
+                """
+                UPDATE execution_targets
+                SET target_json = ?, updated_at = ?
+                WHERE session_file = ?
+                """,
+                (target_json, updated_at, resolved_file),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("saved execution target was not found")
     return {"target": target}
 
 

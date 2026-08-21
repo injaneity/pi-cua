@@ -21,3 +21,11 @@ export function shouldUseControllerTool(toolName, input) {
     isControllerClipboardImagePath(input.path)
   );
 }
+
+export function shouldHandoffExecutionTarget(reason) {
+  return reason === "new" || reason === "fork";
+}
+
+export function shouldCleanupExecutionTarget(reason) {
+  return reason !== "reload" && !shouldHandoffExecutionTarget(reason);
+}

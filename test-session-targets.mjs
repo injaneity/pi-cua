@@ -4,6 +4,8 @@ import assert from "node:assert/strict";
 import {
   isControllerClipboardImagePath,
   preferPickerItem,
+  shouldCleanupExecutionTarget,
+  shouldHandoffExecutionTarget,
   shouldUseControllerTool,
 } from "./session-targets.mjs";
 
@@ -55,5 +57,14 @@ assert.equal(
   }),
   false,
 );
+
+assert.equal(shouldHandoffExecutionTarget("new"), true);
+assert.equal(shouldHandoffExecutionTarget("fork"), true);
+assert.equal(shouldHandoffExecutionTarget("resume"), false);
+assert.equal(shouldCleanupExecutionTarget("new"), false);
+assert.equal(shouldCleanupExecutionTarget("fork"), false);
+assert.equal(shouldCleanupExecutionTarget("reload"), false);
+assert.equal(shouldCleanupExecutionTarget("resume"), true);
+assert.equal(shouldCleanupExecutionTarget("quit"), true);
 
 console.log("session target tests passed");

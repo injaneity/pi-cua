@@ -1054,9 +1054,12 @@ class ControllerStateTests(unittest.TestCase):
                 backend.set_execution_target("session-1", str(session_file), target)
                 by_id = backend.get_execution_target(session_id="session-1")
                 by_file = backend.get_execution_target(session_file=str(session_file))
+                backend.set_execution_target("", str(session_file), {"kind": "local"})
+                transferred = backend.get_execution_target(session_id="session-1")
 
             self.assertEqual(by_id["target"], target)
             self.assertEqual(by_file["target"], target)
+            self.assertEqual(transferred["target"], {"kind": "local"})
 
     def test_long_operation_submission_returns_without_running_inline(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

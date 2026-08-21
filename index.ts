@@ -15,7 +15,11 @@ import {
   visibleWidth,
 } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
-import { shouldUseControllerTool } from "./session-targets.mjs";
+import {
+  shouldCleanupExecutionTarget,
+  shouldHandoffExecutionTarget,
+  shouldUseControllerTool,
+} from "./session-targets.mjs";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { homedir } from "node:os";
@@ -663,23 +667,40 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
   async function loadTarget(
     ctx: UIContext,
     previousSessionFile?: string,
-  ): Promise<{ target: ExecutionTarget | undefined; persisted: boolean }> {
-    const sessionTarget = loadSessionTarget(ctx);
-    if (sessionTarget) return { target: sessionTarget, persisted: true };
+  ): Promise<{
+    target: ExecutionTarget | undefined;
+    persisted: boolean;
+    inherited: boolean;
+  }> {
     const current = await runBackend({
       action: "get_execution_target",
       session_id: ctx.sessionManager.getSessionId(),
-      session_file:
-        ctx.sessionManager.getSessionFile() ?? previousSessionFile ?? "",
+      session_file: ctx.sessionManager.getSessionFile() ?? "",
     });
-    const saved = parseTarget(current.target);
-    if (saved || !previousSessionFile)
-      return { target: saved, persisted: false };
-    const inherited = await runBackend({
+    if (current.target != null)
+      return {
+        target: parseTarget(current.target),
+        persisted: false,
+        inherited: false,
+      };
+    const sessionTarget = loadSessionTarget(ctx);
+    if (sessionTarget)
+      return {
+        target: sessionTarget,
+        persisted: true,
+        inherited: Boolean(previousSessionFile),
+      };
+    if (!previousSessionFile)
+      return { target: undefined, persisted: false, inherited: false };
+    const previous = await runBackend({
       action: "get_execution_target",
       session_file: previousSessionFile,
     });
-    return { target: parseTarget(inherited.target), persisted: false };
+    return {
+      target: parseTarget(previous.target),
+      persisted: false,
+      inherited: previous.target != null,
+    };
   }
 
   async function saveTarget(
@@ -1353,14 +1374,23 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
 
   pi.on("session_start", async (event, ctx) => {
     try {
-      if (event.reason === "new" || event.reason === "fork") {
-        await activate({ kind: "local" }, ctx);
-        return;
-      }
-      const loaded = await loadTarget(ctx);
+      const inheritPrevious = shouldHandoffExecutionTarget(event.reason);
+      const loaded = await loadTarget(
+        ctx,
+        inheritPrevious ? event.previousSessionFile : undefined,
+      );
       const saved = loaded.target;
       if (saved) {
-        await activate(saved, ctx, { persist: !loaded.persisted });
+        await activate(saved, ctx, {
+          persist: loaded.inherited || !loaded.persisted,
+        });
+        if (loaded.inherited && event.previousSessionFile) {
+          await runBackend({
+            action: "set_execution_target",
+            session_file: event.previousSessionFile,
+            target: { kind: "local" },
+          });
+        }
         return;
       }
       await activate({ kind: "local" }, ctx);
@@ -1408,7 +1438,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
   pi.on("session_shutdown", async (event, ctx) => {
     const source = target.kind === "sandbox" ? target : undefined;
     try {
-      if (source && event.reason !== "reload") {
+      if (source && shouldCleanupExecutionTarget(event.reason)) {
         await syncTargetToLocal(source);
         const local: ExecutionTarget = { kind: "local" };
         await saveTarget(local, ctx);
