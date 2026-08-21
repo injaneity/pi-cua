@@ -1159,6 +1159,8 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       pi.events.emit("cua:execution-target-changed", {
         ...next,
         state: "connecting",
+        phase: "connect.tools",
+        message: "starting remote tools",
       });
     }
     try {
