@@ -97,6 +97,10 @@ type BackendResult = {
   state?: string;
   remote_cwd?: string;
   workspace_state?: WorkspaceState;
+  additions?: number;
+  deletions?: number;
+  pending_sync?: boolean;
+  sync_safe?: boolean;
   target?: unknown;
 };
 type Destination =
@@ -577,6 +581,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
   let target: ExecutionTarget = { kind: "local" };
   let placementError: Error | undefined;
   let bridge: ToolBridge | undefined;
+  let workspaceDiffGeneration = 0;
   const proxiedTools = new Set<string>();
   const localToolDefinitions = new Map<string, AnyToolDefinition>();
   const toolPackages = new Set<string>();
@@ -1053,6 +1058,51 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     }
   }
 
+  async function refreshWorkspaceDiff(): Promise<void> {
+    const generation = ++workspaceDiffGeneration;
+    const active = target;
+    if (active.kind === "local") {
+      pi.events.emit("cua:workspace-diff-changed", { kind: "local" });
+      return;
+    }
+    try {
+      const result = await runBackend(
+        {
+          action: "workspace_diff_status",
+          source: {
+            address: active.address,
+            os: active.os,
+            remoteCwd: active.remoteCwd,
+            state: active.workspaceState,
+          },
+          local_cwd: active.localCwd,
+        },
+        new AbortController().signal,
+      );
+      if (
+        generation !== workspaceDiffGeneration ||
+        target.kind !== "sandbox" ||
+        target.name !== active.name ||
+        target.address !== active.address ||
+        typeof result.additions !== "number" ||
+        typeof result.deletions !== "number" ||
+        typeof result.pending_sync !== "boolean" ||
+        typeof result.sync_safe !== "boolean"
+      )
+        return;
+      pi.events.emit("cua:workspace-diff-changed", {
+        kind: "sandbox",
+        name: active.name,
+        additions: result.additions,
+        deletions: result.deletions,
+        pendingSync: result.pending_sync,
+        syncSafe: result.sync_safe,
+      });
+    } catch {
+      // A status refresh must not interrupt the active Pi session.
+    }
+  }
+
   function installProxies(): void {
     if (target.kind !== "sandbox") return;
     const active = pi.getActiveTools();
@@ -1127,6 +1177,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     if (next.kind === "sandbox") installProxies();
     ctx.ui.setStatus("cua-session", undefined);
     pi.events.emit("cua:execution-target-changed", next);
+    void refreshWorkspaceDiff();
   }
 
   pi.registerTool({
@@ -1278,6 +1329,10 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         "error",
       );
     }
+  });
+
+  pi.on("agent_settled", () => {
+    void refreshWorkspaceDiff();
   });
 
   pi.on("before_agent_start", async (event, ctx) => {

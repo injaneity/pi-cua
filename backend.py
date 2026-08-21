@@ -2314,6 +2314,74 @@ def capture_local_workspace(repository: WorkspaceRepository) -> WorkspaceTransfe
     )
 
 
+def parse_numstat(output: str) -> tuple[int, int]:
+    additions = 0
+    deletions = 0
+    for line in output.splitlines():
+        fields = line.split("\t", 2)
+        if len(fields) < 2:
+            continue
+        if fields[0].isdigit():
+            additions += int(fields[0])
+        if fields[1].isdigit():
+            deletions += int(fields[1])
+    return additions, deletions
+
+
+def remote_workspace_numstat(
+    name: str,
+    profile: str,
+    root: str,
+    before_tree: str,
+    after_tree: str,
+) -> tuple[int, int]:
+    if profile == "linux":
+        command = (
+            f"git -C {shlex.quote(root)} diff --numstat "
+            f"{before_tree} {after_tree} --"
+        )
+    else:
+        command = (
+            f"git -C {powershell_literal(root)} diff --numstat "
+            f"{before_tree} {after_tree} --"
+        )
+    result = run_guest_ssh(name, profile, command, timeout=60, report=False)
+    return parse_numstat(result.stdout)
+
+
+def workspace_diff_status(
+    source: SandboxWorkspaceSource, local_cwd: str
+) -> dict[str, Any]:
+    state = source["state"]
+    local_root = Path(state["localRoot"]).resolve()
+    requested_root = Path(
+        git_output(Path(local_cwd), "rev-parse", "--show-toplevel")
+    ).resolve()
+    if requested_root != local_root:
+        raise RuntimeError("local workspace path changed since sandbox activation")
+
+    _, local_tree = workspace_tree(local_root)
+    source_root, _ = workspace_location(
+        source["address"], source["os"], source["remoteCwd"]
+    )
+    final_tree = remote_workspace_tree(
+        source["address"], source["os"], source_root
+    )
+    additions, deletions = remote_workspace_numstat(
+        source["address"],
+        source["os"],
+        source_root,
+        state["commitTree"],
+        final_tree,
+    )
+    return {
+        "additions": additions,
+        "deletions": deletions,
+        "pending_sync": final_tree != state["baselineTree"],
+        "sync_safe": local_tree == state["baselineTree"],
+    }
+
+
 def capture_sandbox_delta(
     source: SandboxWorkspaceSource,
 ) -> tuple[str, bytes, str]:
@@ -2502,11 +2570,13 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         return operation_status(str(request.get("operation_id") or ""))
     if action == "operation_cancel":
         return cancel_operation(str(request.get("operation_id") or ""))
-    if action == "sync_workspace_to_local":
+    if action in {"sync_workspace_to_local", "workspace_diff_status"}:
         local_cwd = request.get("local_cwd")
         if not isinstance(local_cwd, str) or not local_cwd:
-            raise TypeError("sync_workspace_to_local requires local_cwd")
+            raise TypeError(f"{action} requires local_cwd")
         source = require_sandbox_source(request.get("source"))
+        if action == "workspace_diff_status":
+            return workspace_diff_status(source, local_cwd)
         return sync_workspace_to_local(source, local_cwd)
     configure_fleet_auth()
     if action == "create":
@@ -2545,7 +2615,7 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
             tuple(dict.fromkeys(tool_packages)),
         )
     raise ValueError(
-        "action must be list, create, ensure, delete, prepare_execution, get_execution_target, or set_execution_target"
+        "action must be list, create, ensure, delete, prepare_execution, workspace_diff_status, get_execution_target, or set_execution_target"
     )
 
 
@@ -2591,6 +2661,7 @@ def main() -> None:
             "get_execution_target",
             "set_execution_target",
             "operation_status",
+            "workspace_diff_status",
         }
         if not quiet_request:
             progress("request", "accepted", action=action, name=request.get("name"))
@@ -2600,6 +2671,7 @@ def main() -> None:
             "set_execution_target",
             "operation_status",
             "operation_cancel",
+            "workspace_diff_status",
         }
         if local_read:
             result = asyncio.run(dispatch(request))

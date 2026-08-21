@@ -403,6 +403,56 @@ class WorkspaceTests(unittest.TestCase):
             self.assertFalse((root / "untracked.txt").exists())
             self.assertEqual((root / "created.txt").read_text(), "sandbox created\n")
 
+    def test_parse_numstat_ignores_binary_files(self) -> None:
+        self.assertEqual(
+            backend.parse_numstat("12\t3\ttracked.txt\n-\t-\tbinary.bin\n4\t0\tnew.txt\n"),
+            (16, 3),
+        )
+
+    def test_workspace_diff_status_compares_remote_and_local_trees(self) -> None:
+        state = backend.WorkspaceState(
+            version=1,
+            localRoot="/local",
+            commit="a" * 40,
+            commitTree="1" * 40,
+            baselineTree="2" * 40,
+        )
+        source = backend.SandboxWorkspaceSource(
+            address="100.64.0.2",
+            os="linux",
+            remoteCwd="/workspace/subdir",
+            state=state,
+        )
+        with (
+            patch.object(backend, "git_output", return_value="/local"),
+            patch.object(backend, "workspace_tree", return_value=(Path("/local"), "3" * 40)),
+            patch.object(
+                backend,
+                "workspace_location",
+                return_value=("/workspace", "subdir"),
+            ),
+            patch.object(backend, "remote_workspace_tree", return_value="4" * 40),
+            patch.object(backend, "remote_workspace_numstat", return_value=(17, 5)) as stats,
+        ):
+            result = backend.workspace_diff_status(source, "/local")
+
+        self.assertEqual(
+            result,
+            {
+                "additions": 17,
+                "deletions": 5,
+                "pending_sync": True,
+                "sync_safe": False,
+            },
+        )
+        stats.assert_called_once_with(
+            "100.64.0.2",
+            "linux",
+            "/workspace",
+            "1" * 40,
+            "4" * 40,
+        )
+
     def test_empty_remote_patch_still_retains_and_verifies_the_tree(self) -> None:
         tree = "1" * 40
         with (
