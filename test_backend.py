@@ -889,6 +889,29 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
             "100.64.0.2", "linux", f"/home/cua/workspaces/{workspace_id}"
         )
 
+    async def test_prepare_dispatch_does_not_load_fleet_credentials(self) -> None:
+        with (
+            patch.object(backend, "configure_fleet_auth") as configure,
+            patch.object(
+                backend,
+                "prepare_execution",
+                AsyncMock(return_value={"remote_cwd": "/workspace"}),
+            ) as prepare,
+        ):
+            result = await backend.dispatch(
+                {
+                    "action": "prepare_execution",
+                    "name": "linux-1",
+                    "source_cwd": "/local",
+                    "workspace_id": "session-1",
+                    "tool_packages": [],
+                }
+            )
+
+        configure.assert_not_called()
+        prepare.assert_awaited_once()
+        self.assertEqual(result, {"remote_cwd": "/workspace"})
+
 
 class WindowsDesktopBrokerTests(unittest.TestCase):
     def test_preflight_uses_ssh_as_the_windows_transport_probe(self) -> None:

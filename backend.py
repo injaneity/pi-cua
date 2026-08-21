@@ -2669,7 +2669,8 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         if action == "workspace_diff_status":
             return workspace_diff_status(source, local_cwd)
         return sync_workspace_to_local(source, local_cwd)
-    configure_fleet_auth()
+    if action in CLOUD_ACTIONS:
+        configure_fleet_auth()
     if action == "create":
         return await create_one(
             str(request.get("os") or ""),
