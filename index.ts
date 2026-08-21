@@ -7,7 +7,13 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
-import { Editor, Key, matchesKey, SelectList } from "@earendil-works/pi-tui";
+import {
+  Editor,
+  Key,
+  matchesKey,
+  SelectList,
+  visibleWidth,
+} from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import { shouldUseControllerTool } from "./session-targets.mjs";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
@@ -783,6 +789,17 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
                     .toLowerCase()
                     .includes(normalized),
                 );
+                const primaryWidth =
+                  Math.max(
+                    1,
+                    ...filtered.map((option) =>
+                      visibleWidth(
+                        option.current
+                          ? `stay on ${option.label}`
+                          : option.label,
+                      ),
+                    ),
+                  ) + 4;
                 list = new SelectList(
                   filtered.map((option) => ({
                     value: option.value,
@@ -793,6 +810,10 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
                   })),
                   Math.max(1, Math.min(filtered.length, 5)),
                   listTheme,
+                  {
+                    minPrimaryColumnWidth: primaryWidth,
+                    maxPrimaryColumnWidth: primaryWidth,
+                  },
                 );
                 list.onSelect = (item) => done(item.value);
               };
@@ -844,9 +865,11 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     if (!ctx.hasUI) return undefined;
     const current = active?.kind === "sandbox" ? active.name : "local";
     const actions: DestinationSearchOption[] = [
-      { value: "current", label: current, current: true },
       ...(active?.kind === "sandbox"
-        ? [{ value: "local", label: "sync back to local directory" }]
+        ? [
+            { value: "current", label: current, current: true },
+            { value: "local", label: "sync back to local directory" },
+          ]
         : []),
       { value: "connect", label: "connect to an existing sandbox" },
       {
