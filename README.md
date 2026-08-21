@@ -33,13 +33,14 @@ custom images are available through the structured `cua_sandbox` create action's
 
 ## execution path
 
-1. the controller reuses a persistent ssh connection and takes a direct health fast path for an already bootstrapped sandbox; it contacts Fleet only for repair or bootstrap;
-2. it prepares the destination from the thread's local Git baseline, then applies the accumulated workspace delta from the active sandbox;
-3. the extension starts one non-tty ssh jsonl channel; linux runs `cua-tool-host.mjs` directly, while windows authenticates a loopback relay to a broker in the existing interactive desktop session;
-4. the host loads pi's normal remote tool registry and reports its protocol and tool manifest;
-5. calls, updates, results, errors, cancellation, and user shell output use that channel. `Esc` rejects the local request immediately and asks the host to kill the full remote command process tree.
+1. one ssh preflight checks machine health, free disk, the mutable guest-bundle digest, and repository-cache availability; the normal worker uses the controller's existing Python and contacts Fleet through a separate repair operation only when preflight fails;
+2. one content-addressed guest bundle updates extension files and routed-tool package settings when needed;
+3. one workspace command prepares an isolated clone from the shared object cache, then applies one direct Git tree patch from the source state to the final destination state;
+4. the extension starts one non-tty ssh jsonl channel; linux runs `cua-tool-host.mjs` directly, while windows authenticates a loopback relay to a broker in the existing interactive desktop session;
+5. the host loads pi's normal remote tool registry and reports its protocol and tool manifest;
+6. calls, updates, results, errors, cancellation, and user shell output use that channel. `Esc` rejects the local request immediately and asks the host to kill the full remote command process tree.
 
-all target changes use one workspace model: Pi records local and sandbox Git trees at sandbox entry, computes the accumulated binary tree diff when leaving a sandbox, verifies the destination baseline, and applies that diff. after a successful local sync or sandbox-to-sandbox handoff, it removes the source workspace, including ignored build outputs. graceful quit, new-session, resume, and fork shutdowns sync to local, persist local placement, and remove the remote workspace; reload keeps it because the same session immediately reconnects. local divergence, a patch conflict, or cleanup failure is reported explicitly, and a failed sync retains the remote workspace rather than deleting the only copy of changes.
+all target changes use one workspace model: Pi records local and sandbox Git trees at sandbox entry, computes one accumulated binary tree diff from the original commit to the source's final tree, verifies the destination tree, and applies that diff. after a successful local sync or sandbox-to-sandbox handoff, it removes the source workspace, including ignored build outputs. graceful quit, new-session, resume, and fork shutdowns sync to local, persist local placement, and remove the remote workspace; reload keeps it because the same session immediately reconnects. local divergence, a patch conflict, or cleanup failure is reported explicitly, and a failed sync retains the remote workspace rather than deleting the only copy of changes.
 
 ## state
 

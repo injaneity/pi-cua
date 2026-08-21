@@ -70,12 +70,20 @@ class OperationCancelled(RuntimeError):
     pass
 
 
+class SandboxRepairRequired(RuntimeError):
+    pass
+
+
 def cancel_worker(_signum: int, _frame: Any) -> None:
     raise OperationCancelled("operation cancelled")
 
 
-CLOUD_ACTIONS = {"create", "ensure", "delete", "prepare_execution"}
-LONG_ACTIONS = CLOUD_ACTIONS | {"sync_workspace_to_local", "cleanup_workspace"}
+CLOUD_ACTIONS = {"create", "ensure", "delete"}
+LONG_ACTIONS = CLOUD_ACTIONS | {
+    "prepare_execution",
+    "sync_workspace_to_local",
+    "cleanup_workspace",
+}
 FLEET_KEYCHAIN_SERVICE = "cua-sandbox-fleet-api"
 TAILSCALE_KEYCHAIN_SERVICE = "cua-sandbox-tailscale-oauth"
 TAILSCALE_TOKEN_URL = "https://api.tailscale.com/api/v2/oauth/token"
@@ -243,13 +251,25 @@ def bootstrap_digest(profile: str) -> str:
     return digest.hexdigest()[:20]
 
 
-def guest_config_digest() -> str:
-    """Hash mutable Pi files that can be synchronized without guest repair."""
+def guest_config_files(packages: tuple[str, ...] = ()) -> dict[str, bytes]:
+    files = remote_pi_files()
+    files[".pi/agent/settings.json"] = (
+        json.dumps({"packages": list(packages)}, indent=2).encode() + b"\n"
+    )
+    return files
+
+
+def config_digest(files: dict[str, bytes]) -> str:
     digest = hashlib.sha256()
-    for path, content in sorted(remote_pi_files().items()):
+    for path, content in sorted(files.items()):
         digest.update(path.encode())
         digest.update(content)
     return digest.hexdigest()[:20]
+
+
+def guest_config_digest(packages: tuple[str, ...] = ()) -> str:
+    """Hash mutable Pi files that can be synchronized without guest repair."""
+    return config_digest(guest_config_files(packages))
 
 
 def operation_locks(action: str) -> tuple[Path, ...]:
@@ -1364,7 +1384,7 @@ def guest_health_command(profile: str) -> str:
     return (
         "powershell.exe -NoProfile -Command \"if((Get-Content -ErrorAction SilentlyContinue C:\\ProgramData\\cua-pi\\bootstrap-version) -ne '"
         + expected_digest
-        + "'){exit 2}; if(-not (Test-Path C:\\ProgramData\\npm\\pi.cmd)){exit 3}; Write-Output healthy\""
+        + "'){exit 2}; if(-not (Test-Path C:\\ProgramData\\npm\\pi.cmd)){exit 3}; if((Get-Service sshd).Status -ne 'Running'){exit 4}; & 'C:\\Program Files\\Tailscale\\tailscale.exe' ip -4 | Select-Object -First 1\""
     )
 
 
@@ -1615,8 +1635,7 @@ class SandboxWorkspaceSource(TypedDict):
 @dataclass(frozen=True)
 class WorkspaceTransfer:
     state: WorkspaceState
-    baseline_patch: bytes
-    current_patch: bytes
+    patch: bytes
     final_tree: str
 
 
@@ -1853,7 +1872,6 @@ def remote_workspace_patch(
 def apply_workspace_patch(root: Path, patch: bytes, expected_tree: str) -> None:
     command = ["git", "-C", str(root), "apply", "--binary", "--whitespace=nowarn"]
     if patch:
-        subprocess.run([*command, "--check"], input=patch, check=True, timeout=300)
         subprocess.run(command, input=patch, check=True, timeout=300)
     _, actual_tree = workspace_tree(root)
     if actual_tree != expected_tree:
@@ -1886,14 +1904,11 @@ def apply_remote_workspace_patch(
         if profile == "linux":
             command = f"""set -eu
 trap 'rm -f {shlex.quote(remote_path)}' EXIT
-git -C {shlex.quote(root)} apply --binary --whitespace=nowarn --check {shlex.quote(remote_path)}
 git -C {shlex.quote(root)} apply --binary --whitespace=nowarn {shlex.quote(remote_path)}
 """
         else:
             command = f"""$ErrorActionPreference = 'Stop'
 try {{
-  git -C {powershell_literal(root)} apply --binary --whitespace=nowarn --check {powershell_literal(remote_path)}
-  if ($LASTEXITCODE -ne 0) {{ throw 'git apply check failed' }}
   git -C {powershell_literal(root)} apply --binary --whitespace=nowarn {powershell_literal(remote_path)}
   if ($LASTEXITCODE -ne 0) {{ throw 'git apply failed' }}
 }} finally {{
@@ -1971,22 +1986,78 @@ def ssh_options(profile: str) -> list[str]:
     return options
 
 
-def healthy_over_ssh(name: str, profile: str) -> str | None:
+@dataclass(frozen=True)
+class GuestPreflight:
+    address: str
+    free_bytes: int
+    config_matches: bool
+    repository_available: bool
+
+
+def guest_preflight(
+    name: str,
+    profile: str,
+    remote_url: str,
+    commit: str,
+    config_digest: str,
+) -> GuestPreflight | None:
+    repository_key = hashlib.sha256(remote_url.encode()).hexdigest()[:20]
+    if profile == "linux":
+        cache = f"/home/cua/.cache/cua-pi/git/{repository_key}.git"
+        command = f"""set -u
+address=$({guest_health_command(profile)}) || exit 20
+free_bytes=$(( $(df -Pk /home/cua | awk 'NR == 2 {{ print $4 }}') * 1024 ))
+config=$(cat /home/cua/.cua-pi/config-version 2>/dev/null || true)
+if git -C {shlex.quote(cache)} cat-file -e {shlex.quote(commit + "^{commit}")} 2>/dev/null || git ls-remote --exit-code {shlex.quote(remote_url)} HEAD >/dev/null 2>&1; then
+  repository=1
+else
+  repository=0
+fi
+printf '%s|%s|%s|%s\n' "$address" "$free_bytes" "$config" "$repository"
+"""
+    else:
+        cache = rf"C:\cua\cache\git\{repository_key}.git"
+        script = rf"""$expected = {powershell_literal(bootstrap_digest(profile))}
+if ((Get-Content -ErrorAction SilentlyContinue C:\ProgramData\cua-pi\bootstrap-version) -ne $expected) {{ exit 20 }}
+if (-not (Test-Path C:\ProgramData\npm\pi.cmd)) {{ exit 21 }}
+$free = [IO.DriveInfo]::new('C:\').AvailableFreeSpace
+$config = Get-Content -ErrorAction SilentlyContinue C:\Users\cua\.cua-pi\config-version
+$repository = 0
+git -C {powershell_literal(cache)} cat-file -e {powershell_literal(commit + "^{commit}")} 2>$null
+if ($LASTEXITCODE -eq 0) {{
+  $repository = 1
+}} else {{
+  git ls-remote --exit-code {powershell_literal(remote_url)} HEAD 2>$null | Out-Null
+  if ($LASTEXITCODE -eq 0) {{ $repository = 1 }}
+}}
+Write-Output "healthy|$free|$config|$repository"
+"""
+        encoded = base64.b64encode(script.encode("utf-16le")).decode()
+        command = f"powershell.exe -NoProfile -EncodedCommand {encoded}"
     try:
         result = run_guest_ssh(
-            name,
-            profile,
-            guest_health_command(profile),
-            timeout=15,
-            check=False,
-            report=False,
+            name, profile, command, timeout=60, check=False, report=False
         )
     except (OSError, RuntimeError):
         return None
-    lines = result.stdout.strip().splitlines() if result.returncode == 0 else []
-    if not lines:
+    if result.returncode != 0:
         return None
-    return name if profile == "windows" and lines[-1] == "healthy" else lines[-1]
+    fields = next(
+        (
+            candidate.split("|")
+            for candidate in reversed(result.stdout.strip().splitlines())
+            if candidate.count("|") == 3
+        ),
+        [],
+    )
+    if len(fields) != 4 or not fields[1].isdigit() or fields[3] not in {"0", "1"}:
+        return None
+    return GuestPreflight(
+        address=name if profile == "windows" else fields[0],
+        free_bytes=int(fields[1]),
+        config_matches=fields[2] == config_digest,
+        repository_available=fields[3] == "1",
+    )
 
 
 def run_guest_ssh(
@@ -2141,8 +2212,8 @@ def copy_guest_file(name: str, profile: str, content: bytes, remote_path: str) -
     progress(f"scp.{name}", f"uploaded {size} to {remote_path}")
 
 
-def guest_config_archive() -> tuple[bytes, str]:
-    files = remote_pi_files()
+def guest_config_archive(packages: tuple[str, ...] = ()) -> tuple[bytes, str]:
+    files = guest_config_files(packages)
     manifest = "".join(f"{path}\n" for path in sorted(files))
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
@@ -2156,23 +2227,13 @@ def guest_config_archive() -> tuple[bytes, str]:
         info.size = len(content)
         info.mode = 0o600
         archive.addfile(info, io.BytesIO(content))
-    return buffer.getvalue(), guest_config_digest()
+    return buffer.getvalue(), config_digest(files)
 
 
-def sync_guest_config(name: str, profile: str) -> None:
-    content, digest = guest_config_archive()
+def sync_guest_config(name: str, profile: str, content: bytes, digest: str) -> None:
     if profile == "linux":
         version_path = "/home/cua/.cua-pi/config-version"
         archive_path = f"/tmp/cua-pi-config-{digest}.tgz"
-        current = run_guest_ssh(
-            name,
-            profile,
-            f"cat {shlex.quote(version_path)} 2>/dev/null || true",
-            timeout=30,
-            report=False,
-        ).stdout.strip()
-        if current == digest:
-            return
         copy_guest_file(name, profile, content, archive_path)
         command = f"""set -eu
 mkdir -p /home/cua/.cua-pi
@@ -2189,14 +2250,6 @@ rm -f {shlex.quote(archive_path)}
     else:
         version_path = r"C:\Users\cua\.cua-pi\config-version"
         archive_path = rf"C:\Windows\Temp\cua-pi-config-{digest}.tgz"
-        command = rf"""$version = {powershell_literal(version_path)}
-if (Test-Path $version) {{ Get-Content $version }}
-"""
-        current = run_guest_ssh(
-            name, profile, command, timeout=30, report=False
-        ).stdout.strip()
-        if current == digest:
-            return
         copy_guest_file(name, profile, content, archive_path)
         command = rf"""$ErrorActionPreference = 'Stop'
 $cuaHome = 'C:\Users\cua'
@@ -2218,26 +2271,6 @@ Remove-Item -Force {powershell_literal(archive_path)}
     run_guest_ssh(name, profile, command, timeout=120)
 
 
-def sync_guest_packages(name: str, profile: str, packages: tuple[str, ...]) -> None:
-    settings = json.dumps({"packages": list(packages)}, indent=2).encode() + b"\n"
-    digest = hashlib.sha256(settings).hexdigest()
-    remote_path = (
-        "/home/cua/.pi/agent/settings.json"
-        if profile == "linux"
-        else r"C:\Users\cua\.pi\agent\settings.json"
-    )
-    command = (
-        f"sha256sum {shlex.quote(remote_path)} 2>/dev/null | cut -d' ' -f1"
-        if profile == "linux"
-        else rf"if (Test-Path {powershell_literal(remote_path)}) {{ (Get-FileHash -Algorithm SHA256 {powershell_literal(remote_path)}).Hash.ToLowerInvariant() }}"
-    )
-    current = run_guest_ssh(
-        name, profile, command, timeout=30, report=False
-    ).stdout.strip()
-    if current != digest:
-        copy_guest_file(name, profile, settings, remote_path)
-
-
 def git_snapshot(root: Path, commit: str) -> bytes:
     return subprocess.run(
         ["git", "-C", str(root), "archive", "--format=tar.gz", commit],
@@ -2247,26 +2280,13 @@ def git_snapshot(root: Path, commit: str) -> bytes:
     ).stdout
 
 
-def guest_repository_available(
-    name: str, profile: str, cache: str, remote_url: str, commit: str
-) -> bool:
-    command = (
-        f"git -C {shlex.quote(cache)} cat-file -e {shlex.quote(commit + '^{commit}')} 2>/dev/null || git ls-remote --exit-code {shlex.quote(remote_url)} HEAD >/dev/null"
-        if profile == "linux"
-        else f"git -C {powershell_literal(cache)} cat-file -e '{commit}^{{commit}}' 2>$null; if ($LASTEXITCODE -ne 0) {{ git ls-remote --exit-code {powershell_literal(remote_url)} HEAD | Out-Null; if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }} }}"
-    )
-    try:
-        run_guest_ssh(name, profile, command, timeout=60)
-        return True
-    except RuntimeError:
-        return False
-
-
 async def prepare_workspace(
     name: str,
     profile: str,
     source: WorkspaceRepository,
     workspace_id: str,
+    *,
+    repository_available: bool,
 ) -> str:
     progress(f"workspace.{name}.baseline", f"preparing {source.root}")
     repository_key = hashlib.sha256(source.remote_url.encode()).hexdigest()[:20]
@@ -2274,10 +2294,7 @@ async def prepare_workspace(
         workspace_root = f"/home/cua/workspaces/{workspace_id}"
         repository_cache = f"/home/cua/.cache/cua-pi/git/{repository_key}.git"
         snapshot_path = f"/tmp/cua-snapshot-{workspace_id}.tgz"
-        use_remote = guest_repository_available(
-            name, profile, repository_cache, source.remote_url, source.commit
-        )
-        if not use_remote:
+        if not repository_available:
             progress(
                 f"workspace.{name}.snapshot",
                 "origin is unavailable; sending a local commit snapshot",
@@ -2319,12 +2336,7 @@ fi
 rm -f {shlex.quote(snapshot_path)}"""
         command = f"""set -eu
 mkdir -p /home/cua/workspaces /home/cua/.cache/cua-pi/git
-available_kib=$(df -Pk /home/cua | awk 'NR == 2 {{ print $4 }}')
-if [ "$available_kib" -lt 1048576 ]; then
-  echo "workspace setup requires 1 GiB free; only $((available_kib / 1024)) MiB is available" >&2
-  exit 28
-fi
-{remote_setup if use_remote else snapshot_setup}
+{remote_setup if repository_available else snapshot_setup}
 """
         run_guest_ssh(
             name,
@@ -2341,10 +2353,7 @@ fi
     workspace_root = rf"C:\cua\workspaces\{workspace_id}"
     repository_cache = rf"C:\cua\cache\git\{repository_key}.git"
     snapshot_path = rf"C:\Windows\Temp\cua-snapshot-{workspace_id}.tgz"
-    use_remote = guest_repository_available(
-        name, profile, repository_cache, source.remote_url, source.commit
-    )
-    if not use_remote:
+    if not repository_available:
         progress(
             f"workspace.{name}.snapshot",
             "origin is unavailable; sending a local commit snapshot",
@@ -2386,9 +2395,7 @@ function Test-GitCommit([string]$Repository, [string]$Commit) {{
 $root = {powershell_literal(workspace_root)}
 $cache = {powershell_literal(repository_cache)}
 New-Item -ItemType Directory -Force -Path 'C:\\cua\\workspaces','C:\\cua\\cache\\git' | Out-Null
-$available = [IO.DriveInfo]::new('C:\').AvailableFreeSpace
-if ($available -lt 1GB) {{ throw "workspace setup requires 1 GiB free; only $([math]::Floor($available / 1MB)) MiB is available" }}
-{remote_setup if use_remote else snapshot_setup}
+{remote_setup if repository_available else snapshot_setup}
 """
     encoded_script = base64.b64encode(script.encode("utf-16le")).decode()
     run_guest_ssh(
@@ -2454,8 +2461,7 @@ def capture_local_workspace(repository: WorkspaceRepository) -> WorkspaceTransfe
     )
     return WorkspaceTransfer(
         state=state,
-        baseline_patch=workspace_patch(local_root, commit_tree, baseline_tree),
-        current_patch=b"",
+        patch=workspace_patch(local_root, commit_tree, baseline_tree),
         final_tree=baseline_tree,
     )
 
@@ -2545,17 +2551,19 @@ def capture_sandbox_delta(
 
 def capture_sandbox_workspace(source: SandboxWorkspaceSource) -> WorkspaceTransfer:
     state = source["state"]
-    source_root, current_patch, final_tree = capture_sandbox_delta(source)
+    source_root, _ = workspace_location(
+        source["address"], source["os"], source["remoteCwd"]
+    )
+    final_tree = remote_workspace_tree(source["address"], source["os"], source_root)
     return WorkspaceTransfer(
         state=state,
-        baseline_patch=remote_workspace_patch(
+        patch=remote_workspace_patch(
             source["address"],
             source["os"],
             source_root,
             state["commitTree"],
-            state["baselineTree"],
+            final_tree,
         ),
-        current_patch=current_patch,
         final_tree=final_tree,
     )
 
@@ -2567,30 +2575,18 @@ def restore_sandbox_workspace(
     transfer: WorkspaceTransfer,
     reference: str,
 ) -> None:
-    state = transfer.state
-    if transfer.baseline_patch:
+    if transfer.patch:
+        progress("workspace.destination.apply", "applying workspace changes")
         apply_remote_workspace_patch(
             name,
             profile,
             root,
-            transfer.baseline_patch,
-            state["baselineTree"],
+            transfer.patch,
+            transfer.final_tree,
             reference=f"{reference}/workspace",
         )
-    elif state["baselineTree"] != state["commitTree"]:
-        raise RuntimeError("empty baseline patch does not match the Git baseline")
-
-    if transfer.current_patch:
-        progress("workspace.destination.apply", "applying current workspace changes")
-        apply_remote_workspace_patch(
-            name,
-            profile,
-            root,
-            transfer.current_patch,
-            transfer.final_tree,
-        )
-    elif transfer.final_tree != state["baselineTree"]:
-        raise RuntimeError("empty current patch does not match the workspace baseline")
+    elif transfer.final_tree != transfer.state["commitTree"]:
+        raise RuntimeError("empty workspace patch does not match the Git baseline")
 
 
 def sync_workspace_to_local(
@@ -2650,26 +2646,21 @@ async def prepare_execution(
             remote_url=repository.remote_url,
             commit=transfer.state["commit"],
         )
-    address = healthy_over_ssh(states[name].get("address") or name, profile)
-    if address is None:
-        tailnet = local_tailscale_identity()
-        restore_cua_state(name)
-        sb = await connect_sandbox(name)
-        try:
-            address = await healthy(sb, profile)
-            if address is None:
-                address = await (
-                    bootstrap_linux(sb, name, tailnet)
-                    if profile == "linux"
-                    else bootstrap_windows(sb, name, tailnet)
-                )
-            await complete_tailscale_enrollment(sb, profile, name, address, tailnet)
-        finally:
-            await disconnect_safely(sb)
+    config_archive, config_digest = guest_config_archive(tool_packages)
+    candidate = states[name].get("address") or name
+    progress("sandbox.preflight", "checking health, configuration, disk, and cache")
+    preflight = guest_preflight(
+        candidate,
+        profile,
+        repository.remote_url,
+        repository.commit,
+        config_digest,
+    )
+    if preflight is None:
+        raise SandboxRepairRequired(f"sandbox repair required: {name}")
 
+    address = preflight.address
     reference = hashlib.sha256(workspace_key.encode()).hexdigest()[:32]
-    sync_guest_config(address, profile)
-    sync_guest_packages(address, profile, tool_packages)
     workspace_id = hashlib.sha256(workspace_key.encode()).hexdigest()[:16]
     workspace_root = (
         f"/home/cua/workspaces/{workspace_id}"
@@ -2677,11 +2668,19 @@ async def prepare_execution(
         else rf"C:\cua\workspaces\{workspace_id}"
     )
     try:
+        if preflight.free_bytes < 1024**3:
+            raise RuntimeError(
+                "workspace setup requires 1 GiB free; "
+                f"only {preflight.free_bytes // 1048576} MiB is available"
+            )
+        if not preflight.config_matches:
+            sync_guest_config(address, profile, config_archive, config_digest)
         remote_cwd = await prepare_workspace(
             address,
             profile,
             repository,
             workspace_id,
+            repository_available=preflight.repository_available,
         )
         progress("workspace.baseline", "reconstructing the destination workspace")
         restore_sandbox_workspace(address, profile, workspace_root, transfer, reference)

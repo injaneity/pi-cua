@@ -339,6 +339,32 @@ class WorkspaceTests(unittest.TestCase):
             self.assertEqual(backend.bootstrap_digest("linux"), first_bootstrap)
             self.assertNotEqual(backend.guest_config_digest(), first_config)
 
+    def test_linux_preflight_combines_health_config_disk_and_repository(self) -> None:
+        with patch.object(
+            backend,
+            "run_guest_ssh",
+            return_value=subprocess.CompletedProcess(
+                [], 0, "100.64.0.2|1073741824|cccc|1\n", ""
+            ),
+        ) as run:
+            result = backend.guest_preflight(
+                "linux-1",
+                "linux",
+                "https://example.com/repo.git",
+                "a" * 40,
+                "cccc",
+            )
+
+        self.assertEqual(
+            result,
+            backend.GuestPreflight("100.64.0.2", 1073741824, True, True),
+        )
+        command = run.call_args.args[2]
+        self.assertIn("bootstrap-version", command)
+        self.assertIn("config-version", command)
+        self.assertIn("df -Pk", command)
+        self.assertIn("git ls-remote", command)
+
     def test_remote_config_archive_has_a_managed_file_manifest(self) -> None:
         with patch.object(
             backend,
@@ -355,7 +381,11 @@ class WorkspaceTests(unittest.TestCase):
             )
             self.assertEqual(
                 archive.extractfile(".cua-pi/config-files.new").read(),
-                b".pi/agent/example.ts\n",
+                b".pi/agent/example.ts\n.pi/agent/settings.json\n",
+            )
+            self.assertEqual(
+                json.loads(archive.extractfile(".pi/agent/settings.json").read()),
+                {"packages": []},
             )
 
     def test_remote_config_includes_generic_tool_host(self) -> None:
@@ -371,20 +401,15 @@ class WorkspaceTests(unittest.TestCase):
         self.assertNotIn(".pi/agent/settings.json", files)
 
     def test_windows_guest_config_sync_replaces_only_managed_files(self) -> None:
-        responses = [
-            subprocess.CompletedProcess([], 0, "", ""),
-            subprocess.CompletedProcess([], 0, "", ""),
-        ]
         with (
+            patch.object(backend, "copy_guest_file") as copy,
             patch.object(
                 backend,
-                "guest_config_archive",
-                return_value=(b"archive", "1" * 20),
-            ),
-            patch.object(backend, "copy_guest_file") as copy,
-            patch.object(backend, "run_guest_ssh", side_effect=responses) as run,
+                "run_guest_ssh",
+                return_value=subprocess.CompletedProcess([], 0, "", ""),
+            ) as run,
         ):
-            backend.sync_guest_config("windows-1", "windows")
+            backend.sync_guest_config("windows-1", "windows", b"archive", "1" * 20)
 
         copy.assert_called_once_with(
             "windows-1",
@@ -392,44 +417,27 @@ class WorkspaceTests(unittest.TestCase):
             b"archive",
             r"C:\Windows\Temp\cua-pi-config-11111111111111111111.tgz",
         )
-        script = run.call_args_list[1].args[2]
+        script = run.call_args.args[2]
         self.assertIn("StartsWith('.pi/agent/')", script)
         self.assertIn("tar.exe -xzf", script)
         self.assertIn("config-version", script)
 
-    def test_guest_settings_contain_only_requested_tool_packages(self) -> None:
-        with (
-            patch.object(backend, "copy_guest_file") as copy,
-            patch.object(
-                backend,
-                "run_guest_ssh",
-                return_value=subprocess.CompletedProcess([], 0, "", ""),
-            ),
-        ):
-            backend.sync_guest_packages(
-                "linux-1",
-                "linux",
-                ("git:github.com/example/tool-package",),
-            )
-        content = copy.call_args.args[2]
+    def test_guest_bundle_contains_only_requested_tool_packages(self) -> None:
+        content, _ = backend.guest_config_archive(
+            ("git:github.com/example/tool-package",)
+        )
+        with tarfile.open(fileobj=io.BytesIO(content), mode="r:gz") as archive:
+            settings = json.loads(archive.extractfile(".pi/agent/settings.json").read())
         self.assertEqual(
-            json.loads(content),
+            settings,
             {"packages": ["git:github.com/example/tool-package"]},
         )
 
-    def test_guest_settings_skip_an_unchanged_remote_file(self) -> None:
-        settings = json.dumps({"packages": []}, indent=2).encode() + b"\n"
-        digest = hashlib.sha256(settings).hexdigest()
-        with (
-            patch.object(backend, "copy_guest_file") as copy,
-            patch.object(
-                backend,
-                "run_guest_ssh",
-                return_value=subprocess.CompletedProcess([], 0, digest, ""),
-            ),
-        ):
-            backend.sync_guest_packages("linux-1", "linux", ())
-        copy.assert_not_called()
+    def test_guest_bundle_digest_includes_tool_packages(self) -> None:
+        self.assertNotEqual(
+            backend.guest_config_digest(()),
+            backend.guest_config_digest(("git:github.com/example/tool-package",)),
+        )
 
     def test_bundle_describes_only_the_clean_git_baseline(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -627,9 +635,7 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         self.repository = backend.WorkspaceRepository(
             Path("/local"), Path("."), "https://example.com/repo.git", "a" * 40
         )
-        self.transfer = backend.WorkspaceTransfer(
-            self.state, b"baseline", b"current", "3" * 40
-        )
+        self.transfer = backend.WorkspaceTransfer(self.state, b"final", "3" * 40)
 
     def test_local_capture_builds_one_verified_transfer(self) -> None:
         with (
@@ -646,42 +652,41 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
             transfer = backend.capture_local_workspace(self.repository)
 
         self.assertEqual(transfer.state, self.state)
-        self.assertEqual(transfer.baseline_patch, b"baseline")
-        self.assertEqual(transfer.current_patch, b"")
+        self.assertEqual(transfer.patch, b"baseline")
         self.assertEqual(transfer.final_tree, self.state["baselineTree"])
         workspace_patch.assert_called_once_with(
             Path("/local"), self.state["commitTree"], self.state["baselineTree"]
         )
 
-    def test_sandbox_capture_builds_baseline_and_current_patches(self) -> None:
+    def test_sandbox_capture_builds_one_final_tree_patch(self) -> None:
         with (
             patch.object(backend, "workspace_location", return_value=("/source", ".")),
             patch.object(backend, "remote_workspace_tree", return_value="3" * 40),
             patch.object(
-                backend,
-                "remote_workspace_patch",
-                side_effect=[b"current", b"baseline"],
+                backend, "remote_workspace_patch", return_value=b"final"
             ) as workspace_patch,
         ):
             transfer = backend.capture_sandbox_workspace(self.source)
 
-        self.assertEqual(transfer.baseline_patch, b"baseline")
-        self.assertEqual(transfer.current_patch, b"current")
+        self.assertEqual(transfer.patch, b"final")
         self.assertEqual(transfer.final_tree, "3" * 40)
-        self.assertEqual(workspace_patch.call_count, 2)
+        workspace_patch.assert_called_once_with(
+            "100.64.0.1", "linux", "/source", "1" * 40, "3" * 40
+        )
 
-    def test_restore_applies_only_nonempty_baseline_and_current_patches(self) -> None:
+    def test_restore_applies_one_final_tree_patch(self) -> None:
         with patch.object(backend, "apply_remote_workspace_patch") as apply_patch:
             backend.restore_sandbox_workspace(
                 "100.64.0.2", "windows", r"C:\workspace", self.transfer, "session"
             )
 
-        self.assertEqual(
-            [call.args[3] for call in apply_patch.call_args_list],
-            [b"baseline", b"current"],
-        )
-        self.assertEqual(
-            apply_patch.call_args_list[0].kwargs["reference"], "session/workspace"
+        apply_patch.assert_called_once_with(
+            "100.64.0.2",
+            "windows",
+            r"C:\workspace",
+            b"final",
+            "3" * 40,
+            reference="session/workspace",
         )
 
     def test_restore_clean_workspace_requires_no_remote_snapshot_or_patch(self) -> None:
@@ -692,18 +697,18 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
             commitTree="1" * 40,
             baselineTree="1" * 40,
         )
-        transfer = backend.WorkspaceTransfer(state, b"", b"", "1" * 40)
+        transfer = backend.WorkspaceTransfer(state, b"", "1" * 40)
         with patch.object(backend, "apply_remote_workspace_patch") as apply_patch:
             backend.restore_sandbox_workspace(
                 "100.64.0.2", "linux", "/workspace", transfer, "session"
             )
         apply_patch.assert_not_called()
 
-    def test_restore_rejects_an_empty_inconsistent_baseline_patch(self) -> None:
-        transfer = backend.WorkspaceTransfer(self.state, b"", b"", "2" * 40)
+    def test_restore_rejects_an_empty_inconsistent_workspace_patch(self) -> None:
+        transfer = backend.WorkspaceTransfer(self.state, b"", "2" * 40)
         with (
             patch.object(backend, "apply_remote_workspace_patch") as apply_patch,
-            self.assertRaisesRegex(RuntimeError, "empty baseline patch"),
+            self.assertRaisesRegex(RuntimeError, "empty workspace patch"),
         ):
             backend.restore_sandbox_workspace(
                 "100.64.0.2", "linux", "/workspace", transfer, "session"
@@ -711,12 +716,13 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         apply_patch.assert_not_called()
 
     async def test_linux_workspace_borrows_from_the_shared_object_cache(self) -> None:
-        with (
-            patch.object(backend, "guest_repository_available", return_value=True),
-            patch.object(backend, "run_guest_ssh") as run,
-        ):
+        with patch.object(backend, "run_guest_ssh") as run:
             await backend.prepare_workspace(
-                "100.64.0.2", "linux", self.repository, "session"
+                "100.64.0.2",
+                "linux",
+                self.repository,
+                "session",
+                repository_available=True,
             )
 
         command = run.call_args.args[2]
@@ -725,12 +731,13 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("--dissociate", command)
 
     async def test_windows_workspace_fetches_a_missing_cached_commit(self) -> None:
-        with (
-            patch.object(backend, "guest_repository_available", return_value=True),
-            patch.object(backend, "run_guest_ssh") as run,
-        ):
+        with patch.object(backend, "run_guest_ssh") as run:
             await backend.prepare_workspace(
-                "100.64.0.2", "windows", self.repository, "session"
+                "100.64.0.2",
+                "windows",
+                self.repository,
+                "session",
+                repository_available=True,
             )
 
         encoded = run.call_args.args[2].rsplit(" ", 1)[-1]
@@ -746,7 +753,8 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("git -C $cache cat-file -e", script.split("$root =", 1)[1])
 
     async def test_prepare_execution_connects_capture_prepare_and_restore(self) -> None:
-        transfer = backend.WorkspaceTransfer(self.state, b"baseline", b"", "2" * 40)
+        transfer = backend.WorkspaceTransfer(self.state, b"final", "2" * 40)
+        preflight = backend.GuestPreflight("100.64.0.2", 2**30, True, True)
         with (
             patch.object(
                 backend,
@@ -755,15 +763,13 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch.object(backend, "inspect_workspace", return_value=self.repository),
             patch.object(backend, "capture_sandbox_workspace", return_value=transfer),
-            patch.object(backend, "healthy_over_ssh", return_value="100.64.0.2"),
-            patch.object(backend, "sync_guest_config"),
-            patch.object(backend, "sync_guest_packages"),
+            patch.object(backend, "guest_preflight", return_value=preflight),
+            patch.object(backend, "sync_guest_config") as sync_config,
             patch.object(
                 backend,
                 "prepare_workspace",
                 AsyncMock(return_value="/remote/workspace"),
             ) as prepare,
-            patch.object(backend, "workspace_location", return_value=("/remote", ".")),
             patch.object(backend, "restore_sandbox_workspace") as restore,
         ):
             result = await backend.prepare_execution(
@@ -772,10 +778,14 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["workspace_state"], self.state)
         self.assertEqual(prepare.await_args.args[2].commit, self.state["commit"])
+        self.assertTrue(prepare.await_args.kwargs["repository_available"])
+        sync_config.assert_not_called()
         restore.assert_called_once()
 
-    async def test_prepare_execution_removes_an_incomplete_destination(self) -> None:
-        transfer = backend.WorkspaceTransfer(self.state, b"baseline", b"", "2" * 40)
+    async def test_prepare_execution_requests_repair_without_loading_the_sdk(
+        self,
+    ) -> None:
+        transfer = backend.WorkspaceTransfer(self.state, b"final", "2" * 40)
         with (
             patch.object(
                 backend,
@@ -784,9 +794,84 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch.object(backend, "inspect_workspace", return_value=self.repository),
             patch.object(backend, "capture_sandbox_workspace", return_value=transfer),
-            patch.object(backend, "healthy_over_ssh", return_value="100.64.0.2"),
-            patch.object(backend, "sync_guest_config"),
-            patch.object(backend, "sync_guest_packages"),
+            patch.object(backend, "guest_preflight", return_value=None),
+            patch.object(backend, "connect_sandbox") as connect,
+            self.assertRaisesRegex(
+                backend.SandboxRepairRequired, "sandbox repair required"
+            ),
+        ):
+            await backend.prepare_execution(
+                "linux-1", "/local", "session-1", self.source
+            )
+        connect.assert_not_called()
+
+    async def test_prepare_execution_syncs_one_mismatched_guest_bundle(self) -> None:
+        transfer = backend.WorkspaceTransfer(self.state, b"final", "2" * 40)
+        preflight = backend.GuestPreflight("100.64.0.2", 2**30, False, True)
+        with (
+            patch.object(
+                backend,
+                "local_states",
+                return_value=[{"name": "linux-1", "os": "linux"}],
+            ),
+            patch.object(backend, "inspect_workspace", return_value=self.repository),
+            patch.object(backend, "capture_sandbox_workspace", return_value=transfer),
+            patch.object(backend, "guest_preflight", return_value=preflight),
+            patch.object(
+                backend,
+                "guest_config_archive",
+                return_value=(b"bundle", "c" * 20),
+            ),
+            patch.object(backend, "sync_guest_config") as sync_config,
+            patch.object(
+                backend,
+                "prepare_workspace",
+                AsyncMock(return_value="/remote/workspace"),
+            ),
+            patch.object(backend, "restore_sandbox_workspace"),
+        ):
+            await backend.prepare_execution(
+                "linux-1", "/local", "session-1", self.source
+            )
+        sync_config.assert_called_once_with("100.64.0.2", "linux", b"bundle", "c" * 20)
+
+    async def test_prepare_execution_cleans_up_after_low_disk_preflight(self) -> None:
+        transfer = backend.WorkspaceTransfer(self.state, b"final", "2" * 40)
+        preflight = backend.GuestPreflight("100.64.0.2", 512 * 1024**2, True, True)
+        with (
+            patch.object(
+                backend,
+                "local_states",
+                return_value=[{"name": "linux-1", "os": "linux"}],
+            ),
+            patch.object(backend, "inspect_workspace", return_value=self.repository),
+            patch.object(backend, "capture_sandbox_workspace", return_value=transfer),
+            patch.object(backend, "guest_preflight", return_value=preflight),
+            patch.object(backend, "prepare_workspace") as prepare,
+            patch.object(backend, "cleanup_workspace_root") as cleanup,
+            self.assertRaisesRegex(RuntimeError, "requires 1 GiB free"),
+        ):
+            await backend.prepare_execution(
+                "linux-1", "/local", "session-1", self.source
+            )
+        prepare.assert_not_called()
+        workspace_id = hashlib.sha256(b"session-1").hexdigest()[:16]
+        cleanup.assert_called_once_with(
+            "100.64.0.2", "linux", f"/home/cua/workspaces/{workspace_id}"
+        )
+
+    async def test_prepare_execution_removes_an_incomplete_destination(self) -> None:
+        transfer = backend.WorkspaceTransfer(self.state, b"final", "2" * 40)
+        preflight = backend.GuestPreflight("100.64.0.2", 2**30, True, True)
+        with (
+            patch.object(
+                backend,
+                "local_states",
+                return_value=[{"name": "linux-1", "os": "linux"}],
+            ),
+            patch.object(backend, "inspect_workspace", return_value=self.repository),
+            patch.object(backend, "capture_sandbox_workspace", return_value=transfer),
+            patch.object(backend, "guest_preflight", return_value=preflight),
             patch.object(
                 backend,
                 "prepare_workspace",
@@ -806,20 +891,33 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class WindowsDesktopBrokerTests(unittest.TestCase):
-    def test_ssh_health_uses_the_connection_as_the_transport_probe(self) -> None:
-        command = backend.guest_health_command("windows")
-        self.assertIn("Write-Output healthy", command)
-        self.assertNotIn("Get-Service", command)
-        self.assertNotIn("tailscale.exe", command)
-
-        with patch.object(
-            backend,
-            "run_guest_ssh",
-            return_value=subprocess.CompletedProcess([], 0, "healthy\n", ""),
+    def test_preflight_uses_ssh_as_the_windows_transport_probe(self) -> None:
+        with (
+            patch.object(backend, "bootstrap_digest", return_value="b" * 20),
+            patch.object(
+                backend,
+                "run_guest_ssh",
+                return_value=subprocess.CompletedProcess(
+                    [], 0, "healthy|1073741824|cccc|1\n", ""
+                ),
+            ) as run,
         ):
-            self.assertEqual(
-                backend.healthy_over_ssh("100.64.0.2", "windows"), "100.64.0.2"
+            result = backend.guest_preflight(
+                "100.64.0.2",
+                "windows",
+                "https://example.com/repo.git",
+                "a" * 40,
+                "cccc",
             )
+
+        self.assertEqual(
+            result,
+            backend.GuestPreflight("100.64.0.2", 1073741824, True, True),
+        )
+        encoded = run.call_args.args[2].rsplit(" ", 1)[-1]
+        script = backend.base64.b64decode(encoded).decode("utf-16le")
+        self.assertNotIn("Get-Service", script)
+        self.assertNotIn("tailscale.exe", script)
 
     def test_bootstrap_registers_an_interactive_logon_task(self) -> None:
         script = backend.bootstrap_template("windows")
@@ -995,7 +1093,11 @@ class ControllerStateTests(unittest.TestCase):
             self.assertIn("cua-sandbox==0.4.2", popen.call_args.args[0])
 
     def test_local_workers_use_the_current_python(self) -> None:
-        for action in ("sync_workspace_to_local", "cleanup_workspace"):
+        for action in (
+            "prepare_execution",
+            "sync_workspace_to_local",
+            "cleanup_workspace",
+        ):
             with self.subTest(action=action):
                 command = backend.worker_command({"action": action})
                 self.assertEqual(command[0], backend.sys.executable)

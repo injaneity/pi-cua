@@ -1001,42 +1001,51 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       ...destination,
       state: "connecting",
     });
-    try {
-      const result = await runBackend(
-        {
-          action: "prepare_execution",
-          name: destination.name,
-          source_cwd: ctx.cwd,
-          workspace_id: ctx.sessionManager.getSessionId(),
-          tool_packages: [...toolPackages],
-          source:
-            inheritWorkspace && target.kind === "sandbox"
-              ? {
-                  address: target.address,
-                  os: target.os,
-                  remoteCwd: target.remoteCwd,
-                  state: target.workspaceState,
-                }
-              : undefined,
-        },
-        ctx.signal,
-        (status) => {
-          ctx.ui.setStatus(
-            "cua-session",
-            formatSandboxProgress(
-              destination.name,
-              status.phase,
-              status.message,
-            ),
-          );
-          pi.events.emit("cua:execution-target-changed", {
-            ...destination,
-            state: "connecting",
-            phase: status.phase,
-            message: status.message,
-          });
-        },
+    const request = {
+      action: "prepare_execution",
+      name: destination.name,
+      source_cwd: ctx.cwd,
+      workspace_id: ctx.sessionManager.getSessionId(),
+      tool_packages: [...toolPackages],
+      source:
+        inheritWorkspace && target.kind === "sandbox"
+          ? {
+              address: target.address,
+              os: target.os,
+              remoteCwd: target.remoteCwd,
+              state: target.workspaceState,
+            }
+          : undefined,
+    };
+    const onStatus = (status: BackendResult) => {
+      ctx.ui.setStatus(
+        "cua-session",
+        formatSandboxProgress(destination.name, status.phase, status.message),
       );
+      pi.events.emit("cua:execution-target-changed", {
+        ...destination,
+        state: "connecting",
+        phase: status.phase,
+        message: status.message,
+      });
+    };
+    try {
+      let result: BackendResult;
+      try {
+        result = await runBackend(request, ctx.signal, onStatus);
+      } catch (error) {
+        if (
+          !(error instanceof Error) ||
+          !error.message.includes("sandbox repair required:")
+        )
+          throw error;
+        await runBackend(
+          { action: "ensure", name: destination.name },
+          ctx.signal,
+          onStatus,
+        );
+        result = await runBackend(request, ctx.signal, onStatus);
+      }
       if (
         typeof result.remote_cwd !== "string" ||
         typeof result.address !== "string" ||
