@@ -1,5 +1,4 @@
 import {
-  DynamicBorder,
   type AgentToolResult,
   type BashOperations,
   type ExtensionAPI,
@@ -9,13 +8,13 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
-  Container,
+  Editor,
+  Key,
+  matchesKey,
   SelectList,
-  type SelectItem,
-  Text,
+  visibleWidth,
 } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
-import { preferPickerItem } from "./session-targets.mjs";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { homedir } from "node:os";
@@ -113,7 +112,6 @@ type ExecutionTarget =
       workspaceState: WorkspaceState;
     };
 type UIContext = ExtensionContext | ExtensionCommandContext;
-type PickerItem = SelectItem & { value: string };
 
 function formatSandboxProgress(
   name: string,
@@ -124,10 +122,7 @@ function formatSandboxProgress(
     return `${name} (waiting for another sandbox operation)`;
 
   let activity = "connecting";
-  if (
-    phase?.startsWith("bootstrap.") ||
-    phase?.startsWith("upload.windows.")
-  )
+  if (phase?.startsWith("bootstrap.") || phase?.startsWith("upload.windows."))
     activity = "repairing guest";
   else if (phase?.startsWith("workspace.")) activity = "syncing workspace";
 
@@ -481,64 +476,6 @@ class ToolBridge {
   }
 }
 
-async function themedSelect(
-  ctx: UIContext,
-  title: string,
-  items: PickerItem[],
-  preferred?: string,
-): Promise<string | undefined> {
-  const ordered = preferPickerItem(items, preferred) as PickerItem[];
-  if (ctx.mode !== "tui") {
-    const selected = await ctx.ui.select(
-      title,
-      ordered.map((item) => item.label),
-    );
-    return ordered.find((item) => item.label === selected)?.value;
-  }
-  const selected = await ctx.ui.custom<string | null>(
-    (tui, theme, _keybindings, done) => {
-      const container = new Container();
-      container.addChild(
-        new DynamicBorder((text: string) => theme.fg("accent", text)),
-      );
-      container.addChild(new Text(theme.fg("accent", theme.bold(title)), 1, 0));
-      const list = new SelectList(ordered, Math.min(ordered.length, 12), {
-        selectedPrefix: (text) => theme.fg("accent", text),
-        selectedText: (text) =>
-          theme.fg(
-            text.includes("create new sandbox") ? "mdHeading" : "accent",
-            text,
-          ),
-        description: (text) => theme.fg("muted", text),
-        scrollInfo: (text) => theme.fg("dim", text),
-        noMatch: (text) => theme.fg("warning", text),
-      });
-      list.onSelect = (item) => done(item.value);
-      list.onCancel = () => done(null);
-      container.addChild(list);
-      container.addChild(
-        new Text(
-          theme.fg("dim", "↑↓ navigate • Enter select • Esc cancel"),
-          1,
-          0,
-        ),
-      );
-      container.addChild(
-        new DynamicBorder((text: string) => theme.fg("accent", text)),
-      );
-      return {
-        render: (width: number) => container.render(width),
-        invalidate: () => container.invalidate(),
-        handleInput: (data: string) => {
-          list.handleInput(data);
-          tui.requestRender();
-        },
-      };
-    },
-  );
-  return selected ?? undefined;
-}
-
 function delay(milliseconds: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(resolve, milliseconds);
@@ -794,44 +731,203 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     }
   }
 
+  type DestinationSearchOption = {
+    value: string;
+    label: string;
+    description?: string;
+    current?: boolean;
+    create?: boolean;
+  };
+
+  async function searchDestinationOptions(
+    ctx: UIContext,
+    options: DestinationSearchOption[],
+  ): Promise<string | undefined> {
+    const input =
+      ctx.mode === "tui"
+        ? await ctx.ui.custom<string | null>(
+            (tui, theme, _keybindings, done) => {
+              const createLabels = options
+                .filter((option) => option.create)
+                .map((option) => option.label);
+              const selectedRow = (
+                text: string,
+                colour: "accent" | "mdHeading",
+              ) => {
+                const columns = text.match(/^(.*\S)(\s{2,})(\S.*)$/);
+                if (!columns) return theme.fg(colour, text);
+                return (
+                  theme.fg(colour, columns[1]!) +
+                  theme.fg("muted", columns[2]! + columns[3]!)
+                );
+              };
+              const listTheme = {
+                selectedPrefix: (text: string) => theme.fg("accent", text),
+                selectedText: (text: string) =>
+                  selectedRow(
+                    text,
+                    createLabels.some((label) => text.includes(label))
+                      ? "mdHeading"
+                      : "accent",
+                  ),
+                description: (text: string) => theme.fg("muted", text),
+                scrollInfo: (text: string) => theme.fg("muted", text),
+                noMatch: (text: string) => theme.fg("muted", text),
+              };
+              const editor = new Editor(tui, {
+                borderColor: (text) => theme.fg("borderMuted", text),
+                selectList: listTheme,
+              });
+              editor.disableSubmit = true;
+              let list: SelectList;
+              const rebuildList = (query: string) => {
+                const normalized = query.trim().toLowerCase();
+                const filtered = options.filter((option) =>
+                  `${option.label} ${option.description ?? ""}`
+                    .toLowerCase()
+                    .includes(normalized),
+                );
+                const primaryWidth =
+                  Math.max(
+                    1,
+                    ...filtered.map((option) =>
+                      visibleWidth(
+                        option.current
+                          ? `stay on ${option.label}`
+                          : option.label,
+                      ),
+                    ),
+                  ) + 4;
+                list = new SelectList(
+                  filtered.map((option) => ({
+                    value: option.value,
+                    label: option.current
+                      ? theme.bold(`stay on ${option.label}`)
+                      : option.label,
+                    description: option.description,
+                  })),
+                  Math.max(1, Math.min(filtered.length, 5)),
+                  listTheme,
+                  {
+                    minPrimaryColumnWidth: primaryWidth,
+                    maxPrimaryColumnWidth: primaryWidth,
+                  },
+                );
+                list.onSelect = (item) => done(item.value);
+              };
+              rebuildList("");
+              editor.onChange = rebuildList;
+              return {
+                get focused() {
+                  return editor.focused;
+                },
+                set focused(value: boolean) {
+                  editor.focused = value;
+                },
+                invalidate() {
+                  editor.invalidate();
+                  list.invalidate();
+                },
+                render: (width: number) => [
+                  ...editor.render(width),
+                  ...list.render(width),
+                ],
+                handleInput(data: string) {
+                  if (matchesKey(data, Key.escape)) return done(null);
+                  if (
+                    matchesKey(data, Key.up) ||
+                    matchesKey(data, Key.down) ||
+                    matchesKey(data, Key.enter)
+                  ) {
+                    list.handleInput(data);
+                  } else {
+                    editor.handleInput(data);
+                  }
+                  tui.requestRender();
+                },
+              };
+            },
+          )
+        : await ctx.ui.input(
+            "Session execution",
+            options.map((option) => option.label).join(" • "),
+          );
+    if (input === undefined || input === null) return undefined;
+    return input.trim().toLowerCase();
+  }
+
   async function pickDestination(
     ctx: UIContext,
     active?: ExecutionTarget,
   ): Promise<Destination | undefined> {
     if (!ctx.hasUI) return undefined;
-    const listed = await runBackend({ action: "list" }, ctx.signal);
-    const online = (listed.sandboxes ?? []).filter((sandbox) => sandbox.online);
-    const items = [
-      { value: "local", label: "local", description: "run tools on this Mac" },
-      ...online.map((sandbox) => ({
-        value: sandbox.name,
-        label: sandbox.name,
-        description: `${sandbox.os} • reachable over Tailscale`,
-      })),
+    const current = active?.kind === "sandbox" ? active.name : "local";
+    const actions: DestinationSearchOption[] = [
+      ...(active?.kind === "sandbox"
+        ? [
+            { value: "current", label: current, current: true },
+            { value: "local", label: "sync back to local directory" },
+          ]
+        : []),
+      { value: "connect", label: "connect to an existing sandbox" },
       {
         value: "create",
-        label: "create new sandbox",
-        description: "provision a persistent CUA sandbox",
+        label: "create a new sandbox",
+        create: true,
       },
     ];
-    const choice = await themedSelect(
-      ctx,
-      "Session execution",
-      items,
-      active?.kind === "sandbox" ? active.name : undefined,
-    );
-    if (!choice) return undefined;
-    if (choice === "local") return { kind: "local" };
-    if (choice === "create") {
-      const os = await themedSelect(ctx, "Sandbox operating system", [
-        { value: "linux", label: "linux", description: "Ubuntu" },
-        { value: "windows", label: "windows", description: "Windows Server" },
-      ]);
-      if (os !== "linux" && os !== "windows") return undefined;
-      return createSandbox(os, ctx);
+    while (true) {
+      const action = await searchDestinationOptions(ctx, actions);
+      if (!action) return undefined;
+      if (action === "current") return active ?? { kind: "local" };
+      if (action === "local") return { kind: "local" };
+
+      if (action === "create") {
+        const os = await searchDestinationOptions(ctx, [
+          {
+            value: "linux",
+            label: "linux",
+            description: "create a persistent Linux sandbox",
+            create: true,
+          },
+          {
+            value: "windows",
+            label: "windows",
+            description: "create a persistent Windows sandbox",
+            create: true,
+          },
+        ]);
+        if (!os) continue;
+        if (os !== "linux" && os !== "windows")
+          throw new Error(`unknown sandbox operating system: ${os}`);
+        return createSandbox(os, ctx);
+      }
+      if (action !== "connect")
+        throw new Error(`unknown sandbox action: ${action}`);
+
+      const listed = await runBackend({ action: "list" }, ctx.signal);
+      const online = (listed.sandboxes ?? []).filter(
+        (sandbox) =>
+          sandbox.online &&
+          !(active?.kind === "sandbox" && sandbox.name === active.name),
+      );
+      if (online.length === 0) {
+        ctx.ui.notify("No other online sandboxes are available.", "warning");
+        continue;
+      }
+      const name = await searchDestinationOptions(
+        ctx,
+        online.map((sandbox) => ({
+          value: sandbox.name,
+          label: sandbox.name,
+          description: `${sandbox.os} • reachable over Tailscale`,
+        })),
+      );
+      if (!name) continue;
+      const item = online.find((sandbox) => sandbox.name === name);
+      if (!item) throw new Error(`unknown or offline sandbox: ${name}`);
+      return { kind: "sandbox", name: item.name, os: item.os };
     }
-    const item = online.find((sandbox) => sandbox.name === choice);
-    return item ? { kind: "sandbox", name: item.name, os: item.os } : undefined;
   }
 
   async function destinationFromArgument(
@@ -839,7 +935,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     ctx: UIContext,
   ): Promise<Destination | undefined> {
     const value = args.trim().toLowerCase();
-    if (!value) return pickDestination(ctx);
+    if (!value) return pickDestination(ctx, target);
     if (value === "local") return { kind: "local" };
     const createMatch = value.match(
       /^(?:new\s+)?(linux|windows)(?:\s+([1-9]\d*)\s+([1-9]\d*))?$/,
@@ -1162,40 +1258,17 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
 
   pi.on("session_start", async (event, ctx) => {
     try {
-      const loaded = await loadTarget(
-        ctx,
-        event.reason === "fork" ? event.previousSessionFile : undefined,
-      );
-      const saved = loaded.target;
-      if (saved) {
-        if (event.reason === "fork" && saved.kind === "sandbox") {
-          const prepared = await prepareTarget(
-            { kind: "sandbox", name: saved.name, os: saved.os },
-            ctx,
-            { inheritWorkspace: false },
-          );
-          await activate(prepared, ctx);
-        } else {
-          await activate(saved, ctx, { persist: !loaded.persisted });
-        }
-        return;
-      }
-      const needsTarget =
-        event.reason === "new" ||
-        event.reason === "fork" ||
-        (event.reason === "startup" &&
-          ctx.sessionManager.getEntries().length === 0);
-      if (!needsTarget) return;
-      const destination = await pickDestination(
-        ctx,
-        event.reason === "new" ? target : undefined,
-      );
-      if (!destination || destination.kind === "local") {
+      if (event.reason === "new" || event.reason === "fork") {
         await activate({ kind: "local" }, ctx);
         return;
       }
-      const prepared = await prepareTarget(destination, ctx);
-      await activate(prepared, ctx);
+      const loaded = await loadTarget(ctx);
+      const saved = loaded.target;
+      if (saved) {
+        await activate(saved, ctx, { persist: !loaded.persisted });
+        return;
+      }
+      await activate({ kind: "local" }, ctx);
     } catch (error) {
       placementError =
         error instanceof Error ? error : new Error(String(error));
