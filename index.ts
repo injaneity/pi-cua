@@ -737,7 +737,6 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     value: string;
     label: string;
     description?: string;
-    current?: boolean;
     create?: boolean;
   };
 
@@ -792,20 +791,12 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
                 const primaryWidth =
                   Math.max(
                     1,
-                    ...filtered.map((option) =>
-                      visibleWidth(
-                        option.current
-                          ? `stay on ${option.label}`
-                          : option.label,
-                      ),
-                    ),
+                    ...filtered.map((option) => visibleWidth(option.label)),
                   ) + 4;
                 list = new SelectList(
                   filtered.map((option) => ({
                     value: option.value,
-                    label: option.current
-                      ? theme.bold(`stay on ${option.label}`)
-                      : option.label,
+                    label: option.label,
                     description: option.description,
                   })),
                   Math.max(1, Math.min(filtered.length, 5)),
@@ -863,15 +854,20 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     active?: ExecutionTarget,
   ): Promise<Destination | undefined> {
     if (!ctx.hasUI) return undefined;
-    const current = active?.kind === "sandbox" ? active.name : "local";
+    const listed = await runBackend({ action: "list" }, ctx.signal);
+    const online = (listed.sandboxes ?? []).filter(
+      (sandbox) =>
+        sandbox.online &&
+        !(active?.kind === "sandbox" && sandbox.name === active.name),
+    );
     const actions: DestinationSearchOption[] = [
       ...(active?.kind === "sandbox"
-        ? [
-            { value: "current", label: current, current: true },
-            { value: "local", label: "sync back to local directory" },
-          ]
+        ? [{ value: "local", label: "sync back to local directory" }]
         : []),
-      { value: "connect", label: "connect to an existing sandbox" },
+      {
+        value: "connect",
+        label: `connect to ${active?.kind === "sandbox" ? "another" : "an existing"} sandbox (${online.length} available)`,
+      },
       {
         value: "create",
         label: "create a new sandbox",
@@ -881,7 +877,6 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     while (true) {
       const action = await searchDestinationOptions(ctx, actions);
       if (!action) return undefined;
-      if (action === "current") return active ?? { kind: "local" };
       if (action === "local") return { kind: "local" };
 
       if (action === "create") {
@@ -907,12 +902,6 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       if (action !== "connect")
         throw new Error(`unknown sandbox action: ${action}`);
 
-      const listed = await runBackend({ action: "list" }, ctx.signal);
-      const online = (listed.sandboxes ?? []).filter(
-        (sandbox) =>
-          sandbox.online &&
-          !(active?.kind === "sandbox" && sandbox.name === active.name),
-      );
       if (online.length === 0) {
         ctx.ui.notify("No other online sandboxes are available.", "warning");
         continue;
