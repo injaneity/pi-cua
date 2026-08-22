@@ -688,19 +688,6 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     pi.appendEntry(executionTargetEntry, next);
   }
 
-  async function refreshTarget(
-    saved: ExecutionTarget,
-  ): Promise<ExecutionTarget> {
-    if (saved.kind === "local") return saved;
-    const listed = await runBackend({ action: "list" });
-    const current = listed.sandboxes?.find(
-      (sandbox) => sandbox.name === saved.name && sandbox.online,
-    );
-    return current?.address && current.address !== saved.address
-      ? { ...saved, address: current.address }
-      : saved;
-  }
-
   async function createSandbox(
     os: SandboxOS,
     ctx: UIContext,
@@ -1077,12 +1064,11 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     saved: ExecutionTarget,
     ctx: UIContext,
   ): Promise<ExecutionTarget> {
-    const refreshed = await refreshTarget(saved);
-    if (refreshed.kind === "local") return refreshed;
+    if (saved.kind === "local") return saved;
     return prepareTarget(
-      { kind: "sandbox", name: refreshed.name, os: refreshed.os },
+      { kind: "sandbox", name: saved.name, os: saved.os },
       ctx,
-      { inheritWorkspace: false, resume: refreshed },
+      { inheritWorkspace: false, resume: saved },
     );
   }
 
