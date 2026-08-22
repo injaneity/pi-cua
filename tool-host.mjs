@@ -2,6 +2,7 @@
 
 import { spawn, execFileSync } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
+import { existsSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { join } from "node:path";
 
@@ -15,6 +16,7 @@ const requiredTools = new Set(
 );
 
 const protocolVersion = 2;
+const maxProtocolLine = 1024 * 1024;
 process.chdir(cwd);
 if (process.platform === "win32") {
   const nodeDirectory = process.execPath.slice(
@@ -26,15 +28,28 @@ if (process.platform === "win32") {
   process.env.PATH = `/home/cua/.cargo/bin:${process.env.PATH || ""}`;
 }
 
-const npmRoot =
+const npmRoots =
   process.platform === "win32"
-    ? join(process.env.ProgramData || "C:\\ProgramData", "npm", "node_modules")
-    : execFileSync("npm", ["root", "-g"], { encoding: "utf8" }).trim();
-const pi = await import(
-  pathToFileURL(
-    join(npmRoot, "@earendil-works", "pi-coding-agent", "dist", "index.js"),
-  ).href
-);
+    ? [
+        join(
+          process.env.ProgramData || "C:\\ProgramData",
+          "npm",
+          "node_modules",
+        ),
+      ]
+    : [
+        execFileSync("npm", ["root", "-g"], { encoding: "utf8" }).trim(),
+        "/usr/local/lib/node_modules",
+        "/usr/lib/node_modules",
+      ];
+const piEntry = npmRoots
+  .map((root) =>
+    join(root, "@earendil-works", "pi-coding-agent", "dist", "index.js"),
+  )
+  .find(existsSync);
+if (!piEntry)
+  throw new Error("global pi-coding-agent installation was not found");
+const pi = await import(pathToFileURL(piEntry).href);
 
 // stdout is the protocol. Diagnostics belong on stderr.
 console.log = (...values) => console.error(...values);
@@ -204,11 +219,21 @@ function handle(request) {
     typeof request.type !== "string"
   )
     return;
-  if (request.type === "execute") {
+  if (
+    request.type === "execute" &&
+    typeof request.id === "string" &&
+    typeof request.tool === "string"
+  ) {
     void execute(request);
     return;
   }
-  if (request.type === "bash") {
+  if (
+    request.type === "bash" &&
+    typeof request.id === "string" &&
+    typeof request.command === "string" &&
+    (request.timeout === undefined ||
+      (typeof request.timeout === "number" && request.timeout > 0))
+  ) {
     bash(request);
     return;
   }
@@ -222,19 +247,33 @@ function handle(request) {
     if (child) killChildTree(child);
     return;
   }
-  if (request.type === "shutdown") void shutdown();
+  if (request.type === "shutdown") {
+    void shutdown();
+    return;
+  }
+  write({ type: "protocol_error", error: "invalid protocol request" });
 }
 
 const decoder = new StringDecoder("utf8");
 let buffer = "";
 process.stdin.on("data", (chunk) => {
   buffer += decoder.write(chunk);
+  if (buffer.length > maxProtocolLine && !buffer.includes("\n")) {
+    write({ type: "protocol_error", error: "protocol line limit exceeded" });
+    void shutdown();
+    return;
+  }
   for (;;) {
     const index = buffer.indexOf("\n");
     if (index < 0) break;
     const line = buffer.slice(0, index).replace(/\r$/, "");
     buffer = buffer.slice(index + 1);
     if (!line) continue;
+    if (line.length > maxProtocolLine) {
+      write({ type: "protocol_error", error: "protocol line limit exceeded" });
+      void shutdown();
+      return;
+    }
     try {
       handle(JSON.parse(line));
     } catch (error) {

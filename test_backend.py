@@ -174,7 +174,7 @@ class LocalStateTests(unittest.TestCase):
                 patch.object(backend, "STATE_DIR", state_dir),
                 patch.object(backend, "CONTROLLER_DIR", controller_dir),
                 patch.object(
-                    backend, "CONTROLLER_DB", controller_dir / "state.sqlite3"
+                    backend, "SANDBOX_RECORD_DIR", controller_dir / "sandboxes"
                 ),
             ):
                 self.assertEqual(
@@ -330,14 +330,16 @@ class WorkspaceTests(unittest.TestCase):
             patch.object(backend, "remote_pi_files", return_value={"one": b"1"}),
         ):
             first_bootstrap = backend.bootstrap_digest("linux")
-            first_config = backend.guest_config_archive()[1]
+            first_config = backend.config_digest(backend.guest_config_files())
         with (
             patch.object(backend, "pi_version", return_value="1.2.3"),
             patch.object(backend, "bootstrap_template", return_value="bootstrap"),
             patch.object(backend, "remote_pi_files", return_value={"one": b"2"}),
         ):
             self.assertEqual(backend.bootstrap_digest("linux"), first_bootstrap)
-            self.assertNotEqual(backend.guest_config_archive()[1], first_config)
+            self.assertNotEqual(
+                backend.config_digest(backend.guest_config_files()), first_config
+            )
 
     def test_linux_preflight_combines_health_config_disk_and_repository(self) -> None:
         with patch.object(
@@ -371,9 +373,10 @@ class WorkspaceTests(unittest.TestCase):
             "remote_pi_files",
             return_value={".pi/agent/example.ts": b"export default 1;\n"},
         ):
-            content, digest = backend.guest_config_archive()
+            files = backend.guest_config_files()
+            content = backend.guest_config_archive(files)
 
-        self.assertRegex(digest, r"^[0-9a-f]{20}$")
+        self.assertRegex(backend.config_digest(files), r"^[0-9a-f]{20}$")
         with tarfile.open(fileobj=io.BytesIO(content), mode="r:gz") as archive:
             self.assertEqual(
                 archive.extractfile(".pi/agent/example.ts").read(),
@@ -391,7 +394,7 @@ class WorkspaceTests(unittest.TestCase):
     def test_remote_config_includes_generic_tool_host(self) -> None:
         files = backend.remote_pi_files()
         self.assertIn(".pi/agent/cua-tool-host.mjs", files)
-        self.assertIn(".pi/agent/cua-tool-broker.mjs", files)
+        self.assertNotIn(".pi/agent/cua-tool-broker.mjs", files)
         self.assertIn(".pi/agent/cua-tool-relay.mjs", files)
         self.assertIn(
             b'request.type === "execute"', files[".pi/agent/cua-tool-host.mjs"]
@@ -423,9 +426,8 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn("config-version", script)
 
     def test_guest_bundle_contains_only_requested_tool_packages(self) -> None:
-        content, _ = backend.guest_config_archive(
-            ("git:github.com/example/tool-package",)
-        )
+        files = backend.guest_config_files(("git:github.com/example/tool-package",))
+        content = backend.guest_config_archive(files)
         with tarfile.open(fileobj=io.BytesIO(content), mode="r:gz") as archive:
             settings = json.loads(archive.extractfile(".pi/agent/settings.json").read())
         self.assertEqual(
@@ -435,8 +437,10 @@ class WorkspaceTests(unittest.TestCase):
 
     def test_guest_bundle_digest_includes_tool_packages(self) -> None:
         self.assertNotEqual(
-            backend.guest_config_archive(())[1],
-            backend.guest_config_archive(("git:github.com/example/tool-package",))[1],
+            backend.config_digest(backend.guest_config_files()),
+            backend.config_digest(
+                backend.guest_config_files(("git:github.com/example/tool-package",))
+            ),
         )
 
     def test_bundle_describes_only_the_clean_git_baseline(self) -> None:
@@ -817,11 +821,9 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
             patch.object(backend, "inspect_workspace", return_value=self.repository),
             patch.object(backend, "capture_sandbox_workspace", return_value=transfer),
             patch.object(backend, "guest_preflight", return_value=preflight),
-            patch.object(
-                backend,
-                "guest_config_archive",
-                return_value=(b"bundle", "c" * 20),
-            ),
+            patch.object(backend, "guest_config_files", return_value={"x": b""}),
+            patch.object(backend, "config_digest", return_value="c" * 20),
+            patch.object(backend, "guest_config_archive", return_value=b"bundle"),
             patch.object(backend, "sync_guest_config") as sync_config,
             patch.object(
                 backend,
@@ -950,20 +952,15 @@ class WindowsDesktopBrokerTests(unittest.TestCase):
         self.assertIn("cua-tool-broker.mjs", script)
         self.assertIn("cua-tool-broker.token", script)
 
-    def test_bootstrap_limits_recursive_acl_repair_to_pi_agent(self) -> None:
+    def test_bootstrap_owns_only_the_desktop_broker(self) -> None:
         script = backend.bootstrap_template("windows")
 
         self.assertNotIn("Invoke-Icacls @($cuaHome", script)
-        self.assertNotIn(
-            "Invoke-Icacls @($agent, '/grant:r', 'cua:(OI)(CI)F', '/T', '/C')",
-            script,
-        )
+        self.assertNotIn("$extensions", script)
+        self.assertNotIn("cua-tool-host.mjs", script)
+        self.assertNotIn("cua-tool-relay.mjs", script)
         self.assertIn(
-            "Invoke-Icacls @($extensions, '/grant:r', 'cua:(OI)(CI)F', '/T', '/C')",
-            script,
-        )
-        self.assertIn(
-            "Invoke-Icacls @($agentFile, '/grant:r', 'cua:F')",
+            "Invoke-Icacls @(\"$agent\\cua-tool-broker.mjs\", '/grant:r', 'cua:F')",
             script,
         )
         self.assertIn(
@@ -1027,72 +1024,27 @@ class VisibleOperationTests(unittest.IsolatedAsyncioTestCase):
         ):
             await backend.create_one("linux", None)
 
-    async def test_timeout_names_the_phase_and_writes_progress(self) -> None:
+    async def test_timeout_names_the_phase_and_streams_progress(self) -> None:
+        output = io.StringIO()
         with (
-            tempfile.TemporaryDirectory() as directory,
-            patch.object(backend, "OPERATION_DIR", Path(directory)),
-            patch.object(backend, "CURRENT_OPERATION_ID", "operation-1"),
-        ):
-            with self.assertRaisesRegex(
+            patch.dict(backend.os.environ, {"CUA_PROGRESS_JSON": "1"}),
+            patch("sys.stdout", output),
+            self.assertRaisesRegex(
                 RuntimeError, "connect.test timed out after 0.001 seconds"
-            ):
-                await backend.wait_for_step(asyncio.sleep(0.05), "connect.test", 0.001)
-            events = [
-                json.loads(line)
-                for line in (Path(directory) / "operation-1.jsonl")
-                .read_text()
-                .splitlines()
-            ]
+            ),
+        ):
+            await backend.wait_for_step(asyncio.sleep(0.05), "connect.test", 0.001)
 
-        self.assertEqual(events[-1]["phase"], "connect.test")
-        self.assertEqual(events[-1]["message"], "started")
+        event = json.loads(output.getvalue())
+        self.assertEqual(event["phase"], "connect.test")
+        self.assertEqual(event["message"], "started")
 
 
 class ControllerStateTests(unittest.TestCase):
-    def test_long_operation_submission_returns_without_running_inline(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            controller_dir = Path(directory)
-            with (
-                patch.object(backend, "CONTROLLER_DIR", controller_dir),
-                patch.object(
-                    backend, "CONTROLLER_DB", controller_dir / "state.sqlite3"
-                ),
-                patch.object(backend, "OPERATION_DIR", controller_dir / "operations"),
-                patch.object(
-                    backend.subprocess,
-                    "Popen",
-                    return_value=SimpleNamespace(pid=12345),
-                ) as popen,
-                patch.object(backend.os, "kill"),
-            ):
-                status = backend.submit_operation(
-                    {"action": "ensure", "name": "linux-1"}, "operation-1"
-                )
-                backend.finish_operation(
-                    "operation-1", "succeeded", result={"name": "linux-1"}
-                )
-                completed = backend.operation_status("operation-1")
-
-            self.assertEqual(status["state"], "queued")
-            self.assertEqual(status["worker_pid"], 12345)
-            self.assertEqual(completed["state"], "succeeded")
-            self.assertEqual(completed["result"], {"name": "linux-1"})
-            popen.assert_called_once()
-            self.assertEqual(
-                popen.call_args.args[0][:4], ["uv", "run", "--quiet", "--no-project"]
-            )
-            self.assertIn("cua-sandbox==0.4.2", popen.call_args.args[0])
-
-    def test_local_workers_use_the_current_python(self) -> None:
-        for action in (
-            "prepare_execution",
-            "sync_workspace_to_local",
-            "cleanup_workspace",
-        ):
-            with self.subTest(action=action):
-                command = backend.worker_command({"action": action})
-                self.assertEqual(command[0], backend.sys.executable)
-                self.assertNotIn("uv", command)
+    def test_cloud_worker_uses_the_isolated_sdk_runtime(self) -> None:
+        command = backend.cloud_worker_command({"action": "ensure", "name": "linux-1"})
+        self.assertEqual(command[:4], ["uv", "run", "--quiet", "--no-project"])
+        self.assertIn("cua-sandbox==0.4.2", command)
 
 
 if __name__ == "__main__":

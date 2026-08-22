@@ -18,7 +18,6 @@ import os
 import re
 import shlex
 import signal
-import sqlite3
 import ssl
 import subprocess
 import sys
@@ -58,11 +57,9 @@ HOME = Path.home()
 STATE_DIR = HOME / ".cua" / "sandboxes"
 PI_DIR = HOME / ".pi" / "agent"
 CONTROLLER_DIR = HOME / ".cua" / "pi-controller"
-CONTROLLER_DB = CONTROLLER_DIR / "state.sqlite3"
-CONTROLLER_LOCK = CONTROLLER_DIR / "operations.lock"
+SANDBOX_RECORD_DIR = CONTROLLER_DIR / "sandboxes"
+CONTROLLER_LOCK = CONTROLLER_DIR / "controller.lock"
 WORKSPACE_LOCK = CONTROLLER_DIR / "workspaces.lock"
-OPERATION_DIR = CONTROLLER_DIR / "operations"
-CURRENT_OPERATION_ID: str | None = None
 CURRENT_PHASE = "startup"
 
 
@@ -79,11 +76,6 @@ def cancel_worker(_signum: int, _frame: Any) -> None:
 
 
 CLOUD_ACTIONS = {"create", "ensure", "delete"}
-LONG_ACTIONS = CLOUD_ACTIONS | {
-    "prepare_execution",
-    "sync_workspace_to_local",
-    "cleanup_workspace",
-}
 FLEET_KEYCHAIN_SERVICE = "cua-sandbox-fleet-api"
 TAILSCALE_KEYCHAIN_SERVICE = "cua-sandbox-tailscale-oauth"
 TAILSCALE_TOKEN_URL = "https://api.tailscale.com/api/v2/oauth/token"
@@ -119,71 +111,23 @@ BOOTSTRAP_FILES = {
 NAME_PATTERN = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 
 
-def prune_operation_logs(keep: int = 100) -> None:
-    if not OPERATION_DIR.exists():
-        return
-    logs = sorted(
-        OPERATION_DIR.glob("*.jsonl"),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )
-    for path in logs[keep:]:
-        path.unlink(missing_ok=True)
-        path.with_name(f"{path.stem}.console.log").unlink(missing_ok=True)
-
-
 def error_text(error: BaseException) -> str:
     text = str(error).strip()
     return text if text else repr(error)
 
 
-def update_operation_progress(phase: str, message: str) -> None:
-    if not CURRENT_OPERATION_ID or not CONTROLLER_DB.exists():
-        return
-    try:
-        with database() as connection:
-            connection.execute(
-                """
-                UPDATE operations
-                SET phase = ?, message = ?, updated_at = ?
-                WHERE id = ? AND state IN ('queued', 'running', 'cancel_requested')
-                """,
-                (
-                    phase,
-                    message,
-                    datetime.now(timezone.utc).isoformat(),
-                    CURRENT_OPERATION_ID,
-                ),
-            )
-    except sqlite3.Error as error:
-        print(
-            f"warning: failed to update operation state: {error_text(error)}",
-            file=sys.stderr,
-            flush=True,
-        )
-
-
 def progress(phase: str, message: str, **details: Any) -> None:
     global CURRENT_PHASE
     CURRENT_PHASE = phase
-    event = {
-        "at": datetime.now(timezone.utc).isoformat(),
-        "operation_id": CURRENT_OPERATION_ID,
-        "phase": phase,
-        "message": message,
-        **details,
-    }
-    if CURRENT_OPERATION_ID:
-        OPERATION_DIR.mkdir(parents=True, exist_ok=True)
-        path = OPERATION_DIR / f"{CURRENT_OPERATION_ID}.jsonl"
-        with path.open("a") as stream:
-            stream.write(json.dumps(event, separators=(",", ":")) + "\n")
-    update_operation_progress(phase, message)
-    print(
-        f"[cua {CURRENT_OPERATION_ID or '-'}] {phase}: {message}",
-        file=sys.stderr,
-        flush=True,
-    )
+    if os.environ.get("CUA_PROGRESS_JSON") == "1":
+        print(
+            json.dumps(
+                {"progress": True, "phase": phase, "message": message, **details},
+                separators=(",", ":"),
+            ),
+            flush=True,
+        )
+    print(f"[cua] {phase}: {message}", file=sys.stderr, flush=True)
 
 
 async def wait_for_step(
@@ -248,6 +192,8 @@ def bootstrap_digest(profile: str) -> str:
     digest.update(profile.encode())
     digest.update(pi_version().encode())
     digest.update(bootstrap_template(profile).encode())
+    if profile == "windows":
+        digest.update((EXTENSION_DIR / "tool-broker.mjs").read_bytes())
     return digest.hexdigest()[:20]
 
 
@@ -292,56 +238,6 @@ def operation_lock(path: Path) -> Iterator[None]:
             yield
         finally:
             fcntl.flock(lock_file, fcntl.LOCK_UN)
-
-
-@contextmanager
-def database() -> Iterator[sqlite3.Connection]:
-    CONTROLLER_DIR.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(CONTROLLER_DB)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA journal_mode=WAL")
-    connection.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS operations (
-            id TEXT PRIMARY KEY,
-            action TEXT NOT NULL,
-            request_json TEXT NOT NULL,
-            state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'succeeded', 'failed', 'cancel_requested', 'cancelled')),
-            phase TEXT NOT NULL,
-            message TEXT NOT NULL,
-            worker_pid INTEGER,
-            result_json TEXT,
-            error_type TEXT,
-            error TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS sandboxes (
-            name TEXT PRIMARY KEY,
-            os TEXT NOT NULL CHECK (os IN ('linux', 'windows')),
-            pool_name TEXT NOT NULL,
-            claim_reference TEXT NOT NULL,
-            tailscale_tailnet TEXT,
-            tailscale_device_id TEXT,
-            tailscale_addresses TEXT,
-            updated_at TEXT NOT NULL
-        );
-        """
-    )
-    sandbox_columns = {
-        row["name"] for row in connection.execute("PRAGMA table_info(sandboxes)")
-    }
-    for column in ("tailscale_tailnet", "tailscale_device_id", "tailscale_addresses"):
-        if column not in sandbox_columns:
-            connection.execute(f"ALTER TABLE sandboxes ADD COLUMN {column} TEXT")
-    try:
-        yield connection
-        connection.commit()
-    except BaseException:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
 
 
 @dataclass(frozen=True)
@@ -405,93 +301,102 @@ def profile_for_pool(pool: object) -> str | None:
     return default or (match.group("profile") if match else None)
 
 
+def sandbox_record(name: str) -> dict[str, Any] | None:
+    try:
+        value = json.loads((SANDBOX_RECORD_DIR / f"{name}.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def write_sandbox_record(record: dict[str, Any]) -> None:
+    SANDBOX_RECORD_DIR.mkdir(parents=True, exist_ok=True)
+    path = SANDBOX_RECORD_DIR / f"{record['name']}.json"
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
+    os.replace(temporary, path)
+
+
 def record_sandbox(name: str, profile: str, reference: dict[str, Any]) -> None:
     pool_name = reference.get("pool")
     if not isinstance(pool_name, str):
         raise TypeError("CUA claim reference has no pool")
-    now = datetime.now(timezone.utc).isoformat()
-    with database() as connection:
-        connection.execute(
-            """
-            INSERT INTO sandboxes (name, os, pool_name, claim_reference, updated_at)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(name) DO UPDATE SET
-                os = excluded.os,
-                pool_name = excluded.pool_name,
-                claim_reference = excluded.claim_reference,
-                updated_at = excluded.updated_at
-            """,
-            (name, profile, pool_name, json.dumps(reference), now),
-        )
+    write_sandbox_record(
+        {
+            **(sandbox_record(name) or {}),
+            "name": name,
+            "os": profile,
+            "pool": pool_name,
+            "claim": reference,
+            "updatedAt": datetime.now(timezone.utc).isoformat(),
+        }
+    )
 
 
 def record_tailscale_enrollment(
     name: str, tailnet: str, node_id: str, addresses: list[str]
 ) -> None:
-    with database() as connection:
-        cursor = connection.execute(
-            """
-            UPDATE sandboxes
-            SET tailscale_tailnet = ?, tailscale_device_id = ?,
-                tailscale_addresses = ?, updated_at = ?
-            WHERE name = ?
-            """,
-            (
-                tailnet,
-                node_id,
-                json.dumps(addresses),
-                datetime.now(timezone.utc).isoformat(),
-                name,
-            ),
-        )
-        if cursor.rowcount != 1:
+    record = sandbox_record(name)
+    if record is None:
+        state = next((item for item in local_states() if item["name"] == name), None)
+        if state is None:
             raise RuntimeError(
                 f"cannot record Tailscale device for unknown sandbox: {name}"
             )
+        record = {
+            "name": name,
+            "os": state["os"],
+            "pool": state["pool"],
+            "claim": {"pool": state["pool"]},
+        }
+    write_sandbox_record(
+        {
+            **record,
+            "tailnet": tailnet,
+            "deviceId": node_id,
+            "addresses": addresses,
+            "updatedAt": datetime.now(timezone.utc).isoformat(),
+        }
+    )
 
 
 def remove_sandbox_record(name: str) -> None:
-    with database() as connection:
-        connection.execute("DELETE FROM sandboxes WHERE name = ?", (name,))
+    (SANDBOX_RECORD_DIR / f"{name}.json").unlink(missing_ok=True)
+
+
+def controller_sandbox_records() -> list[dict[str, Any]]:
+    if not SANDBOX_RECORD_DIR.exists():
+        return []
+    records = [sandbox_record(path.stem) for path in SANDBOX_RECORD_DIR.glob("*.json")]
+    return [record for record in records if record is not None]
 
 
 def pool_reference_count(pool_name: str) -> int:
-    with database() as connection:
-        row = connection.execute(
-            "SELECT COUNT(*) AS count FROM sandboxes WHERE pool_name = ?",
-            (pool_name,),
-        ).fetchone()
-    return int(row["count"])
+    return sum(item.get("pool") == pool_name for item in local_states())
 
 
 def controller_sandboxes() -> list[dict[str, Any]]:
-    with database() as connection:
-        rows = connection.execute(
-            "SELECT name, os, pool_name, tailscale_addresses FROM sandboxes ORDER BY name"
-        ).fetchall()
-    items = []
-    for row in rows:
-        addresses = json.loads(row["tailscale_addresses"] or "[]")
-        items.append(
+    return sorted(
+        (
             {
-                "name": row["name"],
-                "os": row["os"],
-                "pool": row["pool_name"],
-                "address": addresses[0] if addresses else None,
+                "name": record["name"],
+                "os": record["os"],
+                "pool": record["pool"],
+                "address": (record.get("addresses") or [None])[0],
             }
-        )
-    return items
+            for record in controller_sandbox_records()
+            if all(isinstance(record.get(key), str) for key in ("name", "os", "pool"))
+        ),
+        key=lambda item: item["name"],
+    )
 
 
 def restore_cua_state(name: str) -> None:
     state_path = STATE_DIR / f"{name}.json"
     if state_path.exists():
         return
-    with database() as connection:
-        row = connection.execute(
-            "SELECT pool_name FROM sandboxes WHERE name = ?", (name,)
-        ).fetchone()
-    if row is None:
+    record = sandbox_record(name)
+    if record is None or not isinstance(record.get("pool"), str):
         return
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     temporary = state_path.with_suffix(".json.tmp")
@@ -500,7 +405,7 @@ def restore_cua_state(name: str) -> None:
             {
                 "name": name,
                 "runtime_type": "fleet",
-                "pool_name": row["pool_name"],
+                "pool_name": record["pool"],
                 "status": "running",
                 "created_at": datetime.now(timezone.utc).isoformat(),
             },
@@ -511,11 +416,9 @@ def restore_cua_state(name: str) -> None:
     os.replace(temporary, state_path)
 
 
-def worker_command(request: dict[str, Any]) -> list[str]:
+def cloud_worker_command(request: dict[str, Any]) -> list[str]:
     backend = str(Path(__file__).resolve())
     payload = json.dumps(request)
-    if request.get("action") not in CLOUD_ACTIONS:
-        return [sys.executable, backend, payload]
     return [
         "uv",
         "run",
@@ -533,144 +436,6 @@ def worker_command(request: dict[str, Any]) -> list[str]:
         backend,
         payload,
     ]
-
-
-def submit_operation(request: dict[str, Any], operation_id: str) -> dict[str, Any]:
-    now = datetime.now(timezone.utc).isoformat()
-    action = str(request.get("action") or "")
-    with database() as connection:
-        connection.execute(
-            """
-            INSERT INTO operations (
-                id, action, request_json, state, phase, message, created_at, updated_at
-            ) VALUES (?, ?, ?, 'queued', 'queue', 'waiting for worker', ?, ?)
-            """,
-            (operation_id, action, json.dumps(request), now, now),
-        )
-
-    OPERATION_DIR.mkdir(parents=True, exist_ok=True)
-    console_path = OPERATION_DIR / f"{operation_id}.console.log"
-    environment = {
-        **os.environ,
-        "CUA_DETACHED_WORKER": "1",
-        "CUA_OPERATION_ID": operation_id,
-        "PYTHONUNBUFFERED": "1",
-    }
-    try:
-        with console_path.open("ab", buffering=0) as console:
-            process = subprocess.Popen(
-                worker_command(request),
-                stdin=subprocess.DEVNULL,
-                stdout=console,
-                stderr=console,
-                env=environment,
-                start_new_session=True,
-                close_fds=True,
-            )
-    except OSError as error:
-        finish_operation(
-            operation_id,
-            "failed",
-            error_type=type(error).__name__,
-            error=error_text(error),
-        )
-        raise
-
-    with database() as connection:
-        connection.execute(
-            """
-            UPDATE operations
-            SET worker_pid = ?, message = 'worker started', updated_at = ?
-            WHERE id = ?
-            """,
-            (process.pid, datetime.now(timezone.utc).isoformat(), operation_id),
-        )
-    return operation_status(operation_id)
-
-
-def finish_operation(
-    operation_id: str,
-    state: str,
-    *,
-    result: dict[str, Any] | None = None,
-    error_type: str | None = None,
-    error: str | None = None,
-) -> None:
-    now = datetime.now(timezone.utc).isoformat()
-    with database() as connection:
-        connection.execute(
-            """
-            UPDATE operations
-            SET state = ?, result_json = ?, error_type = ?, error = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (
-                state,
-                json.dumps(result) if result is not None else None,
-                error_type,
-                error,
-                now,
-                operation_id,
-            ),
-        )
-
-
-def operation_status(operation_id: str) -> dict[str, Any]:
-    with database() as connection:
-        row = connection.execute(
-            "SELECT * FROM operations WHERE id = ?", (operation_id,)
-        ).fetchone()
-    if row is None:
-        raise ValueError(f"unknown operation: {operation_id}")
-    item = dict(row)
-    if item["state"] in {"queued", "running", "cancel_requested"} and isinstance(
-        item.get("worker_pid"), int
-    ):
-        try:
-            os.kill(item["worker_pid"], 0)
-        except ProcessLookupError:
-            finish_operation(
-                operation_id,
-                "failed",
-                error_type="WorkerExited",
-                error="detached worker exited without recording a terminal result",
-            )
-            return operation_status(operation_id)
-        except PermissionError:
-            pass
-    raw_result = item.pop("result_json", None)
-    result = json.loads(raw_result) if raw_result else None
-    item.pop("request_json", None)
-    item["operation_id"] = item.pop("id")
-    item["operation_log"] = str(OPERATION_DIR / f"{operation_id}.jsonl")
-    item["console_log"] = str(OPERATION_DIR / f"{operation_id}.console.log")
-    if result is not None:
-        item["result"] = result
-    return item
-
-
-def cancel_operation(operation_id: str) -> dict[str, Any]:
-    status = operation_status(operation_id)
-    if status["state"] in {"succeeded", "failed", "cancelled"}:
-        return status
-    pid = status.get("worker_pid")
-    with database() as connection:
-        connection.execute(
-            """
-            UPDATE operations
-            SET state = 'cancel_requested', phase = 'cancel',
-                message = 'termination requested', updated_at = ?
-            WHERE id = ?
-            """,
-            (datetime.now(timezone.utc).isoformat(), operation_id),
-        )
-    if isinstance(pid, int):
-        try:
-            os.killpg(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-    finish_operation(operation_id, "cancelled")
-    return operation_status(operation_id)
 
 
 def tailscale_access_token() -> str:
@@ -1025,10 +790,9 @@ def next_name(profile: str) -> str:
 
 def remote_pi_files() -> dict[str, bytes]:
     files = {
-        f".pi/agent/{remote}": (Path(__file__).parent / source).read_bytes()
+        f".pi/agent/{remote}": (EXTENSION_DIR / source).read_bytes()
         for remote, source in {
             "cua-tool-host.mjs": "tool-host.mjs",
-            "cua-tool-broker.mjs": "tool-broker.mjs",
             "cua-tool-relay.mjs": "tool-relay.mjs",
         }.items()
     }
@@ -1052,21 +816,11 @@ def remote_pi_files() -> dict[str, bytes]:
 
 
 async def upload_linux_config(sb: Any, tailnet: str) -> None:
-    buffer = io.BytesIO()
-    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
-        for remote, content in remote_pi_files().items():
-            info = tarfile.TarInfo(remote)
-            info.size = len(content)
-            info.mode = 0o644
-            archive.addfile(info, io.BytesIO(content))
-    await sb.files.write_bytes("/tmp/cua-pi-agent.tgz", buffer.getvalue())
     await sb.files.write_text(
         "/tmp/cua-tailscale-auth-key",
         tailscale_auth_key(tailnet),
     )
-    result = await sb.shell.run(
-        "chmod 600 /tmp/cua-pi-agent.tgz /tmp/cua-tailscale-auth-key", timeout=30
-    )
+    result = await sb.shell.run("chmod 600 /tmp/cua-tailscale-auth-key", timeout=30)
     if result.returncode != 0:
         raise RuntimeError(result.stderr or "failed to secure bootstrap credentials")
 
@@ -1187,7 +941,7 @@ async def run_linux_background_job(
     final_cleanup = (
         stop
         + f"$SUDO rm -f {script_path} {log_path} {result_path} "
-        + "/tmp/cua-tailscale-auth-key /tmp/cua-pi-agent.tgz; true"
+        + "/tmp/cua-tailscale-auth-key; true"
     )
     await wait_for_step(
         sb.shell.run(prepare_cleanup, timeout=20), f"{phase}.prepare", 30
@@ -1276,8 +1030,10 @@ async def bootstrap_windows(sb: Any, name: str, tailnet: str) -> str:
         raise RuntimeError(f"missing Windows SSH public key: {WINDOWS_PUBLIC_KEY}")
     archive = io.BytesIO()
     with zipfile.ZipFile(archive, mode="w", compression=zipfile.ZIP_DEFLATED) as bundle:
-        for remote, content in remote_pi_files().items():
-            bundle.writestr(remote, content)
+        bundle.writestr(
+            ".pi/agent/cua-tool-broker.mjs",
+            (EXTENSION_DIR / "tool-broker.mjs").read_bytes(),
+        )
     await upload_windows_file(
         sb, r"C:\Windows\Temp\cua-pi-agent.zip", archive.getvalue()
     )
@@ -1701,7 +1457,7 @@ def reject_remote_workspace_filters(name: str, profile: str, root: str) -> None:
     command = (
         f"node -e {shlex.quote(WORKSPACE_FILTER_CHECK)} {shlex.quote(root)}"
         if profile == "linux"
-        else f"& 'C:\\cua\\node-v22.20.0-win-x64\\node.exe' -e {powershell_literal(WORKSPACE_FILTER_CHECK)} {powershell_literal(root)}"
+        else f"& 'C:\\cua\\node\\node.exe' -e {powershell_literal(WORKSPACE_FILTER_CHECK)} {powershell_literal(root)}"
     )
     run_guest_ssh(name, profile, command, timeout=60)
 
@@ -2151,8 +1907,7 @@ def copy_guest_file(name: str, profile: str, content: bytes, remote_path: str) -
     progress(f"scp.{name}", f"uploaded {size} to {remote_path}")
 
 
-def guest_config_archive(packages: tuple[str, ...] = ()) -> tuple[bytes, str]:
-    files = guest_config_files(packages)
+def guest_config_archive(files: dict[str, bytes]) -> bytes:
     manifest = "".join(f"{path}\n" for path in sorted(files))
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
@@ -2166,7 +1921,7 @@ def guest_config_archive(packages: tuple[str, ...] = ()) -> tuple[bytes, str]:
         info.size = len(content)
         info.mode = 0o600
         archive.addfile(info, io.BytesIO(content))
-    return buffer.getvalue(), config_digest(files)
+    return buffer.getvalue()
 
 
 def sync_guest_config(name: str, profile: str, content: bytes, digest: str) -> None:
@@ -2197,7 +1952,7 @@ $manifest = Join-Path $state 'config-files'
 New-Item -ItemType Directory -Force -Path $state | Out-Null
 if (Test-Path $manifest) {{
   Get-Content $manifest | ForEach-Object {{
-    if ($_.StartsWith('.pi/agent/')) {{
+    if ($_.StartsWith('.pi/agent/') -and $_ -ne '.pi/agent/cua-tool-broker.mjs') {{
       Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $cuaHome ($_.Replace('/', '\\')))
     }}
   }}
@@ -2470,41 +2225,22 @@ def workspace_diff_status(
     }
 
 
-def capture_sandbox_delta(
-    source: SandboxWorkspaceSource,
-) -> tuple[str, bytes, str]:
-    state = source["state"]
+def capture_sandbox_patch(
+    source: SandboxWorkspaceSource, base_tree: str
+) -> tuple[bytes, str]:
     source_root, _ = workspace_location(
         source["address"], source["os"], source["remoteCwd"]
     )
     final_tree = remote_workspace_tree(source["address"], source["os"], source_root)
     patch = remote_workspace_patch(
-        source["address"],
-        source["os"],
-        source_root,
-        state["baselineTree"],
-        final_tree,
+        source["address"], source["os"], source_root, base_tree, final_tree
     )
-    return source_root, patch, final_tree
+    return patch, final_tree
 
 
 def capture_sandbox_workspace(source: SandboxWorkspaceSource) -> WorkspaceTransfer:
-    state = source["state"]
-    source_root, _ = workspace_location(
-        source["address"], source["os"], source["remoteCwd"]
-    )
-    final_tree = remote_workspace_tree(source["address"], source["os"], source_root)
-    return WorkspaceTransfer(
-        state=state,
-        patch=remote_workspace_patch(
-            source["address"],
-            source["os"],
-            source_root,
-            state["commitTree"],
-            final_tree,
-        ),
-        final_tree=final_tree,
-    )
+    patch, final_tree = capture_sandbox_patch(source, source["state"]["commitTree"])
+    return WorkspaceTransfer(state=source["state"], patch=patch, final_tree=final_tree)
 
 
 def restore_sandbox_workspace(
@@ -2547,7 +2283,9 @@ def sync_workspace_to_local(
         )
 
     progress("workspace.local.diff", "capturing sandbox changes")
-    _, current_patch, final_tree = capture_sandbox_delta(source)
+    current_patch, final_tree = capture_sandbox_patch(
+        source, workspace_state["baselineTree"]
+    )
     progress(
         "workspace.local.apply",
         f"applying {len(current_patch) / 1048576:.1f} MiB of sandbox changes",
@@ -2585,7 +2323,8 @@ async def prepare_execution(
             remote_url=repository.remote_url,
             commit=transfer.state["commit"],
         )
-    config_archive, config_digest = guest_config_archive(tool_packages)
+    config_files = guest_config_files(tool_packages)
+    guest_digest = config_digest(config_files)
     candidate = states[name].get("address") or name
     progress("sandbox.preflight", "checking health, configuration, disk, and cache")
     preflight = guest_preflight(
@@ -2593,14 +2332,15 @@ async def prepare_execution(
         profile,
         repository.remote_url,
         repository.commit,
-        config_digest,
+        guest_digest,
     )
     if preflight is None:
         raise SandboxRepairRequired(f"sandbox repair required: {name}")
 
     address = preflight.address
-    reference = hashlib.sha256(workspace_key.encode()).hexdigest()[:32]
-    workspace_id = hashlib.sha256(workspace_key.encode()).hexdigest()[:16]
+    workspace_digest = hashlib.sha256(workspace_key.encode()).hexdigest()
+    reference = workspace_digest[:32]
+    workspace_id = workspace_digest[:16]
     workspace_root = (
         f"/home/cua/workspaces/{workspace_id}"
         if profile == "linux"
@@ -2613,7 +2353,12 @@ async def prepare_execution(
                 f"only {preflight.free_bytes // 1048576} MiB is available"
             )
         if not preflight.config_matches:
-            sync_guest_config(address, profile, config_archive, config_digest)
+            sync_guest_config(
+                address,
+                profile,
+                guest_config_archive(config_files),
+                guest_digest,
+            )
         remote_cwd = await prepare_workspace(
             address,
             profile,
@@ -2655,10 +2400,6 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
             for item in local_states()
         ]
         return {"sandboxes": items}
-    if action == "operation_status":
-        return operation_status(str(request.get("operation_id") or ""))
-    if action == "operation_cancel":
-        return cancel_operation(str(request.get("operation_id") or ""))
     if action == "cleanup_workspace":
         return cleanup_sandbox_workspace(require_sandbox_source(request.get("source")))
     if action in {"sync_workspace_to_local", "workspace_diff_status"}:
@@ -2712,117 +2453,46 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
 
 
 def main() -> None:
-    global CURRENT_OPERATION_ID
     try:
         if len(sys.argv) != 2:
             raise ValueError("expected one JSON request argument")
         request = json.loads(sys.argv[1])
         if not isinstance(request, dict):
             raise TypeError("request must be a JSON object")
-        action = request.get("action")
-        worker = os.environ.get("CUA_DETACHED_WORKER") == "1"
-        if worker:
-            signal.signal(signal.SIGTERM, cancel_worker)
-        CURRENT_OPERATION_ID = os.environ.setdefault(
-            "CUA_OPERATION_ID", uuid.uuid4().hex[:12]
-        )
-        prune_operation_logs()
+        action = str(request.get("action") or "")
+        if action in CLOUD_ACTIONS and os.environ.get("CUA_CLOUD_WORKER") != "1":
+            environment = {**os.environ, "CUA_CLOUD_WORKER": "1"}
+            os.execvpe("uv", cloud_worker_command(request), environment)
 
-        if action in LONG_ACTIONS and not worker:
-            result = submit_operation(request, CURRENT_OPERATION_ID)
-            print(json.dumps({"ok": True, **result}, separators=(",", ":")))
-            return
-
-        if worker:
-            with database() as connection:
-                connection.execute(
-                    """
-                    UPDATE operations
-                    SET state = 'running', worker_pid = ?, phase = 'worker',
-                        message = 'worker running', updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        os.getpgrp(),
-                        datetime.now(timezone.utc).isoformat(),
-                        CURRENT_OPERATION_ID,
-                    ),
-                )
-        quiet_request = action in {
-            "list",
-            "operation_status",
-            "workspace_diff_status",
-        }
+        signal.signal(signal.SIGTERM, cancel_worker)
+        quiet_request = action in {"list", "workspace_diff_status"}
         if not quiet_request:
             progress("request", "accepted", action=action, name=request.get("name"))
-        local_read = action in {
-            "list",
-            "operation_status",
-            "operation_cancel",
-            "workspace_diff_status",
-        }
-        if local_read:
+        locks = operation_locks(action)
+        with ExitStack() as stack:
+            for lock in locks:
+                label = "Fleet" if lock == CONTROLLER_LOCK else "workspace"
+                progress("lock", f"waiting for {label} mutation lock")
+                stack.enter_context(operation_lock(lock))
+                progress("lock", f"acquired {label} mutation lock")
             result = asyncio.run(dispatch(request))
-        else:
-            locks = operation_locks(str(action))
-            with ExitStack() as stack:
-                for lock in locks:
-                    label = "Fleet" if lock == CONTROLLER_LOCK else "workspace"
-                    progress("lock", f"waiting for {label} mutation lock")
-                    stack.enter_context(operation_lock(lock))
-                    progress("lock", f"acquired {label} mutation lock")
-                result = asyncio.run(dispatch(request))
         if not quiet_request:
             progress("complete", "operation succeeded")
-        if worker:
-            finish_operation(CURRENT_OPERATION_ID, "succeeded", result=result)
-        print(
-            json.dumps(
-                {
-                    "ok": True,
-                    "operation_id": CURRENT_OPERATION_ID,
-                    "operation_log": str(
-                        OPERATION_DIR / f"{CURRENT_OPERATION_ID}.jsonl"
-                    ),
-                    **result,
-                },
-                separators=(",", ":"),
-            )
-        )
+        print(json.dumps({"ok": True, **result}, separators=(",", ":")))
     except Exception as error:  # noqa: BLE001 - process boundary returns all failures as JSON
-        try:
-            cancelled = isinstance(error, OperationCancelled)
-            progress(
-                CURRENT_PHASE,
-                "operation cancelled" if cancelled else "operation failed",
-                error=error_text(error),
-            )
-            if os.environ.get("CUA_DETACHED_WORKER") == "1" and CURRENT_OPERATION_ID:
-                finish_operation(
-                    CURRENT_OPERATION_ID,
-                    "cancelled" if cancelled else "failed",
-                    error_type=None if cancelled else type(error).__name__,
-                    error=None if cancelled else error_text(error),
-                )
-        except OSError as log_error:
-            print(
-                f"warning: failed to write operation log: {error_text(log_error)}",
-                file=sys.stderr,
-                flush=True,
-            )
+        cancelled = isinstance(error, OperationCancelled)
+        progress(
+            CURRENT_PHASE,
+            "operation cancelled" if cancelled else "operation failed",
+            error=error_text(error),
+        )
         print(
             json.dumps(
                 {
                     "ok": False,
-                    "operation_id": CURRENT_OPERATION_ID,
                     "phase": CURRENT_PHASE,
                     "error_type": type(error).__name__,
                     "error": error_text(error),
-                    "operation_log": (
-                        str(OPERATION_DIR / f"{CURRENT_OPERATION_ID}.jsonl")
-                        if CURRENT_OPERATION_ID
-                        else None
-                    ),
                 },
                 separators=(",", ":"),
             )

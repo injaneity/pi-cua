@@ -32,18 +32,19 @@ custom images are available through the structured `cua_sandbox` create action's
 
 ## execution path
 
-1. one ssh preflight checks machine health, free disk, the mutable guest-bundle digest, and repository-cache availability; the normal worker uses the controller's existing Python and contacts Fleet through a separate repair operation only when preflight fails;
-2. one content-addressed guest bundle updates extension files and routed-tool package settings when needed;
-3. one workspace command prepares an isolated clone from the shared object cache, then applies one direct Git tree patch from the source state to the final destination state;
-4. the extension starts one non-tty ssh jsonl channel; linux runs `cua-tool-host.mjs` directly, while windows authenticates a loopback relay to a broker in the existing interactive desktop session;
-5. the host loads pi's normal remote tool registry and reports its protocol and tool manifest;
-6. calls, updates, results, errors, cancellation, and user shell output use that channel. `Esc` rejects the local request immediately and asks the host to kill the full remote command process tree.
+1. the extension starts one backend process and reads progress and the final result from its jsonl stream; healthy setup uses the controller's existing Python, while provisioning and repair re-exec under the isolated Fleet sdk runtime;
+2. one ssh preflight checks machine health, free disk, the mutable guest-bundle digest, and repository-cache availability;
+3. one content-addressed guest bundle is created only when extension files or routed-tool package settings need an update;
+4. one workspace command prepares an isolated clone from the shared object cache, then applies one direct Git tree patch from the source state to the final destination state;
+5. the extension starts one non-tty ssh jsonl channel; linux runs `cua-tool-host.mjs` directly, while windows authenticates a loopback relay to a broker in the existing interactive desktop session;
+6. the host loads pi's normal remote tool registry and reports its protocol and tool manifest;
+7. calls, updates, results, errors, cancellation, and user shell output use that channel. `Esc` rejects the local request immediately and asks the host to kill the full remote command process tree.
 
 all target changes use one workspace model: Pi records local and sandbox Git trees at sandbox entry, computes one accumulated binary tree diff from the original commit to the source's final tree, verifies the destination tree, and applies that diff. after a successful move to local or another sandbox, it removes the source workspace, including ignored build outputs. graceful quit and resume shutdowns sync to local and remove the remote workspace. `/new`, `/fork`, and reload retain the active workspace because the replacement session or runtime immediately reconnects. local divergence, a patch conflict, or cleanup failure is reported explicitly, and a failed sync retains the remote workspace rather than deleting the only copy of changes.
 
 ## state
 
-execution placement is stored only as non-context Pi session metadata. restore reads the latest placement across the full session rather than the active branch, so `/tree` and compaction cannot change it.
+execution placement is stored only as non-context Pi session metadata. restore reads the latest placement across the full session rather than the active branch, so `/tree` and compaction cannot change it. the controller keeps one atomic json record per managed sandbox; no database or background operation queue is involved.
 
 sandbox workspaces receive an opaque id when prepared. `/new` and `/fork` transfer ownership of the active workspace to the replacement session; the previous session records local placement. failed destination setup removes its incomplete workspace before returning the error.
 
@@ -55,7 +56,7 @@ pi-cua emits `cua:execution-target-changed` with local, connecting, and ready ta
 
 ## guest boundary
 
-the guest receives the pi sdk version, only the user packages that own routed tools, top-level extension definitions, and the generic tool host. machine bootstrap and mutable Pi configuration have separate content digests, so an extension edit synchronizes a small archive instead of reinstalling or repairing the sandbox. the host activates lifecycle handlers only for extensions that own required tools. it does not receive local model credentials, prompts, conversation sessions, or the sandbox controller.
+the guest receives the pi sdk version, only the user packages that own routed tools, top-level extension definitions, and the generic tool host. machine bootstrap owns operating-system dependencies and the Windows desktop broker; mutable Pi configuration owns the tool host, relay, extensions, and settings. separate content digests let an extension edit synchronize a small archive instead of reinstalling or repairing the sandbox. the host activates lifecycle handlers only for extensions that own required tools. it does not receive local model credentials, prompts, conversation sessions, or the sandbox controller.
 
 workspace preparation requires a git repository with a network `origin` and does not support submodules, Git content filters, or working-tree encodings. if the guest cannot authenticate to the origin, the controller sends a clean commit snapshot and creates an isolated baseline without copying git credentials. new threads, existing local threads, and forks carry the local changes, limited to 200 mib. guests keep one bare repository cache outside all workspaces; isolated clones borrow its objects through Git alternates instead of duplicating packs or sharing mutable Git configuration. package-manager caches remain in the guest user profile. target changes between local and sandbox environments transfer only the accumulated binary Git tree diff, then remove the generated source workspace. `/new` and `/fork` instead transfer ownership of the active workspace without copying it. ignored files, credentials, caches, and processes are neither transferred nor retained as task state.
 
@@ -67,9 +68,8 @@ on Windows, OpenSSH remains in Session 0. it can reach only an authenticated loo
 uvx --quiet ruff format --check backend.py test_backend.py
 uvx --quiet ruff check backend.py test_backend.py
 python3 -m unittest -q test_backend.py
-node test-session-targets.mjs
 node test-tool-broker.mjs
-npm exec --yes --package=prettier -- prettier --check index.ts session-targets.mjs test-session-targets.mjs tool-host.mjs tool-broker.mjs tool-relay.mjs test-tool-broker.mjs
+npm exec --yes --package=prettier -- prettier --check index.ts tool-host.mjs tool-broker.mjs tool-relay.mjs test-tool-broker.mjs
 node --check tool-host.mjs
 pi --list-models
 ```

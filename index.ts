@@ -16,12 +16,6 @@ import {
   visibleWidth,
 } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
-import {
-  latestCustomEntryData,
-  shouldCleanupExecutionTarget,
-  shouldHandoffExecutionTarget,
-  shouldUseControllerTool,
-} from "./session-targets.mjs";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { homedir } from "node:os";
@@ -33,9 +27,38 @@ const backend = join(extensionDir, "backend.py");
 const windowsIdentity = join(homedir(), ".ssh", "cua_windows_ed25519");
 const sandboxKnownHosts = join(homedir(), ".ssh", "cua_known_hosts");
 const protocolVersion = 2;
+const maxProtocolLine = 1024 * 1024;
 const executionTargetEntry = "cua-execution-target";
 const executionTargetHandoffEntry = "cua-execution-target-handoff";
 const localTools = new Set(["cua_sandbox", "report_papercut"]);
+
+function latestCustomEntryData(
+  entries: Array<{ type: string; customType?: string; data?: unknown }>,
+  customType: string,
+): unknown {
+  for (let index = entries.length - 1; index >= 0; index--) {
+    const entry = entries[index]!;
+    if (entry.type === "custom" && entry.customType === customType)
+      return entry.data;
+  }
+  return undefined;
+}
+
+function shouldHandoffExecutionTarget(reason: string): boolean {
+  return reason === "new" || reason === "fork";
+}
+
+function shouldUseControllerTool(toolName: string, input: unknown): boolean {
+  if (toolName !== "read" || input === null || typeof input !== "object")
+    return false;
+  const path = (input as { path?: unknown }).path;
+  return (
+    typeof path === "string" &&
+    /^\/(?:private\/)?var\/folders\/[^/]+\/[^/]+\/T\/pi-clipboard-[^/]+\.(?:png|jpe?g|gif|webp|bmp)$/i.test(
+      path,
+    )
+  );
+}
 
 const resourceSchema = Type.Object({
   action: StringEnum(["list", "create", "ensure", "delete"] as const),
@@ -77,6 +100,7 @@ type SandboxItem = {
   name: string;
   os: SandboxOS;
   pool: string;
+  address?: string;
   online: boolean;
 };
 type WorkspaceState = {
@@ -90,18 +114,15 @@ type WorkspaceState = {
 type BackendResult = {
   ok: boolean;
   error?: string;
-  operation_id?: string;
-  operation_log?: string;
-  console_log?: string;
+  error_type?: string;
+  progress?: boolean;
   phase?: string;
   message?: string;
-  result?: BackendResult;
   sandboxes?: SandboxItem[];
   name?: string;
   os?: SandboxOS;
   address?: string;
   changed?: boolean;
-  state?: string;
   remote_cwd?: string;
   workspace_state?: WorkspaceState;
   additions?: number;
@@ -109,8 +130,16 @@ type BackendResult = {
   pending_sync?: boolean;
   sync_safe?: boolean;
   removed?: boolean;
-  target?: unknown;
 };
+class BackendError extends Error {
+  constructor(
+    message: string,
+    readonly errorType?: string,
+  ) {
+    super(message);
+  }
+}
+
 type Destination =
   { kind: "local" } | { kind: "sandbox"; name: string; os: SandboxOS };
 type ExecutionTarget =
@@ -225,7 +254,7 @@ function hostCommand(
   if (target.os === "windows") {
     return [
       `Set-Location ${powershellQuote(target.remoteCwd)}`,
-      `& 'C:\\cua\\node-v22.20.0-win-x64\\node.exe' $HOME/.pi/agent/cua-tool-relay.mjs ${powershellQuote(target.remoteCwd)} ${powershellQuote(manifest)}`,
+      `& 'C:\\cua\\node\\node.exe' $HOME/.pi/agent/cua-tool-relay.mjs ${powershellQuote(target.remoteCwd)} ${powershellQuote(manifest)}`,
     ].join("; ");
   }
   return `cd ${shellQuote(target.remoteCwd)} && exec node /home/cua/.pi/agent/cua-tool-host.mjs ${shellQuote(target.remoteCwd)} ${shellQuote(manifest)}`;
@@ -310,12 +339,26 @@ class ToolBridge {
       }, 300_000);
       child.stdout.on("data", (chunk: Buffer) => {
         stdout += decoder.write(chunk);
+        if (stdout.length > maxProtocolLine && !stdout.includes("\n")) {
+          child.kill();
+          reject(
+            new Error("remote tool host exceeded the protocol line limit"),
+          );
+          return;
+        }
         for (;;) {
           const index = stdout.indexOf("\n");
           if (index < 0) break;
           const line = stdout.slice(0, index).replace(/\r$/, "");
           stdout = stdout.slice(index + 1);
           if (!line) continue;
+          if (line.length > maxProtocolLine) {
+            child.kill();
+            reject(
+              new Error("remote tool host exceeded the protocol line limit"),
+            );
+            return;
+          }
           try {
             const message = JSON.parse(line) as HostMessage;
             if (message.type === "ready") {
@@ -489,30 +532,6 @@ class ToolBridge {
   }
 }
 
-function delay(milliseconds: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(resolve, milliseconds);
-    signal?.addEventListener(
-      "abort",
-      () => {
-        clearTimeout(timer);
-        reject(signal.reason ?? new Error("operation cancelled"));
-      },
-      { once: true },
-    );
-  });
-}
-
-function lastJson(stdout: string): BackendResult {
-  const lines = stdout.trim().split(/\r?\n/).filter(Boolean);
-  for (let index = lines.length - 1; index >= 0; index--) {
-    try {
-      return JSON.parse(lines[index]) as BackendResult;
-    } catch {}
-  }
-  throw new Error(stdout.trim() || "cua backend returned no result");
-}
-
 function creationDescription(
   resources?: SandboxResources,
   image?: string,
@@ -594,67 +613,83 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
   const localToolDefinitions = new Map<string, AnyToolDefinition>();
   const toolPackages = new Set<string>();
 
-  async function executeBackend(
-    request: Record<string, unknown>,
-    signal?: AbortSignal,
-  ): Promise<BackendResult> {
-    const result = await pi.exec(
-      "python3",
-      [backend, JSON.stringify(request)],
-      {
-        signal,
-        timeout: 15_000,
-      },
-    );
-    const parsed = lastJson(result.stdout);
-    if (result.code === 0 && parsed.ok) return parsed;
-    const context = [parsed.operation_id, parsed.phase]
-      .filter((value) => typeof value === "string")
-      .join("/");
-    const log = parsed.operation_log ? `; log: ${parsed.operation_log}` : "";
-    throw new Error(
-      `${context ? `[${context}] ` : ""}${parsed.error || result.stderr.trim() || "cua operation failed"}${log}`,
-    );
-  }
-
   async function runBackend(
     request: Record<string, unknown>,
     signal?: AbortSignal,
     onStatus?: (status: BackendResult) => void,
   ): Promise<BackendResult> {
-    let status = await executeBackend(request, signal);
-    const operationId = status.operation_id;
-    if (
-      typeof operationId !== "string" ||
-      !["queued", "running", "cancel_requested"].includes(status.state ?? "")
-    ) {
-      return status;
-    }
-    try {
-      while (
-        ["queued", "running", "cancel_requested"].includes(status.state ?? "")
-      ) {
-        await delay(500, signal);
-        status = await executeBackend({
-          action: "operation_status",
-          operation_id: operationId,
-        });
-        onStatus?.(status);
-      }
-    } catch (error) {
-      if (signal?.aborted) {
-        await executeBackend({
-          action: "operation_cancel",
-          operation_id: operationId,
-        }).catch(() => undefined);
-      }
-      throw error;
-    }
-    if (status.state === "succeeded" && status.result) return status.result;
-    const log = status.console_log ?? status.operation_log;
-    throw new Error(
-      `[${operationId}/${status.phase ?? status.state}] ${status.error ?? status.message ?? "cua operation failed"}${log ? `; log: ${log}` : ""}`,
-    );
+    if (signal?.aborted) throw new Error("operation cancelled");
+    return new Promise((resolve, reject) => {
+      const child = spawn("python3", [backend, JSON.stringify(request)], {
+        detached: true,
+        env: { ...process.env, CUA_PROGRESS_JSON: "1" },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      const decoder = new StringDecoder("utf8");
+      let stdout = "";
+      let stderr = "";
+      let result: BackendResult | undefined;
+      let settled = false;
+      const finish = (callback: () => void) => {
+        if (settled) return;
+        settled = true;
+        signal?.removeEventListener("abort", onAbort);
+        callback();
+      };
+      const onAbort = () => {
+        if (child.pid) {
+          try {
+            process.kill(-child.pid, "SIGTERM");
+          } catch {
+            child.kill("SIGTERM");
+          }
+        }
+      };
+      const consume = () => {
+        for (;;) {
+          const newline = stdout.indexOf("\n");
+          if (newline < 0) break;
+          const line = stdout.slice(0, newline).replace(/\r$/, "");
+          stdout = stdout.slice(newline + 1);
+          if (!line) continue;
+          try {
+            const message = JSON.parse(line) as BackendResult;
+            if (message.progress) onStatus?.(message);
+            else result = message;
+          } catch {
+            stderr = `${stderr}\ninvalid backend output: ${line}`.slice(-8_000);
+          }
+        }
+        if (stdout.length > 1024 * 1024) onAbort();
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      child.stdout.on("data", (chunk: Buffer) => {
+        stdout += decoder.write(chunk);
+        consume();
+      });
+      child.stderr.on("data", (chunk: Buffer) => {
+        stderr = `${stderr}${chunk.toString()}`.slice(-8_000);
+      });
+      child.on("error", (error) => finish(() => reject(error)));
+      child.on("close", (code) => {
+        stdout += decoder.end();
+        if (stdout && !stdout.endsWith("\n")) stdout += "\n";
+        consume();
+        if (signal?.aborted) {
+          finish(() => reject(new Error("operation cancelled")));
+          return;
+        }
+        if (code === 0 && result?.ok) {
+          finish(() => resolve(result!));
+          return;
+        }
+        const context = result?.phase ? `[${result.phase}] ` : "";
+        const detail = result?.error || stderr.trim() || "cua operation failed";
+        finish(() =>
+          reject(new BackendError(`${context}${detail}`, result?.error_type)),
+        );
+      });
+    });
   }
 
   function loadSessionTarget(ctx: UIContext): ExecutionTarget | undefined {
@@ -678,6 +713,19 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
 
   function saveTarget(next: ExecutionTarget): void {
     pi.appendEntry(executionTargetEntry, next);
+  }
+
+  async function refreshTarget(
+    saved: ExecutionTarget,
+  ): Promise<ExecutionTarget> {
+    if (saved.kind === "local") return saved;
+    const listed = await runBackend({ action: "list" });
+    const current = listed.sandboxes?.find(
+      (sandbox) => sandbox.name === saved.name && sandbox.online,
+    );
+    return current?.address && current.address !== saved.address
+      ? { ...saved, address: current.address }
+      : saved;
   }
 
   async function createSandbox(
@@ -1020,8 +1068,8 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         result = await runBackend(request, ctx.signal, onStatus);
       } catch (error) {
         if (
-          !(error instanceof Error) ||
-          !error.message.includes("sandbox repair required:")
+          !(error instanceof BackendError) ||
+          error.errorType !== "SandboxRepairRequired"
         )
           throw error;
         await runBackend(
@@ -1340,15 +1388,18 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     try {
       const current = loadSessionTarget(ctx);
       if (current) {
-        await activate(current, ctx, { persist: false });
+        const refreshed = await refreshTarget(current);
+        if (refreshed !== current) saveTarget(refreshed);
+        await activate(refreshed, ctx, { persist: false });
         return;
       }
       const inherited = shouldHandoffExecutionTarget(event.reason)
         ? loadHandoffTarget(event.previousSessionFile)
         : undefined;
       if (inherited) {
-        saveTarget(inherited);
-        await activate(inherited, ctx, { persist: false });
+        const refreshed = await refreshTarget(inherited);
+        saveTarget(refreshed);
+        await activate(refreshed, ctx, { persist: false });
         return;
       }
       await activate({ kind: "local" }, ctx);
@@ -1401,7 +1452,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         const local: ExecutionTarget = { kind: "local" };
         saveTarget(local);
         target = local;
-      } else if (source && shouldCleanupExecutionTarget(event.reason)) {
+      } else if (source && event.reason !== "reload") {
         await syncTargetToLocal(source);
         const local: ExecutionTarget = { kind: "local" };
         saveTarget(local);
