@@ -997,9 +997,12 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
   async function prepareTarget(
     destination: Extract<Destination, { kind: "sandbox" }>,
     ctx: UIContext,
-    options: { inheritWorkspace?: boolean } = {},
+    options: {
+      inheritWorkspace?: boolean;
+      resume?: Extract<ExecutionTarget, { kind: "sandbox" }>;
+    } = {},
   ): Promise<Extract<ExecutionTarget, { kind: "sandbox" }>> {
-    const { inheritWorkspace = true } = options;
+    const { inheritWorkspace = true, resume } = options;
     if (
       inheritWorkspace &&
       target.kind === "sandbox" &&
@@ -1016,18 +1019,14 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     const request = {
       action: "prepare_execution",
       name: destination.name,
-      source_cwd: ctx.cwd,
+      source_cwd: resume?.localCwd ?? ctx.cwd,
       workspace_id: ctx.sessionManager.getSessionId(),
       tool_packages: [...toolPackages],
       source:
-        inheritWorkspace && target.kind === "sandbox"
-          ? {
-              address: target.address,
-              os: target.os,
-              remoteCwd: target.remoteCwd,
-              state: target.workspaceState,
-            }
+        !resume && inheritWorkspace && target.kind === "sandbox"
+          ? sandboxSource(target)
           : undefined,
+      resume: resume ? sandboxSource(resume) : undefined,
     };
     const onStatus = (status: BackendResult) => {
       ctx.ui.setStatus(
@@ -1069,7 +1068,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       return {
         ...destination,
         address: result.address,
-        localCwd: ctx.cwd,
+        localCwd: resume?.localCwd ?? ctx.cwd,
         remoteCwd: result.remote_cwd,
         workspaceState: result.workspace_state,
       };
@@ -1078,6 +1077,19 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       pi.events.emit("cua:execution-target-changed", target);
       throw error;
     }
+  }
+
+  async function resumeTarget(
+    saved: ExecutionTarget,
+    ctx: UIContext,
+  ): Promise<ExecutionTarget> {
+    const refreshed = await refreshTarget(saved);
+    if (refreshed.kind === "local") return refreshed;
+    return prepareTarget(
+      { kind: "sandbox", name: refreshed.name, os: refreshed.os },
+      ctx,
+      { inheritWorkspace: false, resume: refreshed },
+    );
   }
 
   function sandboxSource(
@@ -1367,18 +1379,18 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     try {
       const current = loadSessionTarget(ctx);
       if (current) {
-        const refreshed = await refreshTarget(current);
-        if (refreshed !== current) saveTarget(refreshed);
-        await activate(refreshed, ctx, { persist: false });
+        const resumed = await resumeTarget(current, ctx);
+        if (resumed !== current) saveTarget(resumed);
+        await activate(resumed, ctx, { persist: false });
         return;
       }
       const inherited = shouldHandoffExecutionTarget(event.reason)
         ? loadHandoffTarget(event.previousSessionFile)
         : undefined;
       if (inherited) {
-        const refreshed = await refreshTarget(inherited);
-        saveTarget(refreshed);
-        await activate(refreshed, ctx, { persist: false });
+        const resumed = await resumeTarget(inherited, ctx);
+        saveTarget(resumed);
+        await activate(resumed, ctx, { persist: false });
         return;
       }
       await activate({ kind: "local" }, ctx);

@@ -2090,6 +2090,30 @@ New-Item -ItemType Directory -Force -Path 'C:\\cua\\workspaces','C:\\cua\\cache\
     return str(PureWindowsPath(workspace_root) / relative_windows)
 
 
+def sandbox_workspace_exists(name: str, profile: str, cwd: str) -> bool:
+    if profile == "linux":
+        match = re.match(r"^(/home/cua/workspaces/[0-9a-f]{16})(?:/|$)", cwd)
+        command = f"test -d {shlex.quote(match.group(1) if match else '')}/.git"
+    else:
+        match = re.match(
+            r"^(C:\\cua\\workspaces\\[0-9a-f]{16})(?:\\|$)", cwd, re.IGNORECASE
+        )
+        root = match.group(1) if match else ""
+        command = (
+            'powershell.exe -NoProfile -Command "if(Test-Path '
+            + powershell_literal(root + r"\.git")
+            + '){exit 0}else{exit 1}"'
+        )
+    if match is None:
+        raise ValueError("saved sandbox workspace path is invalid")
+    result = run_guest_ssh(name, profile, command, timeout=30, check=False)
+    if result.returncode not in {0, 1}:
+        raise RuntimeError(
+            result.stderr or f"workspace probe exited {result.returncode}"
+        )
+    return result.returncode == 0
+
+
 def workspace_location(name: str, profile: str, cwd: str) -> tuple[str, str]:
     if profile == "linux":
         command = f"""set -eu
@@ -2291,25 +2315,18 @@ async def prepare_execution(
     source_cwd: str,
     workspace_key: str,
     source: SandboxWorkspaceSource | None = None,
+    resume: SandboxWorkspaceSource | None = None,
     tool_packages: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     states = {item["name"]: item for item in managed_sandboxes()}
     if name not in states:
         raise ValueError(f"unknown managed sandbox: {name}")
     profile = states[name]["os"]
+    if source and resume:
+        raise ValueError("prepare_execution cannot transfer and resume simultaneously")
+    if resume and resume["os"] != profile:
+        raise ValueError("saved sandbox profile does not match its controller record")
     repository = inspect_workspace(Path(source_cwd).expanduser().resolve())
-    transfer = (
-        capture_sandbox_workspace(source)
-        if source
-        else capture_local_workspace(repository)
-    )
-    if source:
-        repository = WorkspaceRepository(
-            root=repository.root,
-            relative_cwd=repository.relative_cwd,
-            remote_url=repository.remote_url,
-            commit=transfer.state["commit"],
-        )
     config_files = guest_config_files(tool_packages)
     guest_digest = config_digest(config_files)
     candidate = states[name].get("address") or name
@@ -2325,6 +2342,39 @@ async def prepare_execution(
         raise SandboxRepairRequired(f"sandbox repair required: {name}")
 
     address = preflight.address
+    if preflight.free_bytes < 1024**3:
+        raise RuntimeError(
+            "workspace setup requires 1 GiB free; "
+            f"only {preflight.free_bytes // 1048576} MiB is available"
+        )
+    if not preflight.config_matches:
+        sync_guest_config(
+            address,
+            profile,
+            guest_config_archive(config_files),
+            guest_digest,
+        )
+    if resume and sandbox_workspace_exists(address, profile, resume["remoteCwd"]):
+        return {
+            "name": name,
+            "os": profile,
+            "address": address,
+            "remote_cwd": resume["remoteCwd"],
+            "workspace_state": resume["state"],
+        }
+
+    transfer = (
+        capture_sandbox_workspace(source)
+        if source
+        else capture_local_workspace(repository)
+    )
+    if source:
+        repository = WorkspaceRepository(
+            root=repository.root,
+            relative_cwd=repository.relative_cwd,
+            remote_url=repository.remote_url,
+            commit=transfer.state["commit"],
+        )
     workspace_digest = hashlib.sha256(workspace_key.encode()).hexdigest()
     reference = workspace_digest[:32]
     workspace_id = workspace_digest[:16]
@@ -2334,18 +2384,6 @@ async def prepare_execution(
         else rf"C:\cua\workspaces\{workspace_id}"
     )
     try:
-        if preflight.free_bytes < 1024**3:
-            raise RuntimeError(
-                "workspace setup requires 1 GiB free; "
-                f"only {preflight.free_bytes // 1048576} MiB is available"
-            )
-        if not preflight.config_matches:
-            sync_guest_config(
-                address,
-                profile,
-                guest_config_archive(config_files),
-                guest_digest,
-            )
         remote_cwd = await prepare_workspace(
             address,
             profile,
@@ -2427,11 +2465,16 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
             for package in tool_packages
         ):
             raise TypeError("tool_packages contains an unsupported package source")
+        resume_value = request.get("resume")
+        resume = (
+            require_sandbox_source(resume_value) if resume_value is not None else None
+        )
         return await prepare_execution(
             str(request.get("name") or ""),
             str(request.get("source_cwd") or ""),
             workspace_key,
             source,
+            resume,
             tuple(dict.fromkeys(tool_packages)),
         )
     raise ValueError(

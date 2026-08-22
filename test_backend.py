@@ -856,7 +856,9 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
             )
         sync_config.assert_called_once_with("100.64.0.2", "linux", b"bundle", "c" * 20)
 
-    async def test_prepare_execution_cleans_up_after_low_disk_preflight(self) -> None:
+    async def test_prepare_execution_stops_before_mutating_a_low_disk_guest(
+        self,
+    ) -> None:
         transfer = backend.WorkspaceTransfer(self.state, b"final", "2" * 40)
         preflight = backend.GuestPreflight("100.64.0.2", 512 * 1024**2, True, True)
         with (
@@ -876,10 +878,59 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
                 "linux-1", "/local", "session-1", self.source
             )
         prepare.assert_not_called()
-        workspace_id = hashlib.sha256(b"session-1").hexdigest()[:16]
-        cleanup.assert_called_once_with(
-            "100.64.0.2", "linux", f"/home/cua/workspaces/{workspace_id}"
-        )
+        cleanup.assert_not_called()
+
+    async def test_prepare_execution_reuses_an_existing_saved_workspace(self) -> None:
+        preflight = backend.GuestPreflight("100.64.0.2", 2**30, True, True)
+        with (
+            patch.object(
+                backend,
+                "managed_sandboxes",
+                return_value=[{"name": "linux-1", "os": "linux"}],
+            ),
+            patch.object(backend, "inspect_workspace", return_value=self.repository),
+            patch.object(backend, "guest_preflight", return_value=preflight),
+            patch.object(backend, "sandbox_workspace_exists", return_value=True),
+            patch.object(backend, "capture_local_workspace") as capture,
+            patch.object(backend, "prepare_workspace") as prepare,
+        ):
+            result = await backend.prepare_execution(
+                "linux-1", "/local", "session-1", resume=self.source
+            )
+
+        self.assertEqual(result["remote_cwd"], self.source["remoteCwd"])
+        self.assertEqual(result["workspace_state"], self.state)
+        capture.assert_not_called()
+        prepare.assert_not_called()
+
+    async def test_prepare_execution_reconstructs_a_missing_saved_workspace(
+        self,
+    ) -> None:
+        transfer = backend.WorkspaceTransfer(self.state, b"final", "2" * 40)
+        preflight = backend.GuestPreflight("100.64.0.2", 2**30, True, True)
+        with (
+            patch.object(
+                backend,
+                "managed_sandboxes",
+                return_value=[{"name": "linux-1", "os": "linux"}],
+            ),
+            patch.object(backend, "inspect_workspace", return_value=self.repository),
+            patch.object(backend, "guest_preflight", return_value=preflight),
+            patch.object(backend, "sandbox_workspace_exists", return_value=False),
+            patch.object(backend, "capture_local_workspace", return_value=transfer),
+            patch.object(
+                backend,
+                "prepare_workspace",
+                AsyncMock(return_value="/remote/workspace"),
+            ) as prepare,
+            patch.object(backend, "restore_sandbox_workspace"),
+        ):
+            result = await backend.prepare_execution(
+                "linux-1", "/local", "session-1", resume=self.source
+            )
+
+        self.assertEqual(result["remote_cwd"], "/remote/workspace")
+        prepare.assert_awaited_once()
 
     async def test_prepare_execution_removes_an_incomplete_destination(self) -> None:
         transfer = backend.WorkspaceTransfer(self.state, b"final", "2" * 40)
