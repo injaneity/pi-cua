@@ -25,7 +25,6 @@ class ResourceSelectionTests(unittest.TestCase):
         self.assertEqual((default.cpu, default.memory_mb), (8, 16 * 1024))
         self.assertEqual(custom, backend.sandbox_resources("linux", 16, 64 * 1024))
         self.assertRegex(custom.pool, r"^cua-pi-custom-linux-[0-9a-f]{16}$")
-        self.assertEqual(backend.profile_for_pool(custom.pool), "linux")
 
     def test_custom_resources_require_two_positive_integers(self) -> None:
         for cpu, memory_mb in ((1, None), (None, 1), (0, 1), (1, -1)):
@@ -134,51 +133,6 @@ class ResourceCreationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ManagedSandboxTests(unittest.TestCase):
-    def test_legacy_sdk_index_is_migrated_once(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            state_dir = Path(directory)
-            custom_pool = backend.sandbox_resources("linux", 16, 65536).pool
-            (state_dir / "linux-1.json").write_text(
-                json.dumps(
-                    {
-                        "name": "linux-1",
-                        "runtime_type": "fleet",
-                        "pool_name": custom_pool,
-                    }
-                )
-            )
-            (state_dir / "unrelated.json").write_text(
-                json.dumps(
-                    {
-                        "name": "unrelated",
-                        "runtime_type": "fleet",
-                        "pool_name": "another-pool",
-                    }
-                )
-            )
-
-            controller_dir = state_dir / "controller"
-            with (
-                patch.object(backend, "STATE_DIR", state_dir),
-                patch.object(backend, "CONTROLLER_DIR", controller_dir),
-                patch.object(
-                    backend, "SANDBOX_RECORD_DIR", controller_dir / "sandboxes"
-                ),
-            ):
-                backend.migrate_legacy_sandbox_records()
-                self.assertEqual(
-                    backend.managed_sandboxes(),
-                    [
-                        {
-                            "name": "linux-1",
-                            "os": "linux",
-                            "pool": custom_pool,
-                            "address": None,
-                        }
-                    ],
-                )
-                self.assertTrue((controller_dir / ".sdk-state-migrated").exists())
-
     def test_controller_record_is_the_only_runtime_index(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state_dir = Path(directory)

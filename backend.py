@@ -276,16 +276,6 @@ def sandbox_resources(
     )
 
 
-def profile_for_pool(pool: object) -> str | None:
-    if not isinstance(pool, str):
-        return None
-    default = next(
-        (profile for profile, spec in PROFILES.items() if spec["pool"] == pool), None
-    )
-    match = CUSTOM_POOL_PATTERN.fullmatch(pool)
-    return default or (match.group("profile") if match else None)
-
-
 def sandbox_record(name: str) -> dict[str, Any] | None:
     try:
         value = json.loads((SANDBOX_RECORD_DIR / f"{name}.json").read_text())
@@ -366,39 +356,6 @@ def controller_sandboxes() -> list[dict[str, Any]]:
         ),
         key=lambda item: item["name"],
     )
-
-
-def migrate_legacy_sandbox_records() -> None:
-    """Import the pre-controller SDK index once, then leave records canonical."""
-    marker = CONTROLLER_DIR / ".sdk-state-migrated"
-    if marker.exists():
-        return
-    if STATE_DIR.exists():
-        for path in STATE_DIR.glob("*.json"):
-            try:
-                state = json.loads(path.read_text())
-            except (OSError, json.JSONDecodeError):
-                continue
-            pool = state.get("pool_name")
-            profile = profile_for_pool(pool)
-            name = state.get("name", path.stem)
-            if (
-                state.get("runtime_type") == "fleet"
-                and profile
-                and isinstance(name, str)
-                and sandbox_record(name) is None
-            ):
-                write_sandbox_record(
-                    {
-                        "name": name,
-                        "os": profile,
-                        "pool": pool,
-                        "claim": {"pool": pool},
-                        "updatedAt": datetime.now(timezone.utc).isoformat(),
-                    }
-                )
-    CONTROLLER_DIR.mkdir(parents=True, exist_ok=True)
-    marker.touch()
 
 
 def restore_cua_state(name: str) -> None:
@@ -2484,7 +2441,6 @@ def main() -> None:
         if not isinstance(request, dict):
             raise TypeError("request must be a JSON object")
         action = str(request.get("action") or "")
-        migrate_legacy_sandbox_records()
         if action in CLOUD_ACTIONS and os.environ.get("CUA_CLOUD_WORKER") != "1":
             environment = {**os.environ, "CUA_CLOUD_WORKER": "1"}
             os.execvpe("uv", cloud_worker_command(request), environment)
