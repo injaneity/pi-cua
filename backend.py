@@ -27,7 +27,7 @@ import time
 import uuid
 import zipfile
 from collections.abc import Iterator
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -59,7 +59,6 @@ PI_DIR = HOME / ".pi" / "agent"
 CONTROLLER_DIR = HOME / ".cua" / "pi-controller"
 SANDBOX_RECORD_DIR = CONTROLLER_DIR / "sandboxes"
 CONTROLLER_LOCK = CONTROLLER_DIR / "controller.lock"
-WORKSPACE_LOCK = CONTROLLER_DIR / "workspaces.lock"
 CURRENT_PHASE = "startup"
 
 
@@ -211,21 +210,6 @@ def config_digest(files: dict[str, bytes]) -> str:
         digest.update(path.encode())
         digest.update(content)
     return digest.hexdigest()[:20]
-
-
-def operation_locks(action: str) -> tuple[Path, ...]:
-    """Keep Fleet mutations separate from workspace preparation."""
-    if action == "create":
-        return (CONTROLLER_LOCK,)
-    if action in {"ensure", "delete"}:
-        return (CONTROLLER_LOCK, WORKSPACE_LOCK)
-    if action in {
-        "prepare_execution",
-        "sync_workspace_to_local",
-        "cleanup_workspace",
-    }:
-        return (WORKSPACE_LOCK,)
-    return ()
 
 
 @contextmanager
@@ -1785,7 +1769,7 @@ def run_guest_ssh(
         return result
 
     # Streamed variant: forward the latest output line (git --progress updates
-    # are \r-terminated) into the operation record so the UI can show it live.
+    # are \r-terminated) so the UI can show it live.
     import select
 
     process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -2468,13 +2452,19 @@ def main() -> None:
         quiet_request = action in {"list", "workspace_diff_status"}
         if not quiet_request:
             progress("request", "accepted", action=action, name=request.get("name"))
-        locks = operation_locks(action)
-        with ExitStack() as stack:
-            for lock in locks:
-                label = "Fleet" if lock == CONTROLLER_LOCK else "workspace"
-                progress("lock", f"waiting for {label} mutation lock")
-                stack.enter_context(operation_lock(lock))
-                progress("lock", f"acquired {label} mutation lock")
+        if action in {
+            "create",
+            "ensure",
+            "delete",
+            "prepare_execution",
+            "sync_workspace_to_local",
+            "cleanup_workspace",
+        }:
+            progress("lock", "waiting for controller mutation lock")
+            with operation_lock(CONTROLLER_LOCK):
+                progress("lock", "acquired controller mutation lock")
+                result = asyncio.run(dispatch(request))
+        else:
             result = asyncio.run(dispatch(request))
         if not quiet_request:
             progress("complete", "operation succeeded")

@@ -267,7 +267,6 @@ class ToolBridge {
   private stderr = "";
   private ready = false;
   private readonly remoteTools = new Map<string, RemoteToolInfo>();
-  private sequence = 0;
 
   constructor(
     private readonly target: Extract<ExecutionTarget, { kind: "sandbox" }>,
@@ -284,11 +283,6 @@ class ToolBridge {
     if (!message.id) return;
     const pending = this.pending.get(message.id);
     if (!pending) return;
-    if (message.type === "manifest" && message.tools) {
-      this.pending.delete(message.id);
-      pending.resolve(message.tools);
-      return;
-    }
     if (message.type === "update" && message.update) {
       pending.onUpdate?.(message.update);
       return;
@@ -468,21 +462,6 @@ class ToolBridge {
         );
       }
     });
-  }
-
-  async refresh(expectedTools: string[]): Promise<void> {
-    const id = `manifest-${++this.sequence}`;
-    const tools = await this.request<RemoteToolInfo[]>(id, {
-      type: "manifest",
-      id,
-    });
-    const names = new Set(tools.map((item) => item.name));
-    const missing = expectedTools.filter((name) => !names.has(name));
-    if (missing.length > 0) {
-      throw new Error(`remote tool host is missing: ${missing.join(", ")}`);
-    }
-    this.remoteTools.clear();
-    for (const item of tools) this.remoteTools.set(item.name, item);
   }
 
   execute(
@@ -1420,9 +1399,6 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
   pi.on("before_agent_start", async (event, ctx) => {
     if (placementError) throw placementError;
     if (target.kind !== "sandbox" || !bridge) return;
-    const expectedTools = captureToolProviders();
-    await bridge.refresh(expectedTools);
-    installProxies();
     const localCwd = `Current working directory: ${target.localCwd}`;
     const environment = `Execution environment: ${target.os}. All tools and user shell commands run in ${target.os}; use relative workspace paths and answer environment questions for ${target.os}.`;
     return {

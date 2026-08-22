@@ -237,10 +237,6 @@ function handle(request) {
     bash(request);
     return;
   }
-  if (request.type === "manifest" && typeof request.id === "string") {
-    write({ type: "manifest", id: request.id, tools: manifest() });
-    return;
-  }
   if (request.type === "cancel" && typeof request.id === "string") {
     controllers.get(request.id)?.abort();
     const child = children.get(request.id);

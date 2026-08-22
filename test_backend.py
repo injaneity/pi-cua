@@ -45,18 +45,6 @@ class ResourceSelectionTests(unittest.TestCase):
             backend.sandbox_resources("linux", image="ghcr.io/acme/cua-linux:latest")
 
 
-class OperationLockTests(unittest.TestCase):
-    def test_fleet_creation_does_not_take_the_workspace_lock(self) -> None:
-        self.assertEqual(backend.operation_locks("create"), (backend.CONTROLLER_LOCK,))
-        self.assertEqual(
-            backend.operation_locks("prepare_execution"), (backend.WORKSPACE_LOCK,)
-        )
-        self.assertEqual(
-            backend.operation_locks("delete"),
-            (backend.CONTROLLER_LOCK, backend.WORKSPACE_LOCK),
-        )
-
-
 class ResourceCreationTests(unittest.IsolatedAsyncioTestCase):
     async def test_failed_create_releases_claim_record_and_custom_pool(self) -> None:
         sandbox = SimpleNamespace(delete=AsyncMock(side_effect=LookupError("gone")))
