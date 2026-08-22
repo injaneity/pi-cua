@@ -233,12 +233,6 @@ function sshArgs(
     `UserKnownHostsFile=${sandboxKnownHosts}`,
     "-o",
     "ConnectTimeout=10",
-    "-o",
-    "ControlMaster=auto",
-    "-o",
-    "ControlPersist=10m",
-    "-o",
-    `ControlPath=${homedir()}/.ssh/cua-%C`,
     "-T",
     `cua@${target.address}`,
   ];

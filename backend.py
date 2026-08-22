@@ -1656,12 +1656,6 @@ def ssh_options(profile: str) -> list[str]:
         f"UserKnownHostsFile={SANDBOX_KNOWN_HOSTS}",
         "-o",
         "ConnectTimeout=10",
-        "-o",
-        "ControlMaster=auto",
-        "-o",
-        "ControlPersist=10m",
-        "-o",
-        f"ControlPath={HOME / '.ssh' / 'cua-%C'}",
     ]
     if profile == "windows":
         options[:0] = ["-i", str(WINDOWS_PUBLIC_KEY.with_suffix(""))]
