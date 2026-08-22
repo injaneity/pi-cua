@@ -93,7 +93,7 @@ class ResourceCreationTests(unittest.IsolatedAsyncioTestCase):
         )
         with (
             patch.dict("sys.modules", {"cua_sandbox": sdk}),
-            patch.object(backend, "local_states", return_value=[]),
+            patch.object(backend, "managed_sandboxes", return_value=[]),
             patch.object(backend, "local_tailscale_identity", return_value={}),
             patch.object(
                 backend,
@@ -133,8 +133,8 @@ class ResourceCreationTests(unittest.IsolatedAsyncioTestCase):
         create.assert_awaited_once_with("linux", None, 16, 65536, PINNED_IMAGE)
 
 
-class LocalStateTests(unittest.TestCase):
-    def test_only_managed_fleet_claims_are_listed(self) -> None:
+class ManagedSandboxTests(unittest.TestCase):
+    def test_legacy_sdk_index_is_migrated_once(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state_dir = Path(directory)
             custom_pool = backend.sandbox_resources("linux", 16, 65536).pool
@@ -165,18 +165,21 @@ class LocalStateTests(unittest.TestCase):
                     backend, "SANDBOX_RECORD_DIR", controller_dir / "sandboxes"
                 ),
             ):
+                backend.migrate_legacy_sandbox_records()
                 self.assertEqual(
-                    backend.local_states(),
+                    backend.managed_sandboxes(),
                     [
                         {
                             "name": "linux-1",
                             "os": "linux",
                             "pool": custom_pool,
+                            "address": None,
                         }
                     ],
                 )
+                self.assertTrue((controller_dir / ".sdk-state-migrated").exists())
 
-    def test_local_state_preserves_controller_tailscale_address(self) -> None:
+    def test_controller_record_is_the_only_runtime_index(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state_dir = Path(directory)
             (state_dir / "linux-1.json").write_text(
@@ -200,7 +203,35 @@ class LocalStateTests(unittest.TestCase):
                     backend, "controller_sandboxes", return_value=[controller]
                 ),
             ):
-                self.assertEqual(backend.local_states(), [controller])
+                self.assertEqual(backend.managed_sandboxes(), [controller])
+
+    def test_sdk_connection_state_is_derived_from_controller_record(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = root / "sdk"
+            record_dir = root / "controller" / "sandboxes"
+            state_dir.mkdir()
+            record_dir.mkdir(parents=True)
+            (state_dir / "linux-1.json").write_text(
+                json.dumps({"runtime_type": "fleet", "pool_name": "stale-pool"})
+            )
+            (record_dir / "linux-1.json").write_text(
+                json.dumps(
+                    {
+                        "name": "linux-1",
+                        "os": "linux",
+                        "pool": "cua-pi-linux",
+                    }
+                )
+            )
+            with (
+                patch.object(backend, "STATE_DIR", state_dir),
+                patch.object(backend, "SANDBOX_RECORD_DIR", record_dir),
+            ):
+                backend.restore_cua_state("linux-1")
+
+            state = json.loads((state_dir / "linux-1.json").read_text())
+            self.assertEqual(state["pool_name"], "cua-pi-linux")
 
 
 class TailscaleTests(unittest.TestCase):
@@ -750,7 +781,7 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(
                 backend,
-                "local_states",
+                "managed_sandboxes",
                 return_value=[{"name": "linux-1", "os": "linux"}],
             ),
             patch.object(backend, "inspect_workspace", return_value=self.repository),
@@ -781,7 +812,7 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(
                 backend,
-                "local_states",
+                "managed_sandboxes",
                 return_value=[{"name": "linux-1", "os": "linux"}],
             ),
             patch.object(backend, "inspect_workspace", return_value=self.repository),
@@ -803,7 +834,7 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(
                 backend,
-                "local_states",
+                "managed_sandboxes",
                 return_value=[{"name": "linux-1", "os": "linux"}],
             ),
             patch.object(backend, "inspect_workspace", return_value=self.repository),
@@ -831,7 +862,7 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(
                 backend,
-                "local_states",
+                "managed_sandboxes",
                 return_value=[{"name": "linux-1", "os": "linux"}],
             ),
             patch.object(backend, "inspect_workspace", return_value=self.repository),
@@ -856,7 +887,7 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(
                 backend,
-                "local_states",
+                "managed_sandboxes",
                 return_value=[{"name": "linux-1", "os": "linux"}],
             ),
             patch.object(backend, "inspect_workspace", return_value=self.repository),
@@ -1001,7 +1032,7 @@ class VisibleOperationTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         with (
-            patch.object(backend, "local_states", return_value=[]),
+            patch.object(backend, "managed_sandboxes", return_value=[]),
             patch.object(backend, "next_name", return_value="linux-1"),
             patch.object(
                 backend,

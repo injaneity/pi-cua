@@ -3,7 +3,8 @@
 CUA publishes a Python SDK but no TypeScript SDK. This process boundary keeps Fleet
 credentials and platform bootstrap logic out of the Pi extension. Every invocation
 accepts one JSON argument and writes one JSON result to stdout; diagnostics stay on
-stderr. Named claims remain indexed by cua-sandbox in ``~/.cua/sandboxes``.
+stderr. Controller records are canonical; Fleet SDK connection state is materialized
+only at its API boundary.
 """
 
 from __future__ import annotations
@@ -322,17 +323,9 @@ def record_tailscale_enrollment(
 ) -> None:
     record = sandbox_record(name)
     if record is None:
-        state = next((item for item in local_states() if item["name"] == name), None)
-        if state is None:
-            raise RuntimeError(
-                f"cannot record Tailscale device for unknown sandbox: {name}"
-            )
-        record = {
-            "name": name,
-            "os": state["os"],
-            "pool": state["pool"],
-            "claim": {"pool": state["pool"]},
-        }
+        raise RuntimeError(
+            f"cannot record Tailscale device for unknown sandbox: {name}"
+        )
     write_sandbox_record(
         {
             **record,
@@ -356,7 +349,7 @@ def controller_sandbox_records() -> list[dict[str, Any]]:
 
 
 def pool_reference_count(pool_name: str) -> int:
-    return sum(item.get("pool") == pool_name for item in local_states())
+    return sum(item.get("pool") == pool_name for item in managed_sandboxes())
 
 
 def controller_sandboxes() -> list[dict[str, Any]]:
@@ -375,10 +368,42 @@ def controller_sandboxes() -> list[dict[str, Any]]:
     )
 
 
-def restore_cua_state(name: str) -> None:
-    state_path = STATE_DIR / f"{name}.json"
-    if state_path.exists():
+def migrate_legacy_sandbox_records() -> None:
+    """Import the pre-controller SDK index once, then leave records canonical."""
+    marker = CONTROLLER_DIR / ".sdk-state-migrated"
+    if marker.exists():
         return
+    if STATE_DIR.exists():
+        for path in STATE_DIR.glob("*.json"):
+            try:
+                state = json.loads(path.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            pool = state.get("pool_name")
+            profile = profile_for_pool(pool)
+            name = state.get("name", path.stem)
+            if (
+                state.get("runtime_type") == "fleet"
+                and profile
+                and isinstance(name, str)
+                and sandbox_record(name) is None
+            ):
+                write_sandbox_record(
+                    {
+                        "name": name,
+                        "os": profile,
+                        "pool": pool,
+                        "claim": {"pool": pool},
+                        "updatedAt": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+    CONTROLLER_DIR.mkdir(parents=True, exist_ok=True)
+    marker.touch()
+
+
+def restore_cua_state(name: str) -> None:
+    """Materialize the SDK connection index from the controller record."""
+    state_path = STATE_DIR / f"{name}.json"
     record = sandbox_record(name)
     if record is None or not isinstance(record.get("pool"), str):
         return
@@ -518,30 +543,8 @@ def configure_fleet_auth() -> None:
     )
 
 
-def local_states() -> list[dict[str, Any]]:
-    controller_items = controller_sandboxes()
-    for item in controller_items:
-        restore_cua_state(item["name"])
-    by_name = {item["name"]: item for item in controller_items}
-    if not STATE_DIR.exists():
-        return sorted(by_name.values(), key=lambda item: item["name"])
-    for path in STATE_DIR.glob("*.json"):
-        try:
-            state = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError):
-            continue
-        pool = state.get("pool_name")
-        profile = profile_for_pool(pool)
-        if state.get("runtime_type") == "fleet" and profile:
-            name = state.get("name", path.stem)
-            if isinstance(name, str):
-                by_name[name] = {
-                    **by_name.get(name, {}),
-                    "name": name,
-                    "os": profile,
-                    "pool": pool,
-                }
-    return sorted(by_name.values(), key=lambda item: item["name"])
+def managed_sandboxes() -> list[dict[str, Any]]:
+    return controller_sandboxes()
 
 
 async def guest_tailscale_identity(sb: Any, profile: str) -> tuple[str, str, list[str]]:
@@ -764,7 +767,7 @@ def validate_name(name: str) -> None:
 
 
 def next_name(profile: str) -> str:
-    used = {item["name"] for item in local_states()}
+    used = {item["name"] for item in managed_sandboxes()}
     for number in range(1, 1000):
         candidate = f"{profile}-{number}"
         if candidate not in used:
@@ -1131,7 +1134,7 @@ async def complete_tailscale_enrollment(
 
 
 async def ensure_one(name: str) -> dict[str, Any]:
-    states = {item["name"]: item for item in local_states()}
+    states = {item["name"]: item for item in managed_sandboxes()}
     if name not in states:
         raise ValueError(f"unknown managed sandbox: {name}")
     profile = states[name]["os"]
@@ -1195,7 +1198,7 @@ async def create_one(
     resources = sandbox_resources(profile, cpu, memory_mb, image_ref)
     name = requested_name or next_name(profile)
     validate_name(name)
-    if any(item["name"] == name for item in local_states()):
+    if any(item["name"] == name for item in managed_sandboxes()):
         raise ValueError(f"managed sandbox already exists: {name}")
     tailnet = local_tailscale_identity()
 
@@ -1273,7 +1276,7 @@ async def create_one(
 
 
 async def delete_one(name: str) -> dict[str, Any]:
-    states = {item["name"]: item for item in local_states()}
+    states = {item["name"]: item for item in managed_sandboxes()}
     if name not in states:
         raise ValueError(f"unknown managed sandbox: {name}")
     from cua_sandbox import Sandbox
@@ -2290,7 +2293,7 @@ async def prepare_execution(
     source: SandboxWorkspaceSource | None = None,
     tool_packages: tuple[str, ...] = (),
 ) -> dict[str, Any]:
-    states = {item["name"]: item for item in local_states()}
+    states = {item["name"]: item for item in managed_sandboxes()}
     if name not in states:
         raise ValueError(f"unknown managed sandbox: {name}")
     profile = states[name]["os"]
@@ -2381,7 +2384,7 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
                 "online": item["name"].lower() in online
                 or str(item.get("address") or "").lower() in online,
             }
-            for item in local_states()
+            for item in managed_sandboxes()
         ]
         return {"sandboxes": items}
     if action == "cleanup_workspace":
@@ -2444,6 +2447,7 @@ def main() -> None:
         if not isinstance(request, dict):
             raise TypeError("request must be a JSON object")
         action = str(request.get("action") or "")
+        migrate_legacy_sandbox_records()
         if action in CLOUD_ACTIONS and os.environ.get("CUA_CLOUD_WORKER") != "1":
             environment = {**os.environ, "CUA_CLOUD_WORKER": "1"}
             os.execvpe("uv", cloud_worker_command(request), environment)

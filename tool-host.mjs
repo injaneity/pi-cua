@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 
-import { spawn, execFileSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
-import { existsSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { join } from "node:path";
 
@@ -28,28 +27,15 @@ if (process.platform === "win32") {
   process.env.PATH = `/home/cua/.cargo/bin:${process.env.PATH || ""}`;
 }
 
-const npmRoots =
+const piRoot =
   process.platform === "win32"
-    ? [
-        join(
-          process.env.ProgramData || "C:\\ProgramData",
-          "npm",
-          "node_modules",
-        ),
-      ]
-    : [
-        execFileSync("npm", ["root", "-g"], { encoding: "utf8" }).trim(),
-        "/usr/local/lib/node_modules",
-        "/usr/lib/node_modules",
-      ];
-const piEntry = npmRoots
-  .map((root) =>
-    join(root, "@earendil-works", "pi-coding-agent", "dist", "index.js"),
-  )
-  .find(existsSync);
-if (!piEntry)
-  throw new Error("global pi-coding-agent installation was not found");
-const pi = await import(pathToFileURL(piEntry).href);
+    ? join(process.env.ProgramData || "C:\\ProgramData", "npm", "node_modules")
+    : "/usr/local/lib/node_modules";
+const pi = await import(
+  pathToFileURL(
+    join(piRoot, "@earendil-works", "pi-coding-agent", "dist", "index.js"),
+  ).href
+);
 
 // stdout is the protocol. Diagnostics belong on stderr.
 console.log = (...values) => console.error(...values);
