@@ -18,18 +18,17 @@ function Invoke-Icacls([string[]]$Arguments) {
   Remove-Item -Force -ErrorAction SilentlyContinue $stdout,$stderr
 }
 $git = 'C:\Program Files\Git\cmd\git.exe'
-if (-not (Test-Path $git)) {
-  $release = Invoke-RestMethod -Headers @{ 'User-Agent' = 'cua-pi-bootstrap' } -Uri 'https://api.github.com/repos/git-for-windows/git/releases/latest'
-  $asset = $release.assets | Where-Object { $_.name -match '^Git-[0-9].*-64-bit\.exe$' } | Select-Object -First 1
-  if (-not $asset) { throw 'No Git for Windows installer found' }
+$gitVersion = if (Test-Path $git) { (& $git --version) } else { '' }
+if ($gitVersion -notlike 'git version 2.55.0.windows.*') {
   $installer = 'C:\Windows\Temp\cua-git.exe'
-  Invoke-WebRequest -UseBasicParsing -Uri $asset.browser_download_url -OutFile $installer
+  Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/git-for-windows/git/releases/download/v2.55.0.windows.5/Git-2.55.0.5-64-bit.exe' -OutFile $installer
+  if ((Get-FileHash -Algorithm SHA256 $installer).Hash.ToLowerInvariant() -ne 'd065a4e23c3d9a6b5073d609b5be0830227ec3ca053c083ba385061ddfaf94c6') { throw 'Git installer digest mismatch' }
   $process = Start-Process -FilePath $installer -ArgumentList '/VERYSILENT','/NORESTART','/NOCANCEL','/SP-' -Wait -PassThru
   if ($process.ExitCode -ne 0) { throw "Git installer exited $($process.ExitCode)" }
   Remove-Item -Force $installer
 }
 Add-MachinePath 'C:\Program Files\Git\cmd'
-$nodeRoot = 'C:\cua\node-v22.20.0-win-x64'
+$nodeRoot = 'C:\cua\node'
 $node = "$nodeRoot\node.exe"
 $npm = "$nodeRoot\npm.cmd"
 $nodeVersion = if (Test-Path $node) { (& $node --version) } else { '' }
@@ -37,10 +36,15 @@ if ($nodeVersion -ne 'v22.20.0') {
   $nodeZip = 'C:\Windows\Temp\cua-node-v22.20.0-win-x64.zip'
   Invoke-WebRequest -UseBasicParsing -Uri 'https://nodejs.org/dist/v22.20.0/node-v22.20.0-win-x64.zip' -OutFile $nodeZip
   if ((Get-FileHash -Algorithm SHA256 $nodeZip).Hash.ToLowerInvariant() -ne 'bb819d6eb8f5bfda294bbc83a7e4ec6539da67c4233d54b0d655b9248b15e29d') { throw 'Node.js archive digest mismatch' }
-  Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $nodeRoot
-  Expand-Archive -Force -Path $nodeZip -DestinationPath 'C:\cua'
+  $nodeExtract = 'C:\Windows\Temp\cua-node-extract'
+  Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $nodeRoot,$nodeExtract
+  Expand-Archive -Force -Path $nodeZip -DestinationPath $nodeExtract
+  New-Item -ItemType Directory -Force -Path 'C:\cua' | Out-Null
+  Move-Item -Force "$nodeExtract\node-v22.20.0-win-x64" $nodeRoot
+  Remove-Item -Recurse -Force $nodeExtract
   Remove-Item -Force $nodeZip
 }
+Invoke-Icacls @($nodeRoot, '/grant:r', '*S-1-5-32-545:(OI)(CI)RX', '/T', '/C')
 $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
 $machineParts = @($machinePath -split ';' | Where-Object { $_ -and $_ -ne $nodeRoot })
 [Environment]::SetEnvironmentVariable('Path', ($nodeRoot + ';' + ($machineParts -join ';')), 'Machine')
@@ -64,9 +68,11 @@ if ($piVersion -ne '__PI_VERSION__') {
 Write-Output '::phase npm-complete'
 Add-MachinePath $npmPrefix
 $tailscale = 'C:\Program Files\Tailscale\tailscale.exe'
-if (-not (Test-Path $tailscale)) {
+$tailscaleVersion = if (Test-Path $tailscale) { (& $tailscale version | Select-Object -First 1) } else { '' }
+if ($tailscaleVersion -ne '1.102.3') {
   $msi = 'C:\Windows\Temp\cua-tailscale.msi'
-  Invoke-WebRequest -UseBasicParsing -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile $msi
+  Invoke-WebRequest -UseBasicParsing -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-1.102.3-amd64.msi' -OutFile $msi
+  if ((Get-FileHash -Algorithm SHA256 $msi).Hash.ToLowerInvariant() -ne '03ac8183c6e3ce276e9b44281ebe7e4c02aef28a971034ca170c4b665df42dce') { throw 'Tailscale installer digest mismatch' }
   $process = Start-Process -FilePath 'msiexec.exe' -ArgumentList '/i',"`"$msi`"",'/qn','/norestart' -Wait -PassThru
   if ($process.ExitCode -ne 0) { throw "Tailscale installer exited $($process.ExitCode)" }
   Remove-Item -Force $msi
@@ -96,44 +102,28 @@ public static class CuaUserEnv {
   $cuaHome = $profilePath.ToString()
 } else { $cuaHome = $profile.LocalPath }
 $agent = "$cuaHome\.pi\agent"
-$extensions = "$agent\extensions"
 $projects = 'C:\cua\projects'
 $sshDirectory = 'C:\ProgramData\ssh'
 $authorizedKeys = "$sshDirectory\cua_authorized_keys"
 Remove-Item -Force -ErrorAction SilentlyContinue "$agent\auth.json","$agent\models.json","$agent\APPEND_SYSTEM.md"
-Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $extensions,"$agent\prompt-templates","$agent\skills"
-New-Item -ItemType Directory -Force -Path $agent,$extensions,$projects,$sshDirectory | Out-Null
+New-Item -ItemType Directory -Force -Path $agent,$projects,$sshDirectory | Out-Null
 Expand-Archive -Force -Path 'C:\Windows\Temp\cua-pi-agent.zip' -DestinationPath $cuaHome
 Copy-Item -Force 'C:\Windows\Temp\cua-authorized-key.pub' $authorizedKeys
-# Files expanded by this SYSTEM bootstrap need an explicit grant, but the agent
-# also contains package caches created by cua. Limit recursion to the freshly
-# recreated extensions directory and grant the three uploaded host files
-# directly. Workspace content is created by cua, so only its root needs an
-# inheritable grant.
-Invoke-Icacls @($extensions, '/grant:r', 'cua:(OI)(CI)F', '/T', '/C')
-foreach ($agentFile in @("$agent\cua-tool-host.mjs", "$agent\cua-tool-broker.mjs", "$agent\cua-tool-relay.mjs")) {
-  Invoke-Icacls @($agentFile, '/grant:r', 'cua:F')
-}
+# The SYSTEM bootstrap owns only the desktop broker. Mutable host files and
+# extensions are synchronized later as cua.
+Invoke-Icacls @("$agent\cua-tool-broker.mjs", '/grant:r', 'cua:F')
 Invoke-Icacls @($projects, '/grant:r', 'cua:(OI)(CI)F')
 Invoke-Icacls @($authorizedKeys, '/inheritance:r', '/grant:r', 'cua:F', 'SYSTEM:F', 'Administrators:F')
 Write-Output '::phase acl-complete'
 $interactiveDesktop = Get-Process explorer -IncludeUserName -ErrorAction SilentlyContinue | Where-Object SessionId -GT 0 | Select-Object -First 1
 $interactiveUser = $interactiveDesktop.UserName
 if (-not $interactiveUser) { throw 'No interactive Windows desktop user is available for the Pi tool broker' }
-$brokerToken = "$agent\cua-tool-broker.token"
-if (-not (Test-Path $brokerToken)) {
-  $tokenBytes = New-Object byte[] 32
-  $random = [Security.Cryptography.RandomNumberGenerator]::Create()
-  try { $random.GetBytes($tokenBytes) } finally { $random.Dispose() }
-  Set-Content -Encoding ascii -NoNewline -Path $brokerToken -Value ([Convert]::ToBase64String($tokenBytes))
-}
 $brokerTask = 'CuaPiDesktopToolBroker'
-$brokerRunner = 'C:\ProgramData\cua-pi\start-desktop-tool-broker.vbs'
-New-Item -ItemType Directory -Force -Path (Split-Path $brokerRunner) | Out-Null
-Set-Content -Encoding ascii -Path $brokerRunner -Value ('CreateObject("WScript.Shell").Run """{0}"" ""{1}""", 0, True' -f $node, "$agent\cua-tool-broker.mjs")
 Stop-ScheduledTask -TaskName $brokerTask -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force -ErrorAction SilentlyContinue 'C:\cua\node-v22.20.0-win-x64'
+Remove-Item -Force -ErrorAction SilentlyContinue 'C:\ProgramData\cua-pi\start-desktop-tool-broker.vbs',"$agent\cua-tool-broker.token","$agent\cua-tool-relay.mjs"
 Unregister-ScheduledTask -TaskName $brokerTask -Confirm:$false -ErrorAction SilentlyContinue
-$brokerAction = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$brokerRunner`""
+$brokerAction = New-ScheduledTaskAction -Execute $node -Argument "`"$agent\cua-tool-broker.mjs`""
 $brokerTrigger = New-ScheduledTaskTrigger -AtLogOn -User $interactiveUser
 $brokerPrincipal = New-ScheduledTaskPrincipal -UserId $interactiveUser -LogonType Interactive -RunLevel Highest
 $brokerSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero)
@@ -152,6 +142,8 @@ Port 22
 PubkeyAuthentication yes
 PasswordAuthentication no
 PermitEmptyPasswords no
+AllowTcpForwarding local
+PermitOpen 127.0.0.1:43121
 AuthorizedKeysFile C:/ProgramData/ssh/cua_authorized_keys
 Subsystem sftp sftp-server.exe
 AllowUsers cua

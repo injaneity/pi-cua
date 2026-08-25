@@ -17,14 +17,13 @@ security add-generic-password -U -s cua-sandbox-tailscale-oauth -a client-id -w 
 security add-generic-password -U -s cua-sandbox-tailscale-oauth -a client-secret -w "$TAILSCALE_CLIENT_SECRET"
 ```
 
-windows provisioning also requires `~/.ssh/cua_windows_ed25519` and its `.pub` file. the local project must be a git repository with a network `origin`.
+Pi Cua reads these standard environment variables first and uses Keychain as the durable fallback. Windows provisioning generates its dedicated SSH identity automatically. the local project must be a Git repository with a network `origin`.
 
 ## behavior
 
-- `/sandbox` opens a compact action search. while a sandbox is active, `stay on <current target>` appears first in neutral bold and gains the selection accent only when highlighted, followed by the action to sync back to local. while local, the no-op `stay on local` row is omitted. every session can connect to another online sandbox or create a sandbox. connect and create open focused nested searches where Escape returns to the action search, and create entries use the prompt-template heading accent when selected. `/sandbox linux 16 65536` creates a sandbox with 16 CPUs and 65536 MiB of memory; omitting both values uses the existing OS defaults.
-- `/new` and `/fork` start local; use `/sandbox` to opt into sandbox execution for the new thread.
+- `/sandbox` opens a compact action search. while a sandbox is active, the first action syncs back to the local directory; staying on the current target requires no action, so Escape closes the search without changing it. every session can connect to another online sandbox or create a sandbox; the connect action shows the number of online choices after excluding the active sandbox. connect and create open focused nested searches where Escape returns to the action search, and create entries use the prompt-template heading accent when selected. `/sandbox linux 16 65536` creates a sandbox with 16 CPUs and 65536 MiB of memory; omitting both values uses the existing OS defaults. `/new` and `/fork` hand the active sandbox workspace to the replacement session without syncing or tearing it down.
 - `/tree` changes conversation history but never changes execution placement.
-- `/resume` restores placement from durable session metadata, with the controller database as a compatibility fallback for older sessions.
+- `/resume` restores placement from Pi's durable session metadata. a session that shut down cleanly after sandbox use resumes locally because shutdown first syncs and removes its generated workspace.
 - the footer shows the selected sandbox. no remote tui or conversation session is created.
 
 custom images are available through the structured `cua_sandbox` create action's `image` field. they must be Fleet-compatible CUA containerDisks and pinned by `sha256` digest; mutable tags are rejected.
@@ -33,33 +32,35 @@ custom images are available through the structured `cua_sandbox` create action's
 
 ## execution path
 
-1. the controller reuses a persistent ssh connection and takes a direct health fast path for an already bootstrapped sandbox; it contacts Fleet only for repair or bootstrap;
-2. it prepares the destination from the thread's local Git baseline, then applies the accumulated workspace delta from the active sandbox;
-3. the extension starts one non-tty ssh jsonl channel; linux runs `cua-tool-host.mjs` directly, while windows authenticates a loopback relay to a broker in the existing interactive desktop session;
-4. the host loads pi's normal remote tool registry and reports its protocol and tool manifest;
-5. calls, updates, results, errors, cancellation, and user shell output use that channel. `Esc` rejects the local request immediately and asks the host to kill the full remote command process tree.
+1. the extension starts one backend process and reads progress and the final result from its jsonl stream; healthy setup uses the controller's existing Python, while provisioning and repair re-exec under the isolated Fleet sdk runtime;
+2. one ssh preflight checks machine health, free disk, the mutable guest-bundle digest, and repository-cache availability;
+3. one content-addressed guest bundle is created only when extension files or routed-tool package settings need an update;
+4. one workspace command prepares an isolated clone from the shared object cache, then applies one direct Git tree patch from the source state to the final destination state;
+5. the extension starts one non-tty ssh jsonl channel; linux runs `cua-tool-host.mjs` directly, while Windows uses OpenSSH direct-TCP forwarding to the existing interactive desktop broker;
+6. the host loads pi's normal remote tool registry and reports its protocol and tool manifest;
+7. calls, updates, results, errors, cancellation, and user shell output use that channel. `Esc` rejects the local request immediately and asks the host to kill the full remote command process tree.
 
-all target changes use one workspace model: Pi records local and sandbox Git trees at sandbox entry, computes the accumulated binary tree diff when leaving a sandbox, verifies the destination baseline, and applies that diff. local divergence or a patch conflict stops the switch, and failure leaves the previous target active.
+all target changes use one workspace model: Pi records local and sandbox Git trees at sandbox entry, computes one accumulated binary tree diff from the original commit to the source's final tree, verifies the destination tree, and applies that diff. after a successful move to local or another sandbox, it removes the source workspace, including ignored build outputs. graceful quit and resume shutdowns sync to local and remove the remote workspace. `/new` and `/fork` hand the existing workspace directly to the replacement session. reload checks only machine and mutable configuration before reconnecting. startup and resume validate the saved workspace and reconstruct it from the local tree if it is missing. local divergence, a patch conflict, or cleanup failure is reported explicitly, and a failed sync retains the remote workspace rather than deleting the only copy of changes.
 
 ## state
 
-execution placement is stored as non-context session metadata and mirrored in the controller database. restore reads the latest placement across the full session rather than the active branch, so `/tree` and compaction cannot change it.
+execution placement is stored only as non-context Pi session metadata. restore reads the latest placement across the full session rather than the active branch, so `/tree` and compaction cannot change it. the controller keeps one atomic json record per managed sandbox; no database or background operation queue is involved.
 
-sandbox workspaces are keyed by session id. new threads and forks start from an exact snapshot of the current local checkout. a fork does not copy its parent's active sandbox workspace, so both threads retain independently verifiable local baselines.
+sandbox workspaces receive an opaque id when prepared. `/new` and `/fork` transfer ownership of the active workspace to the replacement session; the previous session records local placement. failed destination setup removes its incomplete workspace before returning the error.
 
-placement adds a stable operating-system instruction and logical `workspace root` cwd to the model prompt, but no sandbox name, physical path, or model-visible conversation entry. forks on the same target OS therefore keep the same prompt prefix for provider cache hits even though they receive different physical workspaces.
+placement adds a stable operating-system instruction and logical `workspace root` cwd to the model prompt, but no sandbox name, physical path, or model-visible conversation entry. replacement sessions on the same target OS therefore keep the same prompt prefix for provider cache hits.
 
-tool state belongs to the active remote host. switching targets invalidates target-specific references and background processes.
+tool state belongs to the active remote host. switching targets retires that host and invalidates target-specific references and background processes. a Windows session replacement can reattach to the workspace-scoped host because the desktop broker owns it; Linux starts a fresh host on the new SSH channel.
 
-pi-cua emits `cua:execution-target-changed` with local, connecting, and ready target states. a custom footer can consume this event without coupling its layout to the controller.
+pi-cua emits `cua:execution-target-changed` with local, connecting, failed, and ready target states. a custom footer can consume this event without coupling its layout to the controller.
 
 ## guest boundary
 
-the guest receives the pi sdk version, only the user packages that own routed tools, top-level extension definitions, and the generic tool host. the host activates lifecycle handlers only for extensions that own required tools. it does not receive local model credentials, prompts, conversation sessions, or the sandbox controller.
+the guest receives the pi sdk version, only the user packages that own routed tools, top-level extension definitions, and the generic tool host. machine bootstrap owns operating-system dependencies and the Windows desktop broker; mutable Pi configuration owns the tool host, extensions, and settings. separate content digests let an extension edit synchronize a small archive instead of reinstalling or repairing the sandbox. the host activates lifecycle handlers only for extensions that own required tools. it does not receive local model credentials, prompts, conversation sessions, or the sandbox controller.
 
-workspace preparation requires a git repository with a network `origin` and does not support submodules, Git content filters, or working-tree encodings. if the guest cannot authenticate to the origin, the controller sends a clean commit snapshot and creates an isolated baseline without copying git credentials. new threads, existing local threads, and forks carry the local changes, limited to 200 mib. guests keep a bare repository cache outside all workspaces, so fresh sessions and forks reuse git objects without sharing mutable files. package-manager caches also remain in the guest user profile. every handoff transfers only the accumulated binary Git tree diff; `.git`, ignored files, credentials, caches, and processes stay with their machine.
+workspace preparation requires a git repository with a network `origin` and does not support submodules, Git content filters, or working-tree encodings. if the guest cannot authenticate to the origin, the controller sends a clean commit snapshot and creates an isolated baseline without copying git credentials. entering a sandbox from local carries local changes, limited to 200 mib. guests keep one bare repository cache outside all workspaces; isolated clones borrow its objects through Git alternates instead of duplicating packs or sharing mutable Git configuration. package-manager caches remain in the guest user profile. target changes between local and sandbox environments transfer only the accumulated binary Git tree diff, then remove the generated source workspace. `/new` and `/fork` instead transfer ownership of the active workspace without copying it. ignored files, credentials, caches, and processes are not transferred as task state.
 
-on Windows, OpenSSH remains in Session 0. it can reach only an authenticated loopback relay. the relay starts the tool host under the logged-in desktop user's scheduled-task broker, so GUI tools and shell commands share Session 1 without exposing the broker off-machine.
+on Windows, OpenSSH remains in Session 0 and forwards its authenticated channel directly to the loopback-only broker. the logged-in user's scheduled task runs that broker directly and keeps workspace-scoped Pi hosts in Session 1, so GUI tools and shell commands share the interactive desktop without another remote process. disconnects detach from the host; reconnects reuse it until its workspace is retired or its tool configuration changes.
 
 ## verification
 
@@ -67,9 +68,8 @@ on Windows, OpenSSH remains in Session 0. it can reach only an authenticated loo
 uvx --quiet ruff format --check backend.py test_backend.py
 uvx --quiet ruff check backend.py test_backend.py
 python3 -m unittest -q test_backend.py
-node test-session-targets.mjs
 node test-tool-broker.mjs
-npm exec --yes --package=prettier -- prettier --check index.ts session-targets.mjs test-session-targets.mjs tool-host.mjs tool-broker.mjs tool-relay.mjs test-tool-broker.mjs
+npm exec --yes --package=prettier -- prettier --check index.ts tool-host.mjs tool-broker.mjs test-tool-broker.mjs
 node --check tool-host.mjs
 pi --list-models
 ```

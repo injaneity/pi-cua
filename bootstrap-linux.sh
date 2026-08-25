@@ -2,18 +2,24 @@ set -eu
 SUDO=""
 if [ "$(id -u)" -ne 0 ]; then SUDO="sudo"; fi
 if ! id cua >/dev/null 2>&1; then $SUDO useradd --create-home --shell /bin/bash cua; fi
-if ! command -v curl >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1; then
+if ! command -v curl >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1 || ! command -v xz >/dev/null 2>&1; then
   $SUDO apt-get update -qq
-  $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y curl git ca-certificates tar
+  $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y curl git ca-certificates tar xz-utils
 fi
-if ! command -v npm >/dev/null 2>&1; then
-  curl -fsSL https://deb.nodesource.com/setup_22.x | $SUDO bash -
-  $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs
+if ! node --version 2>/dev/null | grep -qx 'v22.20.0'; then
+  node_archive=/tmp/node-v22.20.0-linux-x64.tar.xz
+  node_root=/usr/local/lib/node-v22.20.0-linux-x64
+  curl -fsSL https://nodejs.org/dist/v22.20.0/node-v22.20.0-linux-x64.tar.xz -o "$node_archive"
+  printf '%s  %s\n' '00bbd05e306ea68b6e13e17360d0e2f680b493ef95f2fea1c4296ff7437530bc' "$node_archive" | sha256sum -c -
+  $SUDO rm -rf "$node_root"
+  $SUDO tar -xJf "$node_archive" -C /usr/local/lib
+  for executable in node npm npx corepack; do $SUDO ln -sf "$node_root/bin/$executable" "/usr/local/bin/$executable"; done
+  rm -f "$node_archive"
 fi
-if ! pi --version 2>/dev/null | grep -q '__PI_VERSION__'; then
-  npm_root=$(npm root -g)
-  $SUDO rm -rf "$npm_root/@earendil-works/pi-coding-agent" "$npm_root/@earendil-works"/.pi-coding-agent-*
-  $SUDO npm install -g --ignore-scripts @earendil-works/pi-coding-agent@__PI_VERSION__
+pi_package=/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/package.json
+if [ ! -f "$pi_package" ] || ! grep -q '"version": "__PI_VERSION__"' "$pi_package"; then
+  $SUDO rm -rf /usr/local/lib/node_modules/@earendil-works/pi-coding-agent /usr/local/lib/node_modules/@earendil-works/.pi-coding-agent-*
+  $SUDO npm install -g --prefix /usr/local --ignore-scripts @earendil-works/pi-coding-agent@__PI_VERSION__
 fi
 if ! /home/cua/.cargo/bin/cargo --version 2>/dev/null | grep -q 'cargo 1.88.0'; then
   curl -fsSL https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init -o /tmp/rustup-init
@@ -27,16 +33,16 @@ if ! /home/cua/.cargo/bin/cargo --version 2>/dev/null | grep -q 'cargo 1.88.0'; 
   fi
   rm -f /tmp/rustup-init
 fi
-if ! command -v tailscale >/dev/null 2>&1; then curl -fsSL https://tailscale.com/install.sh | sh; fi
-if command -v systemctl >/dev/null 2>&1; then
-  $SUDO systemctl enable --now tailscaled
-else
-  $SUDO service tailscaled start
+if ! tailscale version 2>/dev/null | head -n 1 | grep -qx '1.102.3'; then
+  tailscale_deb=/tmp/tailscale_1.102.3_amd64.deb
+  curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/pool/tailscale_1.102.3_amd64.deb -o "$tailscale_deb"
+  printf '%s  %s\n' '88e1b0319da94a52ea409a1a5935e4e7215065a25cd99bc509b6dcbb73737fae' "$tailscale_deb" | sha256sum -c -
+  $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y "$tailscale_deb"
+  rm -f "$tailscale_deb"
 fi
+$SUDO systemctl enable --now tailscaled
 $SUDO rm -f /home/cua/.pi/agent/auth.json /home/cua/.pi/agent/models.json /home/cua/.pi/agent/APPEND_SYSTEM.md
-$SUDO rm -rf /home/cua/.pi/agent/extensions /home/cua/.pi/agent/prompt-templates /home/cua/.pi/agent/skills
-$SUDO mkdir -p /home/cua/.pi/agent/extensions /home/cua/projects
-$SUDO tar -xzf /tmp/cua-pi-agent.tgz -C /home/cua
+$SUDO mkdir -p /home/cua/.pi/agent /home/cua/projects
 $SUDO chown -R cua:cua /home/cua/.pi /home/cua/projects
 TS_AUTH_KEY="$(cat /tmp/cua-tailscale-auth-key)"
 $SUDO tailscale up --reset \
@@ -48,5 +54,5 @@ unset TS_AUTH_KEY
 $SUDO install -d -o cua -g cua /home/cua/.cua-pi
 printf '%s\n' '__BOOTSTRAP_VERSION__' | $SUDO tee /home/cua/.cua-pi/bootstrap-version >/dev/null
 $SUDO chown cua:cua /home/cua/.cua-pi/bootstrap-version
-$SUDO rm -f /tmp/cua-tailscale-auth-key /tmp/cua-pi-agent.tgz
+$SUDO rm -f /tmp/cua-tailscale-auth-key
 tailscale ip -4 | head -n 1

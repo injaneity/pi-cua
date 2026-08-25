@@ -6,6 +6,7 @@ import {
   type ReadToolInput,
   type ExtensionCommandContext,
   type ExtensionContext,
+  SessionManager,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -17,7 +18,6 @@ import {
   visibleWidth,
 } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
-import { shouldUseControllerTool } from "./session-targets.mjs";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { homedir } from "node:os";
@@ -29,8 +29,41 @@ const backend = join(extensionDir, "backend.py");
 const windowsIdentity = join(homedir(), ".ssh", "cua_windows_ed25519");
 const sandboxKnownHosts = join(homedir(), ".ssh", "cua_known_hosts");
 const protocolVersion = 2;
+const maxProtocolLine = 1024 * 1024;
 const executionTargetEntry = "cua-execution-target";
+const executionTargetHandoffEntry = "cua-execution-target-handoff";
 const localTools = new Set(["cua_sandbox", "report_papercut"]);
+
+function latestCustomEntryData(
+  entries: Array<{ type: string; customType?: string; data?: unknown }>,
+  customType: string,
+): unknown {
+  for (let index = entries.length - 1; index >= 0; index--) {
+    const entry = entries[index]!;
+    if (entry.type === "custom" && entry.customType === customType)
+      return entry.data;
+  }
+  return undefined;
+}
+
+function shouldHandoffExecutionTarget(reason: string): boolean {
+  return reason === "new" || reason === "fork";
+}
+
+function shouldUseControllerTool(
+  toolName: string,
+  input: unknown,
+): input is ReadToolInput {
+  if (toolName !== "read" || input === null || typeof input !== "object")
+    return false;
+  const path = (input as { path?: unknown }).path;
+  return (
+    typeof path === "string" &&
+    /^\/(?:private\/)?var\/folders\/[^/]+\/[^/]+\/T\/pi-clipboard-[^/]+\.(?:png|jpe?g|gif|webp|bmp)$/i.test(
+      path,
+    )
+  );
+}
 
 const resourceSchema = Type.Object({
   action: StringEnum(["list", "create", "ensure", "delete"] as const),
@@ -72,12 +105,13 @@ type SandboxItem = {
   name: string;
   os: SandboxOS;
   pool: string;
+  address?: string;
   online: boolean;
 };
 type WorkspaceState = {
   version: 1;
   localRoot: string;
-  // immutable objects captured when this thread first enters a sandbox
+  // immutable objects captured when this workspace first enters a sandbox
   commit: string;
   commitTree: string;
   baselineTree: string;
@@ -85,22 +119,33 @@ type WorkspaceState = {
 type BackendResult = {
   ok: boolean;
   error?: string;
-  operation_id?: string;
-  operation_log?: string;
-  console_log?: string;
+  error_type?: string;
+  progress?: boolean;
   phase?: string;
   message?: string;
-  result?: BackendResult;
   sandboxes?: SandboxItem[];
   name?: string;
   os?: SandboxOS;
   address?: string;
   changed?: boolean;
-  state?: string;
   remote_cwd?: string;
   workspace_state?: WorkspaceState;
-  target?: unknown;
+  runtime_digest?: string;
+  additions?: number;
+  deletions?: number;
+  pending_sync?: boolean;
+  sync_safe?: boolean;
+  removed?: boolean;
 };
+class BackendError extends Error {
+  constructor(
+    message: string,
+    readonly errorType?: string,
+  ) {
+    super(message);
+  }
+}
+
 type Destination =
   { kind: "local" } | { kind: "sandbox"; name: string; os: SandboxOS };
 type ExecutionTarget =
@@ -113,6 +158,7 @@ type ExecutionTarget =
       localCwd: string;
       remoteCwd: string;
       workspaceState: WorkspaceState;
+      runtimeDigest?: string;
     };
 type UIContext = ExtensionContext | ExtensionCommandContext;
 
@@ -177,10 +223,6 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'\"'\"'`)}'`;
 }
 
-function powershellQuote(value: string): string {
-  return `'${value.replaceAll("'", "''")}'`;
-}
-
 function sshArgs(
   target: Extract<ExecutionTarget, { kind: "sandbox" }>,
 ): string[] {
@@ -195,29 +237,29 @@ function sshArgs(
     "-o",
     "ConnectTimeout=10",
     "-o",
-    "ControlMaster=auto",
-    "-o",
-    "ControlPersist=10m",
-    "-o",
-    `ControlPath=${homedir()}/.ssh/cua-%C`,
+    "LogLevel=ERROR",
     "-T",
+    ...(target.os === "windows" ? ["-W", "127.0.0.1:43121"] : []),
     `cua@${target.address}`,
   ];
 }
 
+function encodedToolManifest(
+  expectedTools: string[],
+  runtimeDigest?: string,
+): string {
+  return Buffer.from(
+    JSON.stringify({
+      tools: expectedTools,
+      runtimeDigest: runtimeDigest ?? null,
+    }),
+  ).toString("base64");
+}
+
 function hostCommand(
   target: Extract<ExecutionTarget, { kind: "sandbox" }>,
-  expectedTools: string[],
+  manifest: string,
 ): string {
-  const manifest = Buffer.from(JSON.stringify(expectedTools)).toString(
-    "base64",
-  );
-  if (target.os === "windows") {
-    return [
-      `Set-Location ${powershellQuote(target.remoteCwd)}`,
-      `& 'C:\\cua\\node-v22.20.0-win-x64\\node.exe' $HOME/.pi/agent/cua-tool-relay.mjs ${powershellQuote(target.remoteCwd)} ${powershellQuote(manifest)}`,
-    ].join("; ");
-  }
   return `cd ${shellQuote(target.remoteCwd)} && exec node /home/cua/.pi/agent/cua-tool-host.mjs ${shellQuote(target.remoteCwd)} ${shellQuote(manifest)}`;
 }
 
@@ -228,7 +270,6 @@ class ToolBridge {
   private stderr = "";
   private ready = false;
   private readonly remoteTools = new Map<string, RemoteToolInfo>();
-  private sequence = 0;
 
   constructor(
     private readonly target: Extract<ExecutionTarget, { kind: "sandbox" }>,
@@ -245,11 +286,6 @@ class ToolBridge {
     if (!message.id) return;
     const pending = this.pending.get(message.id);
     if (!pending) return;
-    if (message.type === "manifest" && message.tools) {
-      this.pending.delete(message.id);
-      pending.resolve(message.tools);
-      return;
-    }
     if (message.type === "update" && message.update) {
       pending.onUpdate?.(message.update);
       return;
@@ -282,14 +318,32 @@ class ToolBridge {
     if (this.startPromise) return this.startPromise;
     this.startPromise = new Promise<void>((resolve, reject) => {
       this.stderr = "";
+      const manifest = encodedToolManifest(
+        this.expectedTools,
+        this.target.runtimeDigest,
+      );
       const child = spawn(
         "ssh",
-        [...sshArgs(this.target), hostCommand(this.target, this.expectedTools)],
+        [
+          ...sshArgs(this.target),
+          ...(this.target.os === "linux"
+            ? [hostCommand(this.target, manifest)]
+            : []),
+        ],
         {
           stdio: ["pipe", "pipe", "pipe"],
         },
       );
       this.child = child;
+      if (this.target.os === "windows") {
+        child.stdin.write(
+          `${JSON.stringify({
+            type: "open",
+            cwd: this.target.remoteCwd,
+            manifest,
+          })}\n`,
+        );
+      }
       const decoder = new StringDecoder("utf8");
       let stdout = "";
       const timeout = setTimeout(() => {
@@ -300,12 +354,26 @@ class ToolBridge {
       }, 300_000);
       child.stdout.on("data", (chunk: Buffer) => {
         stdout += decoder.write(chunk);
+        if (stdout.length > maxProtocolLine && !stdout.includes("\n")) {
+          child.kill();
+          reject(
+            new Error("remote tool host exceeded the protocol line limit"),
+          );
+          return;
+        }
         for (;;) {
           const index = stdout.indexOf("\n");
           if (index < 0) break;
           const line = stdout.slice(0, index).replace(/\r$/, "");
           stdout = stdout.slice(index + 1);
           if (!line) continue;
+          if (line.length > maxProtocolLine) {
+            child.kill();
+            reject(
+              new Error("remote tool host exceeded the protocol line limit"),
+            );
+            return;
+          }
           try {
             const message = JSON.parse(line) as HostMessage;
             if (message.type === "ready") {
@@ -417,21 +485,6 @@ class ToolBridge {
     });
   }
 
-  async refresh(expectedTools: string[]): Promise<void> {
-    const id = `manifest-${++this.sequence}`;
-    const tools = await this.request<RemoteToolInfo[]>(id, {
-      type: "manifest",
-      id,
-    });
-    const names = new Set(tools.map((item) => item.name));
-    const missing = expectedTools.filter((name) => !names.has(name));
-    if (missing.length > 0) {
-      throw new Error(`remote tool host is missing: ${missing.join(", ")}`);
-    }
-    this.remoteTools.clear();
-    for (const item of tools) this.remoteTools.set(item.name, item);
-  }
-
   execute(
     toolName: string,
     id: string,
@@ -465,11 +518,11 @@ class ToolBridge {
     );
   }
 
-  close(): void {
+  close(dispose = false): void {
     const child = this.child;
     if (!child) return;
     if (child.stdin.writable) {
-      this.send({ type: "shutdown" });
+      this.send({ type: dispose ? "shutdown" : "detach" });
       child.stdin.end();
     }
     const killTimer = setTimeout(() => child.kill(), 1_000);
@@ -477,30 +530,6 @@ class ToolBridge {
     this.child = undefined;
     this.ready = false;
   }
-}
-
-function delay(milliseconds: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(resolve, milliseconds);
-    signal?.addEventListener(
-      "abort",
-      () => {
-        clearTimeout(timer);
-        reject(signal.reason ?? new Error("operation cancelled"));
-      },
-      { once: true },
-    );
-  });
-}
-
-function lastJson(stdout: string): BackendResult {
-  const lines = stdout.trim().split(/\r?\n/).filter(Boolean);
-  for (let index = lines.length - 1; index >= 0; index--) {
-    try {
-      return JSON.parse(lines[index]) as BackendResult;
-    } catch {}
-  }
-  throw new Error(stdout.trim() || "cua backend returned no result");
 }
 
 function creationDescription(
@@ -572,6 +601,8 @@ function parseTarget(value: unknown): ExecutionTarget | undefined {
     localCwd: data.localCwd,
     remoteCwd: data.remoteCwd,
     workspaceState: sync as WorkspaceState,
+    runtimeDigest:
+      typeof data.runtimeDigest === "string" ? data.runtimeDigest : undefined,
   };
 }
 
@@ -579,114 +610,109 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
   let target: ExecutionTarget = { kind: "local" };
   let placementError: Error | undefined;
   let bridge: ToolBridge | undefined;
+  let workspaceDiffGeneration = 0;
   const proxiedTools = new Set<string>();
   const toolPackages = new Set<string>();
-
-  async function executeBackend(
-    request: Record<string, unknown>,
-    signal?: AbortSignal,
-  ): Promise<BackendResult> {
-    const result = await pi.exec(
-      "python3",
-      [backend, JSON.stringify(request)],
-      {
-        signal,
-        timeout: 15_000,
-      },
-    );
-    const parsed = lastJson(result.stdout);
-    if (result.code === 0 && parsed.ok) return parsed;
-    const context = [parsed.operation_id, parsed.phase]
-      .filter((value) => typeof value === "string")
-      .join("/");
-    const log = parsed.operation_log ? `; log: ${parsed.operation_log}` : "";
-    throw new Error(
-      `${context ? `[${context}] ` : ""}${parsed.error || result.stderr.trim() || "cua operation failed"}${log}`,
-    );
-  }
 
   async function runBackend(
     request: Record<string, unknown>,
     signal?: AbortSignal,
     onStatus?: (status: BackendResult) => void,
   ): Promise<BackendResult> {
-    let status = await executeBackend(request, signal);
-    const operationId = status.operation_id;
-    if (
-      typeof operationId !== "string" ||
-      !["queued", "running", "cancel_requested"].includes(status.state ?? "")
-    ) {
-      return status;
-    }
-    try {
-      while (
-        ["queued", "running", "cancel_requested"].includes(status.state ?? "")
-      ) {
-        await delay(500, signal);
-        status = await executeBackend({
-          action: "operation_status",
-          operation_id: operationId,
-        });
-        onStatus?.(status);
-      }
-    } catch (error) {
-      if (signal?.aborted) {
-        await executeBackend({
-          action: "operation_cancel",
-          operation_id: operationId,
-        }).catch(() => undefined);
-      }
-      throw error;
-    }
-    if (status.state === "succeeded" && status.result) return status.result;
-    const log = status.console_log ?? status.operation_log;
-    throw new Error(
-      `[${operationId}/${status.phase ?? status.state}] ${status.error ?? status.message ?? "cua operation failed"}${log ? `; log: ${log}` : ""}`,
-    );
+    if (signal?.aborted) throw new Error("operation cancelled");
+    return new Promise((resolve, reject) => {
+      const child = spawn("python3", [backend, JSON.stringify(request)], {
+        detached: true,
+        env: { ...process.env, CUA_PROGRESS_JSON: "1" },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      const decoder = new StringDecoder("utf8");
+      let stdout = "";
+      let stderr = "";
+      let result: BackendResult | undefined;
+      let settled = false;
+      const finish = (callback: () => void) => {
+        if (settled) return;
+        settled = true;
+        signal?.removeEventListener("abort", onAbort);
+        callback();
+      };
+      const onAbort = () => {
+        if (child.pid) {
+          try {
+            process.kill(-child.pid, "SIGTERM");
+          } catch {
+            child.kill("SIGTERM");
+          }
+        }
+      };
+      const consume = () => {
+        for (;;) {
+          const newline = stdout.indexOf("\n");
+          if (newline < 0) break;
+          const line = stdout.slice(0, newline).replace(/\r$/, "");
+          stdout = stdout.slice(newline + 1);
+          if (!line) continue;
+          try {
+            const message = JSON.parse(line) as BackendResult;
+            if (message.progress) onStatus?.(message);
+            else result = message;
+          } catch {
+            stderr = `${stderr}\ninvalid backend output: ${line}`.slice(-8_000);
+          }
+        }
+        if (stdout.length > 1024 * 1024) onAbort();
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      child.stdout.on("data", (chunk: Buffer) => {
+        stdout += decoder.write(chunk);
+        consume();
+      });
+      child.stderr.on("data", (chunk: Buffer) => {
+        stderr = `${stderr}${chunk.toString()}`.slice(-8_000);
+      });
+      child.on("error", (error) => finish(() => reject(error)));
+      child.on("close", (code) => {
+        stdout += decoder.end();
+        if (stdout && !stdout.endsWith("\n")) stdout += "\n";
+        consume();
+        if (signal?.aborted) {
+          finish(() => reject(new Error("operation cancelled")));
+          return;
+        }
+        if (code === 0 && result?.ok) {
+          finish(() => resolve(result!));
+          return;
+        }
+        const context = result?.phase ? `[${result.phase}] ` : "";
+        const detail = result?.error || stderr.trim() || "cua operation failed";
+        finish(() =>
+          reject(new BackendError(`${context}${detail}`, result?.error_type)),
+        );
+      });
+    });
   }
 
   function loadSessionTarget(ctx: UIContext): ExecutionTarget | undefined {
-    const entries = ctx.sessionManager.getEntries();
-    for (let index = entries.length - 1; index >= 0; index--) {
-      const entry = entries[index];
-      if (entry.type === "custom" && entry.customType === executionTargetEntry)
-        return parseTarget(entry.data);
-    }
-    return undefined;
+    return parseTarget(
+      latestCustomEntryData(
+        ctx.sessionManager.getEntries(),
+        executionTargetEntry,
+      ),
+    );
   }
 
-  async function loadTarget(
-    ctx: UIContext,
+  function loadHandoffTarget(
     previousSessionFile?: string,
-  ): Promise<{ target: ExecutionTarget | undefined; persisted: boolean }> {
-    const sessionTarget = loadSessionTarget(ctx);
-    if (sessionTarget) return { target: sessionTarget, persisted: true };
-    const current = await runBackend({
-      action: "get_execution_target",
-      session_id: ctx.sessionManager.getSessionId(),
-      session_file:
-        ctx.sessionManager.getSessionFile() ?? previousSessionFile ?? "",
-    });
-    const saved = parseTarget(current.target);
-    if (saved || !previousSessionFile)
-      return { target: saved, persisted: false };
-    const inherited = await runBackend({
-      action: "get_execution_target",
-      session_file: previousSessionFile,
-    });
-    return { target: parseTarget(inherited.target), persisted: false };
+  ): ExecutionTarget | undefined {
+    if (!previousSessionFile) return undefined;
+    const previous = SessionManager.open(previousSessionFile);
+    return parseTarget(
+      latestCustomEntryData(previous.getEntries(), executionTargetHandoffEntry),
+    );
   }
 
-  async function saveTarget(
-    next: ExecutionTarget,
-    ctx: UIContext,
-  ): Promise<void> {
-    await runBackend({
-      action: "set_execution_target",
-      session_id: ctx.sessionManager.getSessionId(),
-      session_file: ctx.sessionManager.getSessionFile() ?? "",
-      target: next,
-    });
+  function saveTarget(next: ExecutionTarget): void {
     pi.appendEntry(executionTargetEntry, next);
   }
 
@@ -738,7 +764,6 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     value: string;
     label: string;
     description?: string;
-    current?: boolean;
     create?: boolean;
   };
 
@@ -793,20 +818,12 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
                 const primaryWidth =
                   Math.max(
                     1,
-                    ...filtered.map((option) =>
-                      visibleWidth(
-                        option.current
-                          ? `stay on ${option.label}`
-                          : option.label,
-                      ),
-                    ),
+                    ...filtered.map((option) => visibleWidth(option.label)),
                   ) + 4;
                 list = new SelectList(
                   filtered.map((option) => ({
                     value: option.value,
-                    label: option.current
-                      ? theme.bold(`stay on ${option.label}`)
-                      : option.label,
+                    label: option.label,
                     description: option.description,
                   })),
                   Math.max(1, Math.min(filtered.length, 5)),
@@ -864,15 +881,24 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     active?: ExecutionTarget,
   ): Promise<Destination | undefined> {
     if (!ctx.hasUI) return undefined;
-    const current = active?.kind === "sandbox" ? active.name : "local";
+    const listed = await runBackend({ action: "list" }, ctx.signal);
+    const online = (listed.sandboxes ?? []).filter(
+      (sandbox) =>
+        sandbox.online &&
+        !(active?.kind === "sandbox" && sandbox.name === active.name),
+    );
     const actions: DestinationSearchOption[] = [
       ...(active?.kind === "sandbox"
+        ? [{ value: "local", label: "sync back to local directory" }]
+        : []),
+      ...(online.length > 0
         ? [
-            { value: "current", label: current, current: true },
-            { value: "local", label: "sync back to local directory" },
+            {
+              value: "connect",
+              label: `connect to ${active?.kind === "sandbox" ? "another" : "an existing"} sandbox (${online.length} available)`,
+            },
           ]
         : []),
-      { value: "connect", label: "connect to an existing sandbox" },
       {
         value: "create",
         label: "create a new sandbox",
@@ -882,7 +908,6 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     while (true) {
       const action = await searchDestinationOptions(ctx, actions);
       if (!action) return undefined;
-      if (action === "current") return active ?? { kind: "local" };
       if (action === "local") return { kind: "local" };
 
       if (action === "create") {
@@ -908,16 +933,6 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       if (action !== "connect")
         throw new Error(`unknown sandbox action: ${action}`);
 
-      const listed = await runBackend({ action: "list" }, ctx.signal);
-      const online = (listed.sandboxes ?? []).filter(
-        (sandbox) =>
-          sandbox.online &&
-          !(active?.kind === "sandbox" && sandbox.name === active.name),
-      );
-      if (online.length === 0) {
-        ctx.ui.notify("No other online sandboxes are available.", "warning");
-        continue;
-      }
       const name = await searchDestinationOptions(
         ctx,
         online.map((sandbox) => ({
@@ -989,11 +1004,16 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
   async function prepareTarget(
     destination: Extract<Destination, { kind: "sandbox" }>,
     ctx: UIContext,
-    options: { inheritWorkspace?: boolean } = {},
+    options: {
+      inheritWorkspace?: boolean;
+      resume?: Extract<ExecutionTarget, { kind: "sandbox" }>;
+      refresh?: Extract<ExecutionTarget, { kind: "sandbox" }>;
+    } = {},
   ): Promise<Extract<ExecutionTarget, { kind: "sandbox" }>> {
-    const { inheritWorkspace = true } = options;
+    const { inheritWorkspace = true, resume, refresh } = options;
     if (
       inheritWorkspace &&
+      bridge &&
       target.kind === "sandbox" &&
       target.name === destination.name
     ) {
@@ -1005,46 +1025,53 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       ...destination,
       state: "connecting",
     });
-    try {
-      const result = await runBackend(
-        {
-          action: "prepare_execution",
-          name: destination.name,
-          source_cwd: ctx.cwd,
-          workspace_id: ctx.sessionManager.getSessionId(),
-          tool_packages: [...toolPackages],
-          source:
-            inheritWorkspace && target.kind === "sandbox"
-              ? {
-                  address: target.address,
-                  os: target.os,
-                  remoteCwd: target.remoteCwd,
-                  state: target.workspaceState,
-                }
-              : undefined,
-        },
-        ctx.signal,
-        (status) => {
-          ctx.ui.setStatus(
-            "cua-session",
-            formatSandboxProgress(
-              destination.name,
-              status.phase,
-              status.message,
-            ),
-          );
-          pi.events.emit("cua:execution-target-changed", {
-            ...destination,
-            state: "connecting",
-            phase: status.phase,
-            message: status.message,
-          });
-        },
+    const request = {
+      action: refresh ? "refresh_execution" : "prepare_execution",
+      name: destination.name,
+      source_cwd: resume?.localCwd ?? ctx.cwd,
+      workspace_id: ctx.sessionManager.getSessionId(),
+      tool_packages: [...toolPackages],
+      source: refresh
+        ? sandboxSource(refresh)
+        : !resume && inheritWorkspace && target.kind === "sandbox"
+          ? sandboxSource(target)
+          : undefined,
+      resume: resume ? sandboxSource(resume) : undefined,
+    };
+    const onStatus = (status: BackendResult) => {
+      ctx.ui.setStatus(
+        "cua-session",
+        formatSandboxProgress(destination.name, status.phase, status.message),
       );
+      pi.events.emit("cua:execution-target-changed", {
+        ...destination,
+        state: "connecting",
+        phase: status.phase,
+        message: status.message,
+      });
+    };
+    try {
+      let result: BackendResult;
+      try {
+        result = await runBackend(request, ctx.signal, onStatus);
+      } catch (error) {
+        if (
+          !(error instanceof BackendError) ||
+          error.errorType !== "SandboxRepairRequired"
+        )
+          throw error;
+        await runBackend(
+          { action: "ensure", name: destination.name },
+          ctx.signal,
+          onStatus,
+        );
+        result = await runBackend(request, ctx.signal, onStatus);
+      }
       if (
         typeof result.remote_cwd !== "string" ||
         typeof result.address !== "string" ||
-        !result.workspace_state
+        !result.workspace_state ||
+        typeof result.runtime_digest !== "string"
       ) {
         throw new Error("cua backend returned an invalid execution target");
       }
@@ -1052,14 +1079,112 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       return {
         ...destination,
         address: result.address,
-        localCwd: ctx.cwd,
+        localCwd: refresh?.localCwd ?? resume?.localCwd ?? ctx.cwd,
         remoteCwd: result.remote_cwd,
         workspaceState: result.workspace_state,
+        runtimeDigest: result.runtime_digest,
       };
     } catch (error) {
       ctx.ui.setStatus("cua-session", undefined);
       pi.events.emit("cua:execution-target-changed", target);
       throw error;
+    }
+  }
+
+  async function resumeTarget(
+    saved: ExecutionTarget,
+    ctx: UIContext,
+  ): Promise<ExecutionTarget> {
+    if (saved.kind === "local") return saved;
+    return prepareTarget(
+      { kind: "sandbox", name: saved.name, os: saved.os },
+      ctx,
+      { inheritWorkspace: false, resume: saved },
+    );
+  }
+
+  function sandboxSource(
+    active: Extract<ExecutionTarget, { kind: "sandbox" }>,
+  ): Record<string, unknown> {
+    return {
+      address: active.address,
+      os: active.os,
+      remoteCwd: active.remoteCwd,
+      state: active.workspaceState,
+    };
+  }
+
+  async function cleanupTarget(
+    active: Extract<ExecutionTarget, { kind: "sandbox" }>,
+    ctx: UIContext,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    try {
+      await runBackend(
+        { action: "cleanup_workspace", source: sandboxSource(active) },
+        signal,
+      );
+    } catch (error) {
+      ctx.ui.notify(
+        `workspace cleanup failed on ${active.name}: ${error instanceof Error ? error.message : String(error)}`,
+        "warning",
+      );
+    }
+  }
+
+  async function syncTargetToLocal(
+    active: Extract<ExecutionTarget, { kind: "sandbox" }>,
+    signal?: AbortSignal,
+    onStatus?: (status: BackendResult) => void,
+  ): Promise<void> {
+    await runBackend(
+      {
+        action: "sync_workspace_to_local",
+        source: sandboxSource(active),
+        local_cwd: active.localCwd,
+      },
+      signal,
+      onStatus,
+    );
+  }
+
+  async function refreshWorkspaceDiff(): Promise<void> {
+    const generation = ++workspaceDiffGeneration;
+    const active = target;
+    if (active.kind === "local") {
+      pi.events.emit("cua:workspace-diff-changed", { kind: "local" });
+      return;
+    }
+    try {
+      const result = await runBackend(
+        {
+          action: "workspace_diff_status",
+          source: sandboxSource(active),
+          local_cwd: active.localCwd,
+        },
+        new AbortController().signal,
+      );
+      if (
+        generation !== workspaceDiffGeneration ||
+        target.kind !== "sandbox" ||
+        target.name !== active.name ||
+        target.address !== active.address ||
+        typeof result.additions !== "number" ||
+        typeof result.deletions !== "number" ||
+        typeof result.pending_sync !== "boolean" ||
+        typeof result.sync_safe !== "boolean"
+      )
+        return;
+      pi.events.emit("cua:workspace-diff-changed", {
+        kind: "sandbox",
+        name: active.name,
+        additions: result.additions,
+        deletions: result.deletions,
+        pendingSync: result.pending_sync,
+        syncSafe: result.sync_safe,
+      });
+    } catch {
+      // A status refresh must not interrupt the active Pi session.
     }
   }
 
@@ -1079,7 +1204,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
           if (shouldUseControllerTool(info.name, input)) {
             return createReadTool(toolCtx.cwd).execute(
               id,
-              input as ReadToolInput,
+              input,
               signal,
               onUpdate,
             );
@@ -1101,7 +1226,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     options: { persist?: boolean } = {},
   ): Promise<void> {
     if (next === target && bridge) {
-      if (options.persist !== false) await saveTarget(next, ctx);
+      if (options.persist !== false) saveTarget(next);
       return;
     }
     const expectedTools = captureToolProviders();
@@ -1119,24 +1244,27 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       pi.events.emit("cua:execution-target-changed", {
         ...next,
         state: "connecting",
+        phase: "connect.tools",
+        message: "starting remote tools",
       });
     }
     try {
       await nextBridge?.connect();
-      if (options.persist !== false) await saveTarget(next, ctx);
+      if (options.persist !== false) saveTarget(next);
     } catch (error) {
-      nextBridge?.close();
+      nextBridge?.close(true);
       ctx.ui.setStatus("cua-session", undefined);
       pi.events.emit("cua:execution-target-changed", target);
       throw error;
     }
-    bridge?.close();
+    bridge?.close(true);
     target = next;
     placementError = undefined;
     bridge = nextBridge;
     if (next.kind === "sandbox") installProxies();
     ctx.ui.setStatus("cua-session", undefined);
     pi.events.emit("cua:execution-target-changed", next);
+    void refreshWorkspaceDiff();
   }
 
   pi.registerTool({
@@ -1220,44 +1348,39 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         const destination = await destinationFromArgument(args, ctx);
         if (!destination) return;
         if (destination.kind === "local") {
-          if (target.kind === "sandbox") {
+          const source = target.kind === "sandbox" ? target : undefined;
+          if (source) {
             pi.events.emit("cua:execution-target-changed", {
-              ...target,
+              ...source,
               state: "connecting",
               phase: "workspace.local.sync",
               message: "syncing sandbox changes to local",
             });
-            await runBackend(
-              {
-                action: "sync_workspace_to_local",
-                source: {
-                  address: target.address,
-                  os: target.os,
-                  remoteCwd: target.remoteCwd,
-                  state: target.workspaceState,
-                },
-                local_cwd: target.localCwd,
-              },
-              ctx.signal,
-              (status) => {
-                pi.events.emit("cua:execution-target-changed", {
-                  ...target,
-                  state: "connecting",
-                  phase: status.phase,
-                  message: status.message,
-                });
-              },
-            );
+            await syncTargetToLocal(source, ctx.signal, (status) => {
+              pi.events.emit("cua:execution-target-changed", {
+                ...source,
+                state: "connecting",
+                phase: status.phase,
+                message: status.message,
+              });
+            });
           }
           const local: ExecutionTarget = { kind: "local" };
           await activate(local, ctx);
+          if (source) await cleanupTarget(source, ctx, ctx.signal);
           await ctx.reload();
           return;
         }
-        if (target.kind === "sandbox" && target.name === destination.name)
+        if (
+          bridge &&
+          target.kind === "sandbox" &&
+          target.name === destination.name
+        )
           return;
+        const source = target.kind === "sandbox" ? target : undefined;
         const prepared = await prepareTarget(destination, ctx);
         await activate(prepared, ctx);
+        if (source) await cleanupTarget(source, ctx, ctx.signal);
       } catch (error) {
         ctx.ui.notify(
           error instanceof Error ? error.message : String(error),
@@ -1268,21 +1391,51 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
   });
 
   pi.on("session_start", async (event, ctx) => {
+    let intendedTarget: ExecutionTarget | undefined;
     try {
-      if (event.reason === "new" || event.reason === "fork") {
-        await activate({ kind: "local" }, ctx);
+      const current = loadSessionTarget(ctx);
+      if (current) {
+        intendedTarget = current;
+        const resumed =
+          event.reason === "reload" && current.kind === "sandbox"
+            ? await prepareTarget(
+                { kind: "sandbox", name: current.name, os: current.os },
+                ctx,
+                { inheritWorkspace: false, refresh: current },
+              )
+            : await resumeTarget(current, ctx);
+        intendedTarget = resumed;
+        if (resumed !== current) saveTarget(resumed);
+        await activate(resumed, ctx, { persist: false });
         return;
       }
-      const loaded = await loadTarget(ctx);
-      const saved = loaded.target;
-      if (saved) {
-        await activate(saved, ctx, { persist: !loaded.persisted });
+      const inherited = shouldHandoffExecutionTarget(event.reason)
+        ? loadHandoffTarget(event.previousSessionFile)
+        : undefined;
+      if (inherited) {
+        intendedTarget = inherited;
+        saveTarget(inherited);
+        await activate(inherited, ctx, { persist: false });
         return;
       }
       await activate({ kind: "local" }, ctx);
     } catch (error) {
       placementError =
         error instanceof Error ? error : new Error(String(error));
+      if (intendedTarget?.kind === "sandbox") {
+        target = intendedTarget;
+        ctx.ui.setStatus(
+          "cua-session",
+          `${intendedTarget.name} (failed to connect)`,
+        );
+        pi.events.emit("cua:execution-target-changed", {
+          ...intendedTarget,
+          state: "failed",
+          phase: "connect.failed",
+          message: "failed to connect",
+          error: placementError.message,
+        });
+      }
       ctx.ui.notify(
         `execution placement blocked: ${placementError.message}; choose a target with /sandbox`,
         "error",
@@ -1290,12 +1443,13 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     }
   });
 
+  pi.on("agent_settled", () => {
+    void refreshWorkspaceDiff();
+  });
+
   pi.on("before_agent_start", async (event, ctx) => {
     if (placementError) throw placementError;
     if (target.kind !== "sandbox" || !bridge) return;
-    const expectedTools = captureToolProviders();
-    await bridge.refresh(expectedTools);
-    installProxies();
     const localCwd = `Current working directory: ${target.localCwd}`;
     const environment = `Execution environment: ${target.os}. All tools and user shell commands run in ${target.os}; use relative workspace paths and answer environment questions for ${target.os}.`;
     return {
@@ -1317,8 +1471,31 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     return { operations };
   });
 
-  pi.on("session_shutdown", () => {
-    bridge?.close();
-    bridge = undefined;
+  pi.on("session_shutdown", async (event, ctx) => {
+    const source = target.kind === "sandbox" ? target : undefined;
+    let disposeBridge = false;
+    try {
+      if (source && shouldHandoffExecutionTarget(event.reason)) {
+        pi.appendEntry(executionTargetHandoffEntry, source);
+        const local: ExecutionTarget = { kind: "local" };
+        saveTarget(local);
+        target = local;
+      } else if (source && event.reason !== "reload") {
+        await syncTargetToLocal(source);
+        const local: ExecutionTarget = { kind: "local" };
+        saveTarget(local);
+        target = local;
+        await cleanupTarget(source, ctx);
+        disposeBridge = true;
+      }
+    } catch (error) {
+      ctx.ui.notify(
+        `sandbox shutdown retained ${source?.name ?? "workspace"}: ${error instanceof Error ? error.message : String(error)}`,
+        "error",
+      );
+    } finally {
+      bridge?.close(disposeBridge);
+      bridge = undefined;
+    }
   });
 }
