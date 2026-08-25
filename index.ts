@@ -1043,14 +1043,14 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       action: refresh ? "refresh_execution" : "prepare_execution",
       name: destination.name,
       source_cwd: resume?.localCwd ?? ctx.cwd,
-      workspace_id: ctx.sessionManager.getSessionId(),
+      execution_id: ctx.sessionManager.getSessionId(),
       tool_packages: [...toolPackages],
       source: refresh
         ? executionSource(refresh)
         : !resume && inheritWorkspace && target.kind === "sandbox"
           ? workspaceSource(target)
           : undefined,
-      resume: resume ? workspaceSource(resume) : undefined,
+      resume: resume ? executionSource(resume) : undefined,
     };
     const onStatus = (status: BackendResult) => {
       ctx.ui.setStatus(
@@ -1429,7 +1429,9 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       if (current) {
         intendedTarget = current;
         const resumed =
-          event.reason === "reload" && current.kind === "sandbox"
+          event.reason === "reload" &&
+          current.kind === "sandbox" &&
+          current.workspaceState
             ? await prepareTarget(
                 { kind: "sandbox", name: current.name, os: current.os },
                 ctx,
@@ -1485,7 +1487,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     const localCwd = `Current working directory: ${target.localCwd}`;
     const logicalCwd = target.workspaceState
       ? "workspace root"
-      : "sandbox home";
+      : "execution root";
     const environment = `Execution environment: ${target.os}. All tools and user shell commands run in ${target.os}; use paths relative to the current directory and answer environment questions for ${target.os}.`;
     return {
       systemPrompt: `${event.systemPrompt.replace(localCwd, `Current working directory: ${logicalCwd}`)}\n\n${environment}`,

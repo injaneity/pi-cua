@@ -710,26 +710,6 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         workspace_check.assert_not_called()
         sync_config.assert_not_called()
 
-    def test_reload_without_workspace_refreshes_only_runtime(self) -> None:
-        source = backend.SandboxExecutionSource(
-            address="100.64.0.2",
-            os="linux",
-            remoteCwd="/home/cua",
-        )
-        preflight = backend.GuestRuntimePreflight("100.64.0.2", True)
-        with (
-            patch.object(
-                backend,
-                "managed_sandboxes",
-                return_value=[{"name": "linux-1", "os": "linux"}],
-            ),
-            patch.object(backend, "guest_runtime_preflight", return_value=preflight),
-        ):
-            result = backend.refresh_execution("linux-1", source)
-
-        self.assertEqual(result["remote_cwd"], "/home/cua")
-        self.assertNotIn("workspace_state", result)
-
     def test_reload_refresh_syncs_only_a_changed_guest_bundle(self) -> None:
         preflight = backend.GuestRuntimePreflight("100.64.0.2", False)
         with (
@@ -863,10 +843,11 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("--dissociate", script)
         self.assertNotIn("git -C $cache cat-file -e", script.split("$root =", 1)[1])
 
-    async def test_prepare_execution_without_git_uses_guest_home(self) -> None:
+    async def test_prepare_execution_without_git_uses_thread_directory(self) -> None:
+        execution_id = hashlib.sha256(b"session-1").hexdigest()[:16]
         for profile, remote_cwd in (
-            ("linux", "/home/cua"),
-            ("windows", r"C:\Users\cua"),
+            ("linux", f"/home/cua/.cua-pi/executions/{execution_id}"),
+            ("windows", rf"C:\Users\cua\.cua-pi\executions\{execution_id}"),
         ):
             with self.subTest(profile=profile):
                 preflight = backend.GuestRuntimePreflight("100.64.0.2", True)
@@ -882,6 +863,11 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
                     ),
                     patch.object(backend, "guest_preflight") as full_preflight,
                     patch.object(backend, "prepare_workspace") as prepare,
+                    patch.object(
+                        backend,
+                        "run_guest_ssh",
+                        return_value=subprocess.CompletedProcess([], 0, "", ""),
+                    ) as run,
                 ):
                     result = await backend.prepare_execution(
                         f"{profile}-1", "/not-a-repository", "session-1"
@@ -891,6 +877,53 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("workspace_state", result)
                 full_preflight.assert_not_called()
                 prepare.assert_not_called()
+                self.assertIn(execution_id, run.call_args.args[2])
+
+    def test_non_git_execution_ids_do_not_share_a_directory(self) -> None:
+        with patch.object(
+            backend,
+            "run_guest_ssh",
+            return_value=subprocess.CompletedProcess([], 0, "", ""),
+        ):
+            first = backend.prepare_execution_directory(
+                "100.64.0.2", "windows", hashlib.sha256(b"thread-1").hexdigest()[:16]
+            )
+            second = backend.prepare_execution_directory(
+                "100.64.0.2", "windows", hashlib.sha256(b"thread-2").hexdigest()[:16]
+            )
+
+        self.assertNotEqual(first, second)
+
+    async def test_prepare_execution_resumes_without_git_state(self) -> None:
+        resume = backend.SandboxExecutionSource(
+            address="100.64.0.2",
+            os="linux",
+            remoteCwd="/home/cua",
+        )
+        preflight = backend.GuestRuntimePreflight("100.64.0.2", True)
+        with (
+            patch.object(
+                backend,
+                "managed_sandboxes",
+                return_value=[{"name": "linux-1", "os": "linux"}],
+            ),
+            patch.object(backend, "inspect_workspace") as inspect,
+            patch.object(backend, "guest_runtime_preflight", return_value=preflight),
+            patch.object(
+                backend,
+                "run_guest_ssh",
+                return_value=subprocess.CompletedProcess([], 0, "", ""),
+            ),
+        ):
+            result = await backend.prepare_execution(
+                "linux-1", "/local", "session-1", resume=resume
+            )
+
+        execution_id = hashlib.sha256(b"session-1").hexdigest()[:16]
+        self.assertEqual(
+            result["remote_cwd"], f"/home/cua/.cua-pi/executions/{execution_id}"
+        )
+        inspect.assert_not_called()
 
     async def test_prepare_execution_connects_capture_prepare_and_restore(self) -> None:
         transfer = backend.WorkspaceTransfer(self.state, b"final", "2" * 40)
@@ -1092,7 +1125,7 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
                     "action": "prepare_execution",
                     "name": "linux-1",
                     "source_cwd": "/local",
-                    "workspace_id": "session-1",
+                    "execution_id": "session-1",
                     "tool_packages": [],
                 }
             )
