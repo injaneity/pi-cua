@@ -1,7 +1,9 @@
 import {
   type AgentToolResult,
   type BashOperations,
+  createReadTool,
   type ExtensionAPI,
+  type ReadToolInput,
   type ExtensionCommandContext,
   type ExtensionContext,
   type ToolDefinition,
@@ -578,7 +580,6 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
   let placementError: Error | undefined;
   let bridge: ToolBridge | undefined;
   const proxiedTools = new Set<string>();
-  const localToolDefinitions = new Map<string, AnyToolDefinition>();
   const toolPackages = new Set<string>();
 
   async function executeBackend(
@@ -970,8 +971,6 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     const names: string[] = [];
     for (const tool of pi.getAllTools()) {
       if (localTools.has(tool.name)) continue;
-      if (!proxiedTools.has(tool.name) && !localToolDefinitions.has(tool.name))
-        localToolDefinitions.set(tool.name, tool);
       names.push(tool.name);
       if (
         tool.sourceInfo.origin === "package" &&
@@ -1078,12 +1077,12 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         ...remote,
         async execute(id, input, signal, onUpdate, toolCtx) {
           if (shouldUseControllerTool(info.name, input)) {
-            const localRead = localToolDefinitions.get("read");
-            if (!localRead)
-              throw new Error(
-                "local read tool is unavailable for clipboard image",
-              );
-            return localRead.execute(id, input, signal, onUpdate, toolCtx);
+            return createReadTool(toolCtx.cwd).execute(
+              id,
+              input as ReadToolInput,
+              signal,
+              onUpdate,
+            );
           }
           if (target.kind !== "sandbox" || !bridge) {
             throw new Error(`${info.name} has no active sandbox`);
