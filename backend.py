@@ -3,12 +3,14 @@
 CUA publishes a Python SDK but no TypeScript SDK. This process boundary keeps Fleet
 credentials and platform bootstrap logic out of the Pi extension. Every invocation
 accepts one JSON argument and writes one JSON result to stdout; diagnostics stay on
-stderr. Named claims remain indexed by cua-sandbox in ``~/.cua/sandboxes``.
+stderr. Controller records are canonical; Fleet SDK connection state is materialized
+only at its API boundary.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import fcntl
 import hashlib
 import io
@@ -17,7 +19,6 @@ import os
 import re
 import shlex
 import signal
-import sqlite3
 import ssl
 import subprocess
 import sys
@@ -27,7 +28,7 @@ import time
 import uuid
 import zipfile
 from collections.abc import Iterator
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -57,11 +58,8 @@ HOME = Path.home()
 STATE_DIR = HOME / ".cua" / "sandboxes"
 PI_DIR = HOME / ".pi" / "agent"
 CONTROLLER_DIR = HOME / ".cua" / "pi-controller"
-CONTROLLER_DB = CONTROLLER_DIR / "state.sqlite3"
-CONTROLLER_LOCK = CONTROLLER_DIR / "operations.lock"
-WORKSPACE_LOCK = CONTROLLER_DIR / "workspaces.lock"
-OPERATION_DIR = CONTROLLER_DIR / "operations"
-CURRENT_OPERATION_ID: str | None = None
+SANDBOX_RECORD_DIR = CONTROLLER_DIR / "sandboxes"
+CONTROLLER_LOCK = CONTROLLER_DIR / "controller.lock"
 CURRENT_PHASE = "startup"
 
 
@@ -69,17 +67,22 @@ class OperationCancelled(RuntimeError):
     pass
 
 
+class SandboxRepairRequired(RuntimeError):
+    pass
+
+
 def cancel_worker(_signum: int, _frame: Any) -> None:
     raise OperationCancelled("operation cancelled")
 
 
-CLOUD_ACTIONS = {"create", "ensure", "delete", "prepare_execution"}
-LONG_ACTIONS = CLOUD_ACTIONS | {"sync_workspace_to_local"}
+CLOUD_ACTIONS = {"create", "ensure", "delete"}
 FLEET_KEYCHAIN_SERVICE = "cua-sandbox-fleet-api"
 TAILSCALE_KEYCHAIN_SERVICE = "cua-sandbox-tailscale-oauth"
 TAILSCALE_TOKEN_URL = "https://api.tailscale.com/api/v2/oauth/token"
 TAILSCALE_API_URL = "https://api.tailscale.com/api/v2"
-WINDOWS_PUBLIC_KEY = HOME / ".ssh" / "cua_windows_ed25519.pub"
+WINDOWS_IDENTITY = HOME / ".ssh" / "cua_windows_ed25519"
+WINDOWS_PUBLIC_KEY = WINDOWS_IDENTITY.with_suffix(".pub")
+SANDBOX_KNOWN_HOSTS = HOME / ".ssh" / "cua_known_hosts"
 
 PROFILES = {
     "linux": {
@@ -109,71 +112,23 @@ BOOTSTRAP_FILES = {
 NAME_PATTERN = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 
 
-def prune_operation_logs(keep: int = 100) -> None:
-    if not OPERATION_DIR.exists():
-        return
-    logs = sorted(
-        OPERATION_DIR.glob("*.jsonl"),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )
-    for path in logs[keep:]:
-        path.unlink(missing_ok=True)
-        path.with_name(f"{path.stem}.console.log").unlink(missing_ok=True)
-
-
 def error_text(error: BaseException) -> str:
     text = str(error).strip()
     return text if text else repr(error)
 
 
-def update_operation_progress(phase: str, message: str) -> None:
-    if not CURRENT_OPERATION_ID or not CONTROLLER_DB.exists():
-        return
-    try:
-        with database() as connection:
-            connection.execute(
-                """
-                UPDATE operations
-                SET phase = ?, message = ?, updated_at = ?
-                WHERE id = ? AND state IN ('queued', 'running', 'cancel_requested')
-                """,
-                (
-                    phase,
-                    message,
-                    datetime.now(timezone.utc).isoformat(),
-                    CURRENT_OPERATION_ID,
-                ),
-            )
-    except sqlite3.Error as error:
-        print(
-            f"warning: failed to update operation state: {error_text(error)}",
-            file=sys.stderr,
-            flush=True,
-        )
-
-
 def progress(phase: str, message: str, **details: Any) -> None:
     global CURRENT_PHASE
     CURRENT_PHASE = phase
-    event = {
-        "at": datetime.now(timezone.utc).isoformat(),
-        "operation_id": CURRENT_OPERATION_ID,
-        "phase": phase,
-        "message": message,
-        **details,
-    }
-    if CURRENT_OPERATION_ID:
-        OPERATION_DIR.mkdir(parents=True, exist_ok=True)
-        path = OPERATION_DIR / f"{CURRENT_OPERATION_ID}.jsonl"
-        with path.open("a") as stream:
-            stream.write(json.dumps(event, separators=(",", ":")) + "\n")
-    update_operation_progress(phase, message)
-    print(
-        f"[cua {CURRENT_OPERATION_ID or '-'}] {phase}: {message}",
-        file=sys.stderr,
-        flush=True,
-    )
+    if os.environ.get("CUA_PROGRESS_JSON") == "1":
+        print(
+            json.dumps(
+                {"progress": True, "phase": phase, "message": message, **details},
+                separators=(",", ":"),
+            ),
+            flush=True,
+        )
+    print(f"[cua] {phase}: {message}", file=sys.stderr, flush=True)
 
 
 async def wait_for_step(
@@ -210,6 +165,42 @@ def keychain(account: str, service: str) -> str:
     return proc.stdout.rstrip("\n")
 
 
+def credential(environment: str, account: str, service: str) -> str:
+    value = os.environ.get(environment, "").strip()
+    return value or keychain(account, service)
+
+
+def ensure_windows_identity() -> Path:
+    if WINDOWS_IDENTITY.exists() and WINDOWS_PUBLIC_KEY.exists():
+        WINDOWS_IDENTITY.chmod(0o600)
+        WINDOWS_PUBLIC_KEY.chmod(0o644)
+        return WINDOWS_IDENTITY
+    if WINDOWS_IDENTITY.exists() or WINDOWS_PUBLIC_KEY.exists():
+        raise RuntimeError(
+            f"incomplete Windows SSH identity; remove {WINDOWS_IDENTITY} and {WINDOWS_PUBLIC_KEY}, then retry"
+        )
+    WINDOWS_IDENTITY.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    WINDOWS_IDENTITY.parent.chmod(0o700)
+    subprocess.run(
+        [
+            "ssh-keygen",
+            "-q",
+            "-t",
+            "ed25519",
+            "-N",
+            "",
+            "-C",
+            "pi-cua windows sandbox",
+            "-f",
+            str(WINDOWS_IDENTITY),
+        ],
+        check=True,
+    )
+    WINDOWS_IDENTITY.chmod(0o600)
+    WINDOWS_PUBLIC_KEY.chmod(0o644)
+    return WINDOWS_IDENTITY
+
+
 def pi_version() -> str:
     proc = subprocess.run(
         # pi 0.84+ runs a network update check on --version; 10s flakes
@@ -233,26 +224,30 @@ def bootstrap_template(profile: str) -> str:
 
 
 def bootstrap_digest(profile: str) -> str:
-    """Hash every input that ensure must reproduce inside a guest."""
+    """Hash only inputs that require machine-level guest repair."""
     digest = hashlib.sha256()
     digest.update(profile.encode())
     digest.update(pi_version().encode())
     digest.update(bootstrap_template(profile).encode())
-    for path, content in sorted(remote_pi_files().items()):
-        digest.update(path.encode())
-        digest.update(content)
+    if profile == "windows":
+        digest.update((EXTENSION_DIR / "tool-broker.mjs").read_bytes())
     return digest.hexdigest()[:20]
 
 
-def operation_locks(action: str) -> tuple[Path, ...]:
-    """Keep Fleet mutations separate from workspace preparation."""
-    if action == "create":
-        return (CONTROLLER_LOCK,)
-    if action in {"ensure", "delete"}:
-        return (CONTROLLER_LOCK, WORKSPACE_LOCK)
-    if action in {"prepare_execution", "sync_workspace_to_local"}:
-        return (WORKSPACE_LOCK,)
-    return ()
+def guest_config_files(packages: tuple[str, ...] = ()) -> dict[str, bytes]:
+    files = remote_pi_files()
+    files[".pi/agent/settings.json"] = (
+        json.dumps({"packages": list(packages)}, indent=2).encode() + b"\n"
+    )
+    return files
+
+
+def config_digest(files: dict[str, bytes]) -> str:
+    digest = hashlib.sha256()
+    for path, content in sorted(files.items()):
+        digest.update(path.encode())
+        digest.update(content)
+    return digest.hexdigest()[:20]
 
 
 @contextmanager
@@ -265,112 +260,6 @@ def operation_lock(path: Path) -> Iterator[None]:
             yield
         finally:
             fcntl.flock(lock_file, fcntl.LOCK_UN)
-
-
-@contextmanager
-def database() -> Iterator[sqlite3.Connection]:
-    CONTROLLER_DIR.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(CONTROLLER_DB)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA journal_mode=WAL")
-    connection.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS operations (
-            id TEXT PRIMARY KEY,
-            action TEXT NOT NULL,
-            request_json TEXT NOT NULL,
-            state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'succeeded', 'failed', 'cancel_requested', 'cancelled')),
-            phase TEXT NOT NULL,
-            message TEXT NOT NULL,
-            worker_pid INTEGER,
-            result_json TEXT,
-            error_type TEXT,
-            error TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS sandboxes (
-            name TEXT PRIMARY KEY,
-            os TEXT NOT NULL CHECK (os IN ('linux', 'windows')),
-            pool_name TEXT NOT NULL,
-            claim_reference TEXT NOT NULL,
-            tailscale_tailnet TEXT,
-            tailscale_device_id TEXT,
-            tailscale_addresses TEXT,
-            updated_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS execution_targets (
-            session_id TEXT PRIMARY KEY,
-            session_file TEXT,
-            target_json TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        CREATE UNIQUE INDEX IF NOT EXISTS execution_targets_session_file
-            ON execution_targets(session_file) WHERE session_file IS NOT NULL;
-        """
-    )
-    sandbox_columns = {
-        row["name"] for row in connection.execute("PRAGMA table_info(sandboxes)")
-    }
-    for column in ("tailscale_tailnet", "tailscale_device_id", "tailscale_addresses"):
-        if column not in sandbox_columns:
-            connection.execute(f"ALTER TABLE sandboxes ADD COLUMN {column} TEXT")
-    try:
-        yield connection
-        connection.commit()
-    except BaseException:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
-
-
-def get_execution_target(
-    session_id: str = "", session_file: str = ""
-) -> dict[str, Any]:
-    with database() as connection:
-        row = None
-        if session_id:
-            row = connection.execute(
-                "SELECT target_json FROM execution_targets WHERE session_id = ?",
-                (session_id,),
-            ).fetchone()
-        if row is None and session_file:
-            row = connection.execute(
-                "SELECT target_json FROM execution_targets WHERE session_file = ?",
-                (str(Path(session_file).expanduser().resolve()),),
-            ).fetchone()
-    return {"target": json.loads(row["target_json"]) if row else None}
-
-
-def set_execution_target(
-    session_id: str, session_file: str, target: object
-) -> dict[str, Any]:
-    if not session_id:
-        raise ValueError("set_execution_target requires session_id")
-    if not isinstance(target, dict) or target.get("kind") not in {"local", "sandbox"}:
-        raise ValueError("set_execution_target requires a valid target")
-    resolved_file = (
-        str(Path(session_file).expanduser().resolve()) if session_file else None
-    )
-    with database() as connection:
-        connection.execute(
-            """
-            INSERT INTO execution_targets (session_id, session_file, target_json, updated_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(session_id) DO UPDATE SET
-                session_file = excluded.session_file,
-                target_json = excluded.target_json,
-                updated_at = excluded.updated_at
-            """,
-            (
-                session_id,
-                resolved_file,
-                json.dumps(target, separators=(",", ":")),
-                datetime.now(timezone.utc).isoformat(),
-            ),
-        )
-    return {"target": target}
 
 
 @dataclass(frozen=True)
@@ -434,93 +323,126 @@ def profile_for_pool(pool: object) -> str | None:
     return default or (match.group("profile") if match else None)
 
 
+def sandbox_record(name: str) -> dict[str, Any] | None:
+    try:
+        value = json.loads((SANDBOX_RECORD_DIR / f"{name}.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def write_sandbox_record(record: dict[str, Any]) -> None:
+    SANDBOX_RECORD_DIR.mkdir(parents=True, exist_ok=True)
+    path = SANDBOX_RECORD_DIR / f"{record['name']}.json"
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
+    os.replace(temporary, path)
+
+
 def record_sandbox(name: str, profile: str, reference: dict[str, Any]) -> None:
     pool_name = reference.get("pool")
     if not isinstance(pool_name, str):
         raise TypeError("CUA claim reference has no pool")
-    now = datetime.now(timezone.utc).isoformat()
-    with database() as connection:
-        connection.execute(
-            """
-            INSERT INTO sandboxes (name, os, pool_name, claim_reference, updated_at)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(name) DO UPDATE SET
-                os = excluded.os,
-                pool_name = excluded.pool_name,
-                claim_reference = excluded.claim_reference,
-                updated_at = excluded.updated_at
-            """,
-            (name, profile, pool_name, json.dumps(reference), now),
-        )
+    write_sandbox_record(
+        {
+            **(sandbox_record(name) or {}),
+            "name": name,
+            "os": profile,
+            "pool": pool_name,
+            "claim": reference,
+            "updatedAt": datetime.now(timezone.utc).isoformat(),
+        }
+    )
 
 
 def record_tailscale_enrollment(
     name: str, tailnet: str, node_id: str, addresses: list[str]
 ) -> None:
-    with database() as connection:
-        cursor = connection.execute(
-            """
-            UPDATE sandboxes
-            SET tailscale_tailnet = ?, tailscale_device_id = ?,
-                tailscale_addresses = ?, updated_at = ?
-            WHERE name = ?
-            """,
-            (
-                tailnet,
-                node_id,
-                json.dumps(addresses),
-                datetime.now(timezone.utc).isoformat(),
-                name,
-            ),
+    record = sandbox_record(name)
+    if record is None:
+        raise RuntimeError(
+            f"cannot record Tailscale device for unknown sandbox: {name}"
         )
-        if cursor.rowcount != 1:
-            raise RuntimeError(
-                f"cannot record Tailscale device for unknown sandbox: {name}"
-            )
+    write_sandbox_record(
+        {
+            **record,
+            "tailnet": tailnet,
+            "deviceId": node_id,
+            "addresses": addresses,
+            "updatedAt": datetime.now(timezone.utc).isoformat(),
+        }
+    )
 
 
 def remove_sandbox_record(name: str) -> None:
-    with database() as connection:
-        connection.execute("DELETE FROM sandboxes WHERE name = ?", (name,))
+    (SANDBOX_RECORD_DIR / f"{name}.json").unlink(missing_ok=True)
+
+
+def controller_sandbox_records() -> list[dict[str, Any]]:
+    if not SANDBOX_RECORD_DIR.exists():
+        return []
+    records = [sandbox_record(path.stem) for path in SANDBOX_RECORD_DIR.glob("*.json")]
+    return [record for record in records if record is not None]
 
 
 def pool_reference_count(pool_name: str) -> int:
-    with database() as connection:
-        row = connection.execute(
-            "SELECT COUNT(*) AS count FROM sandboxes WHERE pool_name = ?",
-            (pool_name,),
-        ).fetchone()
-    return int(row["count"])
+    return sum(item.get("pool") == pool_name for item in managed_sandboxes())
 
 
 def controller_sandboxes() -> list[dict[str, Any]]:
-    with database() as connection:
-        rows = connection.execute(
-            "SELECT name, os, pool_name, tailscale_addresses FROM sandboxes ORDER BY name"
-        ).fetchall()
-    items = []
-    for row in rows:
-        addresses = json.loads(row["tailscale_addresses"] or "[]")
-        items.append(
+    return sorted(
+        (
             {
-                "name": row["name"],
-                "os": row["os"],
-                "pool": row["pool_name"],
-                "address": addresses[0] if addresses else None,
+                "name": record["name"],
+                "os": record["os"],
+                "pool": record["pool"],
+                "address": (record.get("addresses") or [None])[0],
             }
-        )
-    return items
+            for record in controller_sandbox_records()
+            if all(isinstance(record.get(key), str) for key in ("name", "os", "pool"))
+        ),
+        key=lambda item: item["name"],
+    )
+
+
+def migrate_sdk_sandbox_records() -> None:
+    """Adopt records created before the controller JSON index shipped."""
+    with operation_lock(CONTROLLER_LOCK):
+        marker = CONTROLLER_DIR / ".sdk-state-migrated"
+        if marker.exists():
+            return
+        if STATE_DIR.exists():
+            for path in STATE_DIR.glob("*.json"):
+                try:
+                    state = json.loads(path.read_text())
+                except (OSError, json.JSONDecodeError):
+                    continue
+                pool = state.get("pool_name")
+                profile = profile_for_pool(pool)
+                name = state.get("name", path.stem)
+                if (
+                    state.get("runtime_type") == "fleet"
+                    and profile
+                    and isinstance(name, str)
+                    and sandbox_record(name) is None
+                ):
+                    write_sandbox_record(
+                        {
+                            "name": name,
+                            "os": profile,
+                            "pool": pool,
+                            "claim": {"pool": pool},
+                            "updatedAt": datetime.now(timezone.utc).isoformat(),
+                        }
+                    )
+        marker.touch()
 
 
 def restore_cua_state(name: str) -> None:
+    """Materialize the SDK connection index from the controller record."""
     state_path = STATE_DIR / f"{name}.json"
-    if state_path.exists():
-        return
-    with database() as connection:
-        row = connection.execute(
-            "SELECT pool_name FROM sandboxes WHERE name = ?", (name,)
-        ).fetchone()
-    if row is None:
+    record = sandbox_record(name)
+    if record is None or not isinstance(record.get("pool"), str):
         return
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     temporary = state_path.with_suffix(".json.tmp")
@@ -529,7 +451,7 @@ def restore_cua_state(name: str) -> None:
             {
                 "name": name,
                 "runtime_type": "fleet",
-                "pool_name": row["pool_name"],
+                "pool_name": record["pool"],
                 "status": "running",
                 "created_at": datetime.now(timezone.utc).isoformat(),
             },
@@ -540,11 +462,9 @@ def restore_cua_state(name: str) -> None:
     os.replace(temporary, state_path)
 
 
-def worker_command(request: dict[str, Any]) -> list[str]:
+def cloud_worker_command(request: dict[str, Any]) -> list[str]:
     backend = str(Path(__file__).resolve())
     payload = json.dumps(request)
-    if request.get("action") not in CLOUD_ACTIONS:
-        return [sys.executable, backend, payload]
     return [
         "uv",
         "run",
@@ -553,7 +473,7 @@ def worker_command(request: dict[str, Any]) -> list[str]:
         "--python",
         "3.11",
         "--with",
-        "cua-sandbox==0.3.4",
+        "cua-sandbox==0.4.3",
         "--extra-index-url",
         "https://wheels.cua.ai/simple",
         "--index-strategy",
@@ -564,151 +484,19 @@ def worker_command(request: dict[str, Any]) -> list[str]:
     ]
 
 
-def submit_operation(request: dict[str, Any], operation_id: str) -> dict[str, Any]:
-    now = datetime.now(timezone.utc).isoformat()
-    action = str(request.get("action") or "")
-    with database() as connection:
-        connection.execute(
-            """
-            INSERT INTO operations (
-                id, action, request_json, state, phase, message, created_at, updated_at
-            ) VALUES (?, ?, ?, 'queued', 'queue', 'waiting for worker', ?, ?)
-            """,
-            (operation_id, action, json.dumps(request), now, now),
-        )
-
-    OPERATION_DIR.mkdir(parents=True, exist_ok=True)
-    console_path = OPERATION_DIR / f"{operation_id}.console.log"
-    environment = {
-        **os.environ,
-        "CUA_DETACHED_WORKER": "1",
-        "CUA_OPERATION_ID": operation_id,
-        "PYTHONUNBUFFERED": "1",
-    }
-    try:
-        with console_path.open("ab", buffering=0) as console:
-            process = subprocess.Popen(
-                worker_command(request),
-                stdin=subprocess.DEVNULL,
-                stdout=console,
-                stderr=console,
-                env=environment,
-                start_new_session=True,
-                close_fds=True,
-            )
-    except OSError as error:
-        finish_operation(
-            operation_id,
-            "failed",
-            error_type=type(error).__name__,
-            error=error_text(error),
-        )
-        raise
-
-    with database() as connection:
-        connection.execute(
-            """
-            UPDATE operations
-            SET worker_pid = ?, message = 'worker started', updated_at = ?
-            WHERE id = ?
-            """,
-            (process.pid, datetime.now(timezone.utc).isoformat(), operation_id),
-        )
-    return operation_status(operation_id)
-
-
-def finish_operation(
-    operation_id: str,
-    state: str,
-    *,
-    result: dict[str, Any] | None = None,
-    error_type: str | None = None,
-    error: str | None = None,
-) -> None:
-    now = datetime.now(timezone.utc).isoformat()
-    with database() as connection:
-        connection.execute(
-            """
-            UPDATE operations
-            SET state = ?, result_json = ?, error_type = ?, error = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (
-                state,
-                json.dumps(result) if result is not None else None,
-                error_type,
-                error,
-                now,
-                operation_id,
-            ),
-        )
-
-
-def operation_status(operation_id: str) -> dict[str, Any]:
-    with database() as connection:
-        row = connection.execute(
-            "SELECT * FROM operations WHERE id = ?", (operation_id,)
-        ).fetchone()
-    if row is None:
-        raise ValueError(f"unknown operation: {operation_id}")
-    item = dict(row)
-    if item["state"] in {"queued", "running", "cancel_requested"} and isinstance(
-        item.get("worker_pid"), int
-    ):
-        try:
-            os.kill(item["worker_pid"], 0)
-        except ProcessLookupError:
-            finish_operation(
-                operation_id,
-                "failed",
-                error_type="WorkerExited",
-                error="detached worker exited without recording a terminal result",
-            )
-            return operation_status(operation_id)
-        except PermissionError:
-            pass
-    raw_result = item.pop("result_json", None)
-    result = json.loads(raw_result) if raw_result else None
-    item.pop("request_json", None)
-    item["operation_id"] = item.pop("id")
-    item["operation_log"] = str(OPERATION_DIR / f"{operation_id}.jsonl")
-    item["console_log"] = str(OPERATION_DIR / f"{operation_id}.console.log")
-    if result is not None:
-        item["result"] = result
-    return item
-
-
-def cancel_operation(operation_id: str) -> dict[str, Any]:
-    status = operation_status(operation_id)
-    if status["state"] in {"succeeded", "failed", "cancelled"}:
-        return status
-    pid = status.get("worker_pid")
-    with database() as connection:
-        connection.execute(
-            """
-            UPDATE operations
-            SET state = 'cancel_requested', phase = 'cancel',
-                message = 'termination requested', updated_at = ?
-            WHERE id = ?
-            """,
-            (datetime.now(timezone.utc).isoformat(), operation_id),
-        )
-    if isinstance(pid, int):
-        try:
-            os.killpg(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-    finish_operation(operation_id, "cancelled")
-    return operation_status(operation_id)
-
-
 def tailscale_access_token() -> str:
     token_request = Request(
         TAILSCALE_TOKEN_URL,
         data=urlencode(
             {
-                "client_id": keychain("client-id", TAILSCALE_KEYCHAIN_SERVICE),
-                "client_secret": keychain("client-secret", TAILSCALE_KEYCHAIN_SERVICE),
+                "client_id": credential(
+                    "TAILSCALE_CLIENT_ID", "client-id", TAILSCALE_KEYCHAIN_SERVICE
+                ),
+                "client_secret": credential(
+                    "TAILSCALE_CLIENT_SECRET",
+                    "client-secret",
+                    TAILSCALE_KEYCHAIN_SERVICE,
+                ),
             }
         ).encode(),
         headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -791,37 +579,17 @@ def tailscale_auth_key(tailnet: str) -> str:
 
 def configure_fleet_auth() -> None:
     os.environ.setdefault(
-        "CUA_CLIENT_ID", keychain("client-id", FLEET_KEYCHAIN_SERVICE)
+        "CUA_CLIENT_ID",
+        credential("CUA_CLIENT_ID", "client-id", FLEET_KEYCHAIN_SERVICE),
     )
     os.environ.setdefault(
-        "CUA_CLIENT_SECRET", keychain("client-secret", FLEET_KEYCHAIN_SERVICE)
+        "CUA_CLIENT_SECRET",
+        credential("CUA_CLIENT_SECRET", "client-secret", FLEET_KEYCHAIN_SERVICE),
     )
 
 
-def local_states() -> list[dict[str, Any]]:
-    controller_items = controller_sandboxes()
-    for item in controller_items:
-        restore_cua_state(item["name"])
-    by_name = {item["name"]: item for item in controller_items}
-    if not STATE_DIR.exists():
-        return sorted(by_name.values(), key=lambda item: item["name"])
-    for path in STATE_DIR.glob("*.json"):
-        try:
-            state = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError):
-            continue
-        pool = state.get("pool_name")
-        profile = profile_for_pool(pool)
-        if state.get("runtime_type") == "fleet" and profile:
-            name = state.get("name", path.stem)
-            if isinstance(name, str):
-                by_name[name] = {
-                    **by_name.get(name, {}),
-                    "name": name,
-                    "os": profile,
-                    "pool": pool,
-                }
-    return sorted(by_name.values(), key=lambda item: item["name"])
+def managed_sandboxes() -> list[dict[str, Any]]:
+    return controller_sandboxes()
 
 
 async def guest_tailscale_identity(sb: Any, profile: str) -> tuple[str, str, list[str]]:
@@ -960,6 +728,66 @@ async def verify_tailscale_enrollment(
     return node_id, addresses
 
 
+def pin_verified_ssh_host_key(address: str) -> None:
+    """Pin the SSH key after Fleet and the controller netmap verify the guest."""
+    try:
+        scanned = subprocess.run(
+            ["ssh-keyscan", "-T", "5", "-t", "ed25519", address],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError(f"could not scan the SSH host key for {address}") from error
+    keys = [
+        line
+        for line in scanned.stdout.splitlines()
+        if line and not line.startswith("#")
+    ]
+    if scanned.returncode != 0 or not keys:
+        detail = scanned.stderr.strip()
+        raise RuntimeError(
+            f"could not scan the SSH host key for {address}: "
+            f"{detail or f'exit {scanned.returncode}'}"
+        )
+
+    known = subprocess.run(
+        ["ssh-keygen", "-F", address, "-f", str(SANDBOX_KNOWN_HOSTS)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    scanned_material = {" ".join(line.split()[1:3]) for line in keys}
+    known_material = {
+        " ".join(line.split()[1:3])
+        for line in known.stdout.splitlines()
+        if line and not line.startswith("#") and len(line.split()) >= 3
+    }
+    if scanned_material & known_material:
+        return
+
+    SANDBOX_KNOWN_HOSTS.parent.mkdir(parents=True, exist_ok=True)
+    SANDBOX_KNOWN_HOSTS.touch(mode=0o600, exist_ok=True)
+    removed = subprocess.run(
+        ["ssh-keygen", "-R", address, "-f", str(SANDBOX_KNOWN_HOSTS)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if removed.returncode != 0:
+        raise RuntimeError(
+            f"could not replace the verified SSH host key for {address}: "
+            f"{removed.stderr.strip() or f'exit {removed.returncode}'}"
+        )
+    with SANDBOX_KNOWN_HOSTS.open("a") as known_hosts:
+        known_hosts.write("\n".join(keys) + "\n")
+    SANDBOX_KNOWN_HOSTS.chmod(0o600)
+    progress("ssh.host-key", f"pinned verified host key for {address}")
+
+
 def online_tailscale_hosts() -> set[str]:
     status = local_tailscale_status(timeout=3)
     if status is None:
@@ -984,7 +812,7 @@ def validate_name(name: str) -> None:
 
 
 def next_name(profile: str) -> str:
-    used = {item["name"] for item in local_states()}
+    used = {item["name"] for item in managed_sandboxes()}
     for number in range(1, 1000):
         candidate = f"{profile}-{number}"
         if candidate not in used:
@@ -994,12 +822,7 @@ def next_name(profile: str) -> str:
 
 def remote_pi_files() -> dict[str, bytes]:
     files = {
-        f".pi/agent/{remote}": (Path(__file__).parent / source).read_bytes()
-        for remote, source in {
-            "cua-tool-host.mjs": "tool-host.mjs",
-            "cua-tool-broker.mjs": "tool-broker.mjs",
-            "cua-tool-relay.mjs": "tool-relay.mjs",
-        }.items()
+        ".pi/agent/cua-tool-host.mjs": (EXTENSION_DIR / "tool-host.mjs").read_bytes()
     }
     extensions = PI_DIR / "extensions"
     if extensions.exists():
@@ -1021,21 +844,11 @@ def remote_pi_files() -> dict[str, bytes]:
 
 
 async def upload_linux_config(sb: Any, tailnet: str) -> None:
-    buffer = io.BytesIO()
-    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
-        for remote, content in remote_pi_files().items():
-            info = tarfile.TarInfo(remote)
-            info.size = len(content)
-            info.mode = 0o644
-            archive.addfile(info, io.BytesIO(content))
-    await sb.files.write_bytes("/tmp/cua-pi-agent.tgz", buffer.getvalue())
     await sb.files.write_text(
         "/tmp/cua-tailscale-auth-key",
         tailscale_auth_key(tailnet),
     )
-    result = await sb.shell.run(
-        "chmod 600 /tmp/cua-pi-agent.tgz /tmp/cua-tailscale-auth-key", timeout=30
-    )
+    result = await sb.shell.run("chmod 600 /tmp/cua-tailscale-auth-key", timeout=30)
     if result.returncode != 0:
         raise RuntimeError(result.stderr or "failed to secure bootstrap credentials")
 
@@ -1156,7 +969,7 @@ async def run_linux_background_job(
     final_cleanup = (
         stop
         + f"$SUDO rm -f {script_path} {log_path} {result_path} "
-        + "/tmp/cua-tailscale-auth-key /tmp/cua-pi-agent.tgz; true"
+        + "/tmp/cua-tailscale-auth-key; true"
     )
     await wait_for_step(
         sb.shell.run(prepare_cleanup, timeout=20), f"{phase}.prepare", 30
@@ -1241,12 +1054,13 @@ async def run_windows_background_job(
 
 async def bootstrap_windows(sb: Any, name: str, tailnet: str) -> str:
     progress(f"bootstrap.{name}.upload", "building Windows bootstrap inputs")
-    if not WINDOWS_PUBLIC_KEY.exists():
-        raise RuntimeError(f"missing Windows SSH public key: {WINDOWS_PUBLIC_KEY}")
+    ensure_windows_identity()
     archive = io.BytesIO()
     with zipfile.ZipFile(archive, mode="w", compression=zipfile.ZIP_DEFLATED) as bundle:
-        for remote, content in remote_pi_files().items():
-            bundle.writestr(remote, content)
+        bundle.writestr(
+            ".pi/agent/cua-tool-broker.mjs",
+            (EXTENSION_DIR / "tool-broker.mjs").read_bytes(),
+        )
     await upload_windows_file(
         sb, r"C:\Windows\Temp\cua-pi-agent.zip", archive.getvalue()
     )
@@ -1350,6 +1164,7 @@ async def complete_tailscale_enrollment(
     node_id, addresses = await verify_tailscale_enrollment(
         sb, profile, name, address, tailnet
     )
+    pin_verified_ssh_host_key(address)
     record_tailscale_enrollment(
         name,
         tailnet,
@@ -1359,7 +1174,7 @@ async def complete_tailscale_enrollment(
 
 
 async def ensure_one(name: str) -> dict[str, Any]:
-    states = {item["name"]: item for item in local_states()}
+    states = {item["name"]: item for item in managed_sandboxes()}
     if name not in states:
         raise ValueError(f"unknown managed sandbox: {name}")
     profile = states[name]["os"]
@@ -1423,7 +1238,7 @@ async def create_one(
     resources = sandbox_resources(profile, cpu, memory_mb, image_ref)
     name = requested_name or next_name(profile)
     validate_name(name)
-    if any(item["name"] == name for item in local_states()):
+    if any(item["name"] == name for item in managed_sandboxes()):
         raise ValueError(f"managed sandbox already exists: {name}")
     tailnet = local_tailscale_identity()
 
@@ -1501,7 +1316,7 @@ async def create_one(
 
 
 async def delete_one(name: str) -> dict[str, Any]:
-    states = {item["name"]: item for item in local_states()}
+    states = {item["name"]: item for item in managed_sandboxes()}
     if name not in states:
         raise ValueError(f"unknown managed sandbox: {name}")
     from cua_sandbox import Sandbox
@@ -1523,7 +1338,7 @@ class WorkspaceRepository:
 
 
 class WorkspaceState(TypedDict):
-    """Immutable trees captured when a thread first enters a sandbox."""
+    """Immutable trees captured when a workspace first enters a sandbox."""
 
     version: int
     localRoot: str
@@ -1542,8 +1357,7 @@ class SandboxWorkspaceSource(TypedDict):
 @dataclass(frozen=True)
 class WorkspaceTransfer:
     state: WorkspaceState
-    baseline_patch: bytes
-    current_patch: bytes
+    patch: bytes
     final_tree: str
 
 
@@ -1587,6 +1401,17 @@ def require_sandbox_source(value: object) -> SandboxWorkspaceSource:
     )
 
 
+def require_tool_packages(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list) or any(
+        not isinstance(package, str)
+        or not package.startswith(("git:", "npm:", "https://", "http://", "ssh://"))
+        or "pi-cua" in package.lower()
+        for package in value
+    ):
+        raise TypeError("tool_packages contains an unsupported package source")
+    return tuple(dict.fromkeys(value))
+
+
 def git_output(root: Path, *args: str) -> str:
     proc = subprocess.run(
         ["git", "-C", str(root), *args],
@@ -1600,6 +1425,23 @@ def git_output(root: Path, *args: str) -> str:
 
 def workspace_tree(source: Path) -> tuple[Path, str]:
     root = Path(git_output(source, "rev-parse", "--show-toplevel")).resolve()
+    status = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+        ],
+        check=True,
+        capture_output=True,
+        timeout=300,
+    )
+    if not status.stdout:
+        return root, git_output(root, "rev-parse", "HEAD^{tree}")
+
     with tempfile.TemporaryDirectory() as directory:
         index = Path(directory) / "index"
         environment = {**os.environ, "GIT_INDEX_FILE": str(index)}
@@ -1653,7 +1495,7 @@ def reject_remote_workspace_filters(name: str, profile: str, root: str) -> None:
     command = (
         f"node -e {shlex.quote(WORKSPACE_FILTER_CHECK)} {shlex.quote(root)}"
         if profile == "linux"
-        else f"& 'C:\\cua\\node-v22.20.0-win-x64\\node.exe' -e {powershell_literal(WORKSPACE_FILTER_CHECK)} {powershell_literal(root)}"
+        else f"& 'C:\\cua\\node\\node.exe' -e {powershell_literal(WORKSPACE_FILTER_CHECK)} {powershell_literal(root)}"
     )
     run_guest_ssh(name, profile, command, timeout=60)
 
@@ -1763,7 +1605,6 @@ def remote_workspace_patch(
 def apply_workspace_patch(root: Path, patch: bytes, expected_tree: str) -> None:
     command = ["git", "-C", str(root), "apply", "--binary", "--whitespace=nowarn"]
     if patch:
-        subprocess.run([*command, "--check"], input=patch, check=True, timeout=300)
         subprocess.run(command, input=patch, check=True, timeout=300)
     _, actual_tree = workspace_tree(root)
     if actual_tree != expected_tree:
@@ -1796,14 +1637,11 @@ def apply_remote_workspace_patch(
         if profile == "linux":
             command = f"""set -eu
 trap 'rm -f {shlex.quote(remote_path)}' EXIT
-git -C {shlex.quote(root)} apply --binary --whitespace=nowarn --check {shlex.quote(remote_path)}
 git -C {shlex.quote(root)} apply --binary --whitespace=nowarn {shlex.quote(remote_path)}
 """
         else:
             command = f"""$ErrorActionPreference = 'Stop'
 try {{
-  git -C {powershell_literal(root)} apply --binary --whitespace=nowarn --check {powershell_literal(remote_path)}
-  if ($LASTEXITCODE -ne 0) {{ throw 'git apply check failed' }}
   git -C {powershell_literal(root)} apply --binary --whitespace=nowarn {powershell_literal(remote_path)}
   if ($LASTEXITCODE -ne 0) {{ throw 'git apply failed' }}
 }} finally {{
@@ -1866,35 +1704,135 @@ def ssh_options(profile: str) -> list[str]:
         "-o",
         "StrictHostKeyChecking=accept-new",
         "-o",
-        f"UserKnownHostsFile={HOME / '.ssh' / 'cua_known_hosts'}",
+        f"UserKnownHostsFile={SANDBOX_KNOWN_HOSTS}",
         "-o",
         "ConnectTimeout=10",
-        "-o",
-        "ControlMaster=auto",
-        "-o",
-        "ControlPersist=10m",
-        "-o",
-        f"ControlPath={HOME / '.ssh' / 'cua-%C'}",
     ]
     if profile == "windows":
-        options[:0] = ["-i", str(WINDOWS_PUBLIC_KEY.with_suffix(""))]
+        options[:0] = ["-i", str(ensure_windows_identity())]
     return options
 
 
-def healthy_over_ssh(name: str, profile: str) -> str | None:
+@dataclass(frozen=True)
+class GuestPreflight:
+    address: str
+    free_bytes: int
+    config_matches: bool
+    repository_available: bool
+
+
+@dataclass(frozen=True)
+class GuestRuntimePreflight:
+    address: str
+    config_matches: bool
+
+
+def guest_runtime_preflight(
+    name: str, profile: str, config_digest: str
+) -> GuestRuntimePreflight | None:
+    if profile == "linux":
+        command = f"""set -u
+address=$({guest_health_command(profile)}) || exit 20
+config=$(cat /home/cua/.cua-pi/config-version 2>/dev/null || true)
+printf '%s|%s\n' "$address" "$config"
+"""
+    else:
+        script = rf"""$expected = {powershell_literal(bootstrap_digest(profile))}
+if ((Get-Content -ErrorAction SilentlyContinue C:\ProgramData\cua-pi\bootstrap-version) -ne $expected) {{ exit 20 }}
+if (-not (Test-Path C:\ProgramData\npm\pi.cmd)) {{ exit 21 }}
+$config = Get-Content -ErrorAction SilentlyContinue C:\Users\cua\.cua-pi\config-version
+Write-Output "healthy|$config"
+"""
+        encoded = base64.b64encode(script.encode("utf-16le")).decode()
+        command = f"powershell.exe -NoProfile -EncodedCommand {encoded}"
     try:
         result = run_guest_ssh(
-            name,
-            profile,
-            guest_health_command(profile),
-            timeout=15,
-            check=False,
-            report=False,
+            name, profile, command, timeout=30, check=False, report=False
         )
     except (OSError, RuntimeError):
         return None
-    lines = result.stdout.strip().splitlines() if result.returncode == 0 else []
-    return lines[-1] if lines else None
+    if result.returncode != 0:
+        return None
+    fields = next(
+        (
+            candidate.split("|", 1)
+            for candidate in reversed(result.stdout.strip().splitlines())
+            if "|" in candidate
+        ),
+        [],
+    )
+    if len(fields) != 2:
+        return None
+    return GuestRuntimePreflight(
+        address=name if profile == "windows" else fields[0],
+        config_matches=fields[1] == config_digest,
+    )
+
+
+def guest_preflight(
+    name: str,
+    profile: str,
+    remote_url: str,
+    commit: str,
+    config_digest: str,
+) -> GuestPreflight | None:
+    repository_key = hashlib.sha256(remote_url.encode()).hexdigest()[:20]
+    if profile == "linux":
+        cache = f"/home/cua/.cache/cua-pi/git/{repository_key}.git"
+        command = f"""set -u
+address=$({guest_health_command(profile)}) || exit 20
+free_bytes=$(( $(df -Pk /home/cua | awk 'NR == 2 {{ print $4 }}') * 1024 ))
+config=$(cat /home/cua/.cua-pi/config-version 2>/dev/null || true)
+if git -C {shlex.quote(cache)} cat-file -e {shlex.quote(commit + "^{commit}")} 2>/dev/null || git ls-remote --exit-code {shlex.quote(remote_url)} HEAD >/dev/null 2>&1; then
+  repository=1
+else
+  repository=0
+fi
+printf '%s|%s|%s|%s\n' "$address" "$free_bytes" "$config" "$repository"
+"""
+    else:
+        cache = rf"C:\cua\cache\git\{repository_key}.git"
+        script = rf"""$expected = {powershell_literal(bootstrap_digest(profile))}
+if ((Get-Content -ErrorAction SilentlyContinue C:\ProgramData\cua-pi\bootstrap-version) -ne $expected) {{ exit 20 }}
+if (-not (Test-Path C:\ProgramData\npm\pi.cmd)) {{ exit 21 }}
+$free = [IO.DriveInfo]::new('C:\').AvailableFreeSpace
+$config = Get-Content -ErrorAction SilentlyContinue C:\Users\cua\.cua-pi\config-version
+$repository = 0
+git -C {powershell_literal(cache)} cat-file -e {powershell_literal(commit + "^{commit}")} 2>$null
+if ($LASTEXITCODE -eq 0) {{
+  $repository = 1
+}} else {{
+  git ls-remote --exit-code {powershell_literal(remote_url)} HEAD 2>$null | Out-Null
+  if ($LASTEXITCODE -eq 0) {{ $repository = 1 }}
+}}
+Write-Output "healthy|$free|$config|$repository"
+"""
+        encoded = base64.b64encode(script.encode("utf-16le")).decode()
+        command = f"powershell.exe -NoProfile -EncodedCommand {encoded}"
+    try:
+        result = run_guest_ssh(
+            name, profile, command, timeout=60, check=False, report=False
+        )
+    except (OSError, RuntimeError):
+        return None
+    if result.returncode != 0:
+        return None
+    fields = next(
+        (
+            candidate.split("|")
+            for candidate in reversed(result.stdout.strip().splitlines())
+            if candidate.count("|") == 3
+        ),
+        [],
+    )
+    if len(fields) != 4 or not fields[1].isdigit() or fields[3] not in {"0", "1"}:
+        return None
+    return GuestPreflight(
+        address=name if profile == "windows" else fields[0],
+        free_bytes=int(fields[1]),
+        config_matches=fields[2] == config_digest,
+        repository_available=fields[3] == "1",
+    )
 
 
 def run_guest_ssh(
@@ -1927,7 +1865,7 @@ def run_guest_ssh(
         return result
 
     # Streamed variant: forward the latest output line (git --progress updates
-    # are \r-terminated) into the operation record so the UI can show it live.
+    # are \r-terminated) so the UI can show it live.
     import select
 
     process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -2003,7 +1941,6 @@ def copy_guest_file(name: str, profile: str, content: bytes, remote_path: str) -
         process = subprocess.Popen(
             [
                 "scp",
-                "-q",
                 *ssh_options(profile),
                 source.name,
                 f"cua@{name}:{target_path}",
@@ -2050,14 +1987,62 @@ def copy_guest_file(name: str, profile: str, content: bytes, remote_path: str) -
     progress(f"scp.{name}", f"uploaded {size} to {remote_path}")
 
 
-def sync_guest_packages(name: str, profile: str, packages: tuple[str, ...]) -> None:
-    settings = json.dumps({"packages": list(packages)}, indent=2).encode() + b"\n"
-    remote_path = (
-        "/home/cua/.pi/agent/settings.json"
-        if profile == "linux"
-        else r"C:\Users\cua\.pi\agent\settings.json"
-    )
-    copy_guest_file(name, profile, settings, remote_path)
+def guest_config_archive(files: dict[str, bytes]) -> bytes:
+    manifest = "".join(f"{path}\n" for path in sorted(files))
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        for path, content in files.items():
+            info = tarfile.TarInfo(path)
+            info.size = len(content)
+            info.mode = 0o644
+            archive.addfile(info, io.BytesIO(content))
+        content = manifest.encode()
+        info = tarfile.TarInfo(".cua-pi/config-files.new")
+        info.size = len(content)
+        info.mode = 0o600
+        archive.addfile(info, io.BytesIO(content))
+    return buffer.getvalue()
+
+
+def sync_guest_config(name: str, profile: str, content: bytes, digest: str) -> None:
+    if profile == "linux":
+        version_path = "/home/cua/.cua-pi/config-version"
+        archive_path = f"/tmp/cua-pi-config-{digest}.tgz"
+        copy_guest_file(name, profile, content, archive_path)
+        command = f"""set -eu
+mkdir -p /home/cua/.cua-pi
+if [ -f /home/cua/.cua-pi/config-files ]; then
+  while IFS= read -r path; do
+    case "$path" in .pi/agent/*) rm -f -- "/home/cua/$path" ;; esac
+  done < /home/cua/.cua-pi/config-files
+fi
+tar -xzf {shlex.quote(archive_path)} -C /home/cua
+mv /home/cua/.cua-pi/config-files.new /home/cua/.cua-pi/config-files
+printf '%s\n' {shlex.quote(digest)} > {shlex.quote(version_path)}
+rm -f {shlex.quote(archive_path)}
+"""
+    else:
+        version_path = r"C:\Users\cua\.cua-pi\config-version"
+        archive_path = rf"C:\Windows\Temp\cua-pi-config-{digest}.tgz"
+        copy_guest_file(name, profile, content, archive_path)
+        command = rf"""$ErrorActionPreference = 'Stop'
+$cuaHome = 'C:\Users\cua'
+$state = Join-Path $cuaHome '.cua-pi'
+$manifest = Join-Path $state 'config-files'
+New-Item -ItemType Directory -Force -Path $state | Out-Null
+if (Test-Path $manifest) {{
+  Get-Content $manifest | ForEach-Object {{
+    if ($_.StartsWith('.pi/agent/') -and $_ -ne '.pi/agent/cua-tool-broker.mjs') {{
+      Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $cuaHome ($_.Replace('/', '\\')))
+    }}
+  }}
+}}
+tar.exe -xzf {powershell_literal(archive_path)} -C $cuaHome
+Move-Item -Force (Join-Path $state 'config-files.new') $manifest
+Set-Content -NoNewline -Path {powershell_literal(version_path)} -Value {powershell_literal(digest)}
+Remove-Item -Force {powershell_literal(archive_path)}
+"""
+    run_guest_ssh(name, profile, command, timeout=120)
 
 
 def git_snapshot(root: Path, commit: str) -> bytes:
@@ -2069,26 +2054,13 @@ def git_snapshot(root: Path, commit: str) -> bytes:
     ).stdout
 
 
-def guest_repository_available(
-    name: str, profile: str, cache: str, remote_url: str, commit: str
-) -> bool:
-    command = (
-        f"git -C {shlex.quote(cache)} cat-file -e {shlex.quote(commit + '^{commit}')} 2>/dev/null || git ls-remote --exit-code {shlex.quote(remote_url)} HEAD >/dev/null"
-        if profile == "linux"
-        else f"git -C {powershell_literal(cache)} cat-file -e '{commit}^{{commit}}' 2>$null; if ($LASTEXITCODE -ne 0) {{ git ls-remote --exit-code {powershell_literal(remote_url)} HEAD | Out-Null; if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }} }}"
-    )
-    try:
-        run_guest_ssh(name, profile, command, timeout=60)
-        return True
-    except RuntimeError:
-        return False
-
-
 async def prepare_workspace(
     name: str,
     profile: str,
     source: WorkspaceRepository,
     workspace_id: str,
+    *,
+    repository_available: bool,
 ) -> str:
     progress(f"workspace.{name}.baseline", f"preparing {source.root}")
     repository_key = hashlib.sha256(source.remote_url.encode()).hexdigest()[:20]
@@ -2096,10 +2068,7 @@ async def prepare_workspace(
         workspace_root = f"/home/cua/workspaces/{workspace_id}"
         repository_cache = f"/home/cua/.cache/cua-pi/git/{repository_key}.git"
         snapshot_path = f"/tmp/cua-snapshot-{workspace_id}.tgz"
-        use_remote = guest_repository_available(
-            name, profile, repository_cache, source.remote_url, source.commit
-        )
-        if not use_remote:
+        if not repository_available:
             progress(
                 f"workspace.{name}.snapshot",
                 "origin is unavailable; sending a local commit snapshot",
@@ -2113,7 +2082,8 @@ elif ! git -C {shlex.quote(repository_cache)} cat-file -e {shlex.quote(source.co
   git -C {shlex.quote(repository_cache)} fetch --progress origin {shlex.quote(source.commit)}
 fi
 if [ ! -d {shlex.quote(workspace_root)}/.git ]; then
-  git clone --reference-if-able {shlex.quote(repository_cache)} --dissociate --no-checkout --progress {shlex.quote(source.remote_url)} {shlex.quote(workspace_root)}
+  git clone --shared --no-checkout {shlex.quote(repository_cache)} {shlex.quote(workspace_root)}
+  git -C {shlex.quote(workspace_root)} remote set-url origin {shlex.quote(source.remote_url)}
 fi
 if ! git -C {shlex.quote(workspace_root)} cat-file -e {shlex.quote(source.commit + "^{commit}")} 2>/dev/null; then
   git -C {shlex.quote(workspace_root)} fetch --depth=1 --progress origin {shlex.quote(source.commit)}
@@ -2140,7 +2110,7 @@ fi
 rm -f {shlex.quote(snapshot_path)}"""
         command = f"""set -eu
 mkdir -p /home/cua/workspaces /home/cua/.cache/cua-pi/git
-{remote_setup if use_remote else snapshot_setup}
+{remote_setup if repository_available else snapshot_setup}
 """
         run_guest_ssh(
             name,
@@ -2157,10 +2127,7 @@ mkdir -p /home/cua/workspaces /home/cua/.cache/cua-pi/git
     workspace_root = rf"C:\cua\workspaces\{workspace_id}"
     repository_cache = rf"C:\cua\cache\git\{repository_key}.git"
     snapshot_path = rf"C:\Windows\Temp\cua-snapshot-{workspace_id}.tgz"
-    use_remote = guest_repository_available(
-        name, profile, repository_cache, source.remote_url, source.commit
-    )
-    if not use_remote:
+    if not repository_available:
         progress(
             f"workspace.{name}.snapshot",
             "origin is unavailable; sending a local commit snapshot",
@@ -2169,7 +2136,7 @@ mkdir -p /home/cua/workspaces /home/cua/.cache/cua-pi/git
             name, profile, git_snapshot(source.root, source.commit), snapshot_path
         )
     remote_setup = f"""if (-not (Test-Path $cache)) {{ git clone --quiet --mirror {powershell_literal(source.remote_url)} $cache }} elseif (-not (Test-GitCommit $cache '{source.commit}')) {{ git -C $cache fetch --quiet origin {source.commit} }}
-if (-not (Test-Path "$root\\.git")) {{ git clone --quiet --reference-if-able $cache --dissociate --no-checkout {powershell_literal(source.remote_url)} $root }}
+if (-not (Test-Path "$root\\.git")) {{ git clone --quiet --shared --no-checkout $cache $root; git -C $root remote set-url origin {powershell_literal(source.remote_url)} }}
 if (-not (Test-GitCommit $root '{source.commit}')) {{ git -C $root fetch --quiet --depth=1 origin {source.commit} }}
 git -C $root checkout --quiet --detach --force {source.commit}
 git -C $root clean -ffd"""
@@ -2202,19 +2169,42 @@ function Test-GitCommit([string]$Repository, [string]$Commit) {{
 $root = {powershell_literal(workspace_root)}
 $cache = {powershell_literal(repository_cache)}
 New-Item -ItemType Directory -Force -Path 'C:\\cua\\workspaces','C:\\cua\\cache\\git' | Out-Null
-{remote_setup if use_remote else snapshot_setup}
+{remote_setup if repository_available else snapshot_setup}
 """
-    script_path = rf"C:\Windows\Temp\cua-workspace-{workspace_id}.ps1"
-    copy_guest_file(name, profile, script.encode("utf-8-sig"), script_path)
+    encoded_script = base64.b64encode(script.encode("utf-16le")).decode()
     run_guest_ssh(
         name,
         profile,
-        rf"powershell.exe -NoProfile -ExecutionPolicy Bypass -File {script_path}",
+        f"powershell.exe -NoProfile -EncodedCommand {encoded_script}",
         timeout=1800,
         stream_phase=f"workspace.{name}.sync",
     )
     relative_windows = PureWindowsPath(*source.relative_cwd.parts)
     return str(PureWindowsPath(workspace_root) / relative_windows)
+
+
+def sandbox_workspace_exists(name: str, profile: str, cwd: str) -> bool:
+    if profile == "linux":
+        match = re.match(r"^(/home/cua/workspaces/[0-9a-f]{16})(?:/|$)", cwd)
+        command = f"test -d {shlex.quote(match.group(1) if match else '')}/.git"
+    else:
+        match = re.match(
+            r"^(C:\\cua\\workspaces\\[0-9a-f]{16})(?:\\|$)", cwd, re.IGNORECASE
+        )
+        root = match.group(1) if match else ""
+        command = (
+            'powershell.exe -NoProfile -Command "if(Test-Path '
+            + powershell_literal(root + r"\.git")
+            + '){exit 0}else{exit 1}"'
+        )
+    if match is None:
+        raise ValueError("saved sandbox workspace path is invalid")
+    result = run_guest_ssh(name, profile, command, timeout=30, check=False)
+    if result.returncode not in {0, 1}:
+        raise RuntimeError(
+            result.stderr or f"workspace probe exited {result.returncode}"
+        )
+    return result.returncode == 0
 
 
 def workspace_location(name: str, profile: str, cwd: str) -> tuple[str, str]:
@@ -2239,6 +2229,24 @@ if ($cwd.Equals($root, [StringComparison]::OrdinalIgnoreCase)) {{ Write-Output '
     return lines[-2], lines[-1]
 
 
+def cleanup_workspace_root(name: str, profile: str, root: str) -> None:
+    if profile == "linux":
+        if not re.fullmatch(r"/home/cua/workspaces/[0-9a-f]{16}", root):
+            raise RuntimeError("refusing to remove an invalid Linux workspace path")
+        command = f"rm -rf -- {shlex.quote(root)}"
+    else:
+        if not re.fullmatch(r"C:\\cua\\workspaces\\[0-9a-f]{16}", root, re.IGNORECASE):
+            raise RuntimeError("refusing to remove an invalid Windows workspace path")
+        command = f"Remove-Item -Recurse -Force -ErrorAction SilentlyContinue {powershell_literal(root)}"
+    run_guest_ssh(name, profile, command, timeout=600)
+
+
+def cleanup_sandbox_workspace(source: SandboxWorkspaceSource) -> dict[str, Any]:
+    root, _ = workspace_location(source["address"], source["os"], source["remoteCwd"])
+    cleanup_workspace_root(source["address"], source["os"], root)
+    return {"removed": True}
+
+
 def capture_local_workspace(repository: WorkspaceRepository) -> WorkspaceTransfer:
     local_root, baseline_tree = workspace_tree(repository.root)
     commit_tree = git_output(local_root, "rev-parse", "HEAD^{tree}")
@@ -2251,45 +2259,92 @@ def capture_local_workspace(repository: WorkspaceRepository) -> WorkspaceTransfe
     )
     return WorkspaceTransfer(
         state=state,
-        baseline_patch=workspace_patch(local_root, commit_tree, baseline_tree),
-        current_patch=b"",
+        patch=workspace_patch(local_root, commit_tree, baseline_tree),
         final_tree=baseline_tree,
     )
 
 
-def capture_sandbox_delta(
-    source: SandboxWorkspaceSource,
-) -> tuple[str, bytes, str]:
+def parse_numstat(output: str) -> tuple[int, int]:
+    additions = 0
+    deletions = 0
+    for line in output.splitlines():
+        fields = line.split("\t", 2)
+        if len(fields) < 2:
+            continue
+        if fields[0].isdigit():
+            additions += int(fields[0])
+        if fields[1].isdigit():
+            deletions += int(fields[1])
+    return additions, deletions
+
+
+def remote_workspace_numstat(
+    name: str,
+    profile: str,
+    root: str,
+    before_tree: str,
+    after_tree: str,
+) -> tuple[int, int]:
+    if profile == "linux":
+        command = (
+            f"git -C {shlex.quote(root)} diff --numstat {before_tree} {after_tree} --"
+        )
+    else:
+        command = (
+            f"git -C {powershell_literal(root)} diff --numstat "
+            f"{before_tree} {after_tree} --"
+        )
+    result = run_guest_ssh(name, profile, command, timeout=60, report=False)
+    return parse_numstat(result.stdout)
+
+
+def workspace_diff_status(
+    source: SandboxWorkspaceSource, local_cwd: str
+) -> dict[str, Any]:
     state = source["state"]
+    local_root = Path(state["localRoot"]).resolve()
+    requested_root = Path(
+        git_output(Path(local_cwd), "rev-parse", "--show-toplevel")
+    ).resolve()
+    if requested_root != local_root:
+        raise RuntimeError("local workspace path changed since sandbox activation")
+
+    _, local_tree = workspace_tree(local_root)
+    source_root, _ = workspace_location(
+        source["address"], source["os"], source["remoteCwd"]
+    )
+    final_tree = remote_workspace_tree(source["address"], source["os"], source_root)
+    additions, deletions = remote_workspace_numstat(
+        source["address"],
+        source["os"],
+        source_root,
+        state["commitTree"],
+        final_tree,
+    )
+    return {
+        "additions": additions,
+        "deletions": deletions,
+        "pending_sync": final_tree != state["baselineTree"],
+        "sync_safe": local_tree == state["baselineTree"],
+    }
+
+
+def capture_sandbox_patch(
+    source: SandboxWorkspaceSource, base_tree: str
+) -> tuple[bytes, str]:
     source_root, _ = workspace_location(
         source["address"], source["os"], source["remoteCwd"]
     )
     final_tree = remote_workspace_tree(source["address"], source["os"], source_root)
     patch = remote_workspace_patch(
-        source["address"],
-        source["os"],
-        source_root,
-        state["baselineTree"],
-        final_tree,
+        source["address"], source["os"], source_root, base_tree, final_tree
     )
-    return source_root, patch, final_tree
+    return patch, final_tree
 
 
 def capture_sandbox_workspace(source: SandboxWorkspaceSource) -> WorkspaceTransfer:
-    state = source["state"]
-    source_root, current_patch, final_tree = capture_sandbox_delta(source)
-    return WorkspaceTransfer(
-        state=state,
-        baseline_patch=remote_workspace_patch(
-            source["address"],
-            source["os"],
-            source_root,
-            state["commitTree"],
-            state["baselineTree"],
-        ),
-        current_patch=current_patch,
-        final_tree=final_tree,
-    )
+    patch, final_tree = capture_sandbox_patch(source, source["state"]["commitTree"])
+    return WorkspaceTransfer(state=source["state"], patch=patch, final_tree=final_tree)
 
 
 def restore_sandbox_workspace(
@@ -2299,27 +2354,18 @@ def restore_sandbox_workspace(
     transfer: WorkspaceTransfer,
     reference: str,
 ) -> None:
-    commit_tree = remote_workspace_tree(
-        name, profile, root, reference=f"{reference}/commit"
-    )
-    if commit_tree != transfer.state["commitTree"]:
-        raise RuntimeError("destination workspace does not match the Git baseline")
-    apply_remote_workspace_patch(
-        name,
-        profile,
-        root,
-        transfer.baseline_patch,
-        transfer.state["baselineTree"],
-        reference=f"{reference}/workspace",
-    )
-    progress("workspace.destination.apply", "applying current workspace changes")
-    apply_remote_workspace_patch(
-        name,
-        profile,
-        root,
-        transfer.current_patch,
-        transfer.final_tree,
-    )
+    if transfer.patch:
+        progress("workspace.destination.apply", "applying workspace changes")
+        apply_remote_workspace_patch(
+            name,
+            profile,
+            root,
+            transfer.patch,
+            transfer.final_tree,
+            reference=f"{reference}/workspace",
+        )
+    elif transfer.final_tree != transfer.state["commitTree"]:
+        raise RuntimeError("empty workspace patch does not match the Git baseline")
 
 
 def sync_workspace_to_local(
@@ -2341,7 +2387,9 @@ def sync_workspace_to_local(
         )
 
     progress("workspace.local.diff", "capturing sandbox changes")
-    _, current_patch, final_tree = capture_sandbox_delta(source)
+    current_patch, final_tree = capture_sandbox_patch(
+        source, workspace_state["baselineTree"]
+    )
     progress(
         "workspace.local.apply",
         f"applying {len(current_patch) / 1048576:.1f} MiB of sandbox changes",
@@ -2355,18 +2403,95 @@ def sync_workspace_to_local(
     return {"local_cwd": local_cwd, "changed": bool(current_patch)}
 
 
+def refresh_execution(
+    name: str,
+    source: SandboxWorkspaceSource,
+    tool_packages: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    states = {item["name"]: item for item in managed_sandboxes()}
+    if name not in states:
+        raise ValueError(f"unknown managed sandbox: {name}")
+    profile = states[name]["os"]
+    if source["os"] != profile:
+        raise ValueError("saved sandbox profile does not match its controller record")
+    config_files = guest_config_files(tool_packages)
+    guest_digest = config_digest(config_files)
+    candidate = states[name].get("address") or source["address"] or name
+    progress("sandbox.runtime", "checking guest runtime configuration")
+    preflight = guest_runtime_preflight(candidate, profile, guest_digest)
+    if preflight is None:
+        raise SandboxRepairRequired(f"sandbox repair required: {name}")
+    if not preflight.config_matches:
+        sync_guest_config(
+            preflight.address,
+            profile,
+            guest_config_archive(config_files),
+            guest_digest,
+        )
+    return {
+        "name": name,
+        "os": profile,
+        "address": preflight.address,
+        "remote_cwd": source["remoteCwd"],
+        "workspace_state": source["state"],
+        "runtime_digest": guest_digest,
+    }
+
+
 async def prepare_execution(
     name: str,
     source_cwd: str,
     workspace_key: str,
     source: SandboxWorkspaceSource | None = None,
+    resume: SandboxWorkspaceSource | None = None,
     tool_packages: tuple[str, ...] = (),
 ) -> dict[str, Any]:
-    states = {item["name"]: item for item in local_states()}
+    states = {item["name"]: item for item in managed_sandboxes()}
     if name not in states:
         raise ValueError(f"unknown managed sandbox: {name}")
     profile = states[name]["os"]
+    if source and resume:
+        raise ValueError("prepare_execution cannot transfer and resume simultaneously")
+    if resume and resume["os"] != profile:
+        raise ValueError("saved sandbox profile does not match its controller record")
     repository = inspect_workspace(Path(source_cwd).expanduser().resolve())
+    config_files = guest_config_files(tool_packages)
+    guest_digest = config_digest(config_files)
+    candidate = states[name].get("address") or name
+    progress("sandbox.preflight", "checking health, configuration, disk, and cache")
+    preflight = guest_preflight(
+        candidate,
+        profile,
+        repository.remote_url,
+        repository.commit,
+        guest_digest,
+    )
+    if preflight is None:
+        raise SandboxRepairRequired(f"sandbox repair required: {name}")
+
+    address = preflight.address
+    if preflight.free_bytes < 1024**3:
+        raise RuntimeError(
+            "workspace setup requires 1 GiB free; "
+            f"only {preflight.free_bytes // 1048576} MiB is available"
+        )
+    if not preflight.config_matches:
+        sync_guest_config(
+            address,
+            profile,
+            guest_config_archive(config_files),
+            guest_digest,
+        )
+    if resume and sandbox_workspace_exists(address, profile, resume["remoteCwd"]):
+        return {
+            "name": name,
+            "os": profile,
+            "address": address,
+            "remote_cwd": resume["remoteCwd"],
+            "workspace_state": resume["state"],
+            "runtime_digest": guest_digest,
+        }
+
     transfer = (
         capture_sandbox_workspace(source)
         if source
@@ -2379,41 +2504,41 @@ async def prepare_execution(
             remote_url=repository.remote_url,
             commit=transfer.state["commit"],
         )
-    address = healthy_over_ssh(states[name].get("address") or name, profile)
-    if address is None:
-        tailnet = local_tailscale_identity()
-        restore_cua_state(name)
-        sb = await connect_sandbox(name)
-        try:
-            address = await healthy(sb, profile)
-            if address is None:
-                address = await (
-                    bootstrap_linux(sb, name, tailnet)
-                    if profile == "linux"
-                    else bootstrap_windows(sb, name, tailnet)
-                )
-            await complete_tailscale_enrollment(sb, profile, name, address, tailnet)
-        finally:
-            await disconnect_safely(sb)
-
-    reference = hashlib.sha256(workspace_key.encode()).hexdigest()[:32]
-    sync_guest_packages(address, profile, tool_packages)
-    workspace_id = hashlib.sha256(workspace_key.encode()).hexdigest()[:16]
-    remote_cwd = await prepare_workspace(
-        address,
-        profile,
-        repository,
-        workspace_id,
+    workspace_digest = hashlib.sha256(workspace_key.encode()).hexdigest()
+    reference = workspace_digest[:32]
+    workspace_id = workspace_digest[:16]
+    workspace_root = (
+        f"/home/cua/workspaces/{workspace_id}"
+        if profile == "linux"
+        else rf"C:\cua\workspaces\{workspace_id}"
     )
-    progress("workspace.baseline", "reconstructing the destination workspace")
-    remote_root, _ = workspace_location(address, profile, remote_cwd)
-    restore_sandbox_workspace(address, profile, remote_root, transfer, reference)
+    try:
+        remote_cwd = await prepare_workspace(
+            address,
+            profile,
+            repository,
+            workspace_id,
+            repository_available=preflight.repository_available,
+        )
+        progress("workspace.baseline", "reconstructing the destination workspace")
+        restore_sandbox_workspace(address, profile, workspace_root, transfer, reference)
+    except BaseException:
+        try:
+            progress("workspace.destination.cleanup", "removing incomplete workspace")
+            cleanup_workspace_root(address, profile, workspace_root)
+        except Exception as cleanup_error:  # noqa: BLE001 - preserve the setup failure
+            progress(
+                "workspace.destination.cleanup",
+                f"cleanup failed: {error_text(cleanup_error)}",
+            )
+        raise
     return {
         "name": name,
         "os": profile,
         "address": address,
         "remote_cwd": remote_cwd,
         "workspace_state": transfer.state,
+        "runtime_digest": guest_digest,
     }
 
 
@@ -2427,31 +2552,21 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
                 "online": item["name"].lower() in online
                 or str(item.get("address") or "").lower() in online,
             }
-            for item in local_states()
+            for item in managed_sandboxes()
         ]
         return {"sandboxes": items}
-    if action == "get_execution_target":
-        return get_execution_target(
-            str(request.get("session_id") or ""),
-            str(request.get("session_file") or ""),
-        )
-    if action == "set_execution_target":
-        return set_execution_target(
-            str(request.get("session_id") or ""),
-            str(request.get("session_file") or ""),
-            request.get("target"),
-        )
-    if action == "operation_status":
-        return operation_status(str(request.get("operation_id") or ""))
-    if action == "operation_cancel":
-        return cancel_operation(str(request.get("operation_id") or ""))
-    if action == "sync_workspace_to_local":
+    if action == "cleanup_workspace":
+        return cleanup_sandbox_workspace(require_sandbox_source(request.get("source")))
+    if action in {"sync_workspace_to_local", "workspace_diff_status"}:
         local_cwd = request.get("local_cwd")
         if not isinstance(local_cwd, str) or not local_cwd:
-            raise TypeError("sync_workspace_to_local requires local_cwd")
+            raise TypeError(f"{action} requires local_cwd")
         source = require_sandbox_source(request.get("source"))
+        if action == "workspace_diff_status":
+            return workspace_diff_status(source, local_cwd)
         return sync_workspace_to_local(source, local_cwd)
-    configure_fleet_auth()
+    if action in CLOUD_ACTIONS:
+        configure_fleet_auth()
     if action == "create":
         return await create_one(
             str(request.get("os") or ""),
@@ -2464,6 +2579,12 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         return await ensure_one(str(request.get("name") or ""))
     if action == "delete":
         return await delete_one(str(request.get("name") or ""))
+    if action == "refresh_execution":
+        return refresh_execution(
+            str(request.get("name") or ""),
+            require_sandbox_source(request.get("source")),
+            require_tool_packages(request.get("tool_packages", [])),
+        )
     if action == "prepare_execution":
         workspace_key = request.get("workspace_id")
         if not isinstance(workspace_key, str) or not workspace_key:
@@ -2472,140 +2593,73 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         source = (
             require_sandbox_source(source_value) if source_value is not None else None
         )
-        tool_packages = request.get("tool_packages", [])
-        if not isinstance(tool_packages, list) or any(
-            not isinstance(package, str)
-            or not package.startswith(("git:", "npm:", "https://", "http://", "ssh://"))
-            or "pi-cua" in package.lower()
-            for package in tool_packages
-        ):
-            raise TypeError("tool_packages contains an unsupported package source")
+        tool_packages = require_tool_packages(request.get("tool_packages", []))
+        resume_value = request.get("resume")
+        resume = (
+            require_sandbox_source(resume_value) if resume_value is not None else None
+        )
         return await prepare_execution(
             str(request.get("name") or ""),
             str(request.get("source_cwd") or ""),
             workspace_key,
             source,
-            tuple(dict.fromkeys(tool_packages)),
+            resume,
+            tool_packages,
         )
     raise ValueError(
-        "action must be list, create, ensure, delete, prepare_execution, get_execution_target, or set_execution_target"
+        "action must be list, create, ensure, delete, prepare_execution, refresh_execution, sync_workspace_to_local, cleanup_workspace, or workspace_diff_status"
     )
 
 
 def main() -> None:
-    global CURRENT_OPERATION_ID
     try:
         if len(sys.argv) != 2:
             raise ValueError("expected one JSON request argument")
         request = json.loads(sys.argv[1])
         if not isinstance(request, dict):
             raise TypeError("request must be a JSON object")
-        action = request.get("action")
-        worker = os.environ.get("CUA_DETACHED_WORKER") == "1"
-        if worker:
-            signal.signal(signal.SIGTERM, cancel_worker)
-        CURRENT_OPERATION_ID = os.environ.setdefault(
-            "CUA_OPERATION_ID", uuid.uuid4().hex[:12]
-        )
-        prune_operation_logs()
+        action = str(request.get("action") or "")
+        migrate_sdk_sandbox_records()
+        if action in CLOUD_ACTIONS and os.environ.get("CUA_CLOUD_WORKER") != "1":
+            environment = {**os.environ, "CUA_CLOUD_WORKER": "1"}
+            os.execvpe("uv", cloud_worker_command(request), environment)
 
-        if action in LONG_ACTIONS and not worker:
-            result = submit_operation(request, CURRENT_OPERATION_ID)
-            print(json.dumps({"ok": True, **result}, separators=(",", ":")))
-            return
-
-        if worker:
-            with database() as connection:
-                connection.execute(
-                    """
-                    UPDATE operations
-                    SET state = 'running', worker_pid = ?, phase = 'worker',
-                        message = 'worker running', updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        os.getpgrp(),
-                        datetime.now(timezone.utc).isoformat(),
-                        CURRENT_OPERATION_ID,
-                    ),
-                )
-        quiet_request = action in {
-            "list",
-            "get_execution_target",
-            "set_execution_target",
-            "operation_status",
-        }
+        signal.signal(signal.SIGTERM, cancel_worker)
+        quiet_request = action in {"list", "workspace_diff_status"}
         if not quiet_request:
             progress("request", "accepted", action=action, name=request.get("name"))
-        local_read = action in {
-            "list",
-            "get_execution_target",
-            "set_execution_target",
-            "operation_status",
-            "operation_cancel",
-        }
-        if local_read:
-            result = asyncio.run(dispatch(request))
-        else:
-            locks = operation_locks(str(action))
-            with ExitStack() as stack:
-                for lock in locks:
-                    label = "Fleet" if lock == CONTROLLER_LOCK else "workspace"
-                    progress("lock", f"waiting for {label} mutation lock")
-                    stack.enter_context(operation_lock(lock))
-                    progress("lock", f"acquired {label} mutation lock")
+        if action in {
+            "create",
+            "ensure",
+            "delete",
+            "prepare_execution",
+            "refresh_execution",
+            "sync_workspace_to_local",
+            "cleanup_workspace",
+        }:
+            progress("lock", "waiting for controller mutation lock")
+            with operation_lock(CONTROLLER_LOCK):
+                progress("lock", "acquired controller mutation lock")
                 result = asyncio.run(dispatch(request))
+        else:
+            result = asyncio.run(dispatch(request))
         if not quiet_request:
             progress("complete", "operation succeeded")
-        if worker:
-            finish_operation(CURRENT_OPERATION_ID, "succeeded", result=result)
-        print(
-            json.dumps(
-                {
-                    "ok": True,
-                    "operation_id": CURRENT_OPERATION_ID,
-                    "operation_log": str(
-                        OPERATION_DIR / f"{CURRENT_OPERATION_ID}.jsonl"
-                    ),
-                    **result,
-                },
-                separators=(",", ":"),
-            )
-        )
+        print(json.dumps({"ok": True, **result}, separators=(",", ":")))
     except Exception as error:  # noqa: BLE001 - process boundary returns all failures as JSON
-        try:
-            cancelled = isinstance(error, OperationCancelled)
-            progress(
-                CURRENT_PHASE,
-                "operation cancelled" if cancelled else "operation failed",
-                error=error_text(error),
-            )
-            if os.environ.get("CUA_DETACHED_WORKER") == "1" and CURRENT_OPERATION_ID:
-                finish_operation(
-                    CURRENT_OPERATION_ID,
-                    "cancelled" if cancelled else "failed",
-                    error_type=None if cancelled else type(error).__name__,
-                    error=None if cancelled else error_text(error),
-                )
-        except OSError as log_error:
-            print(
-                f"warning: failed to write operation log: {error_text(log_error)}",
-                file=sys.stderr,
-                flush=True,
-            )
+        cancelled = isinstance(error, OperationCancelled)
+        progress(
+            CURRENT_PHASE,
+            "operation cancelled" if cancelled else "operation failed",
+            error=error_text(error),
+        )
         print(
             json.dumps(
                 {
                     "ok": False,
-                    "operation_id": CURRENT_OPERATION_ID,
                     "phase": CURRENT_PHASE,
                     "error_type": type(error).__name__,
                     "error": error_text(error),
-                    "operation_log": (
-                        str(OPERATION_DIR / f"{CURRENT_OPERATION_ID}.jsonl")
-                        if CURRENT_OPERATION_ID
-                        else None
-                    ),
                 },
                 separators=(",", ":"),
             )

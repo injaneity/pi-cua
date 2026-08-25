@@ -1,27 +1,20 @@
 #!/usr/bin/env node
 
-import { spawn } from "node:child_process";
-import { timingSafeEqual } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { createServer } from "node:net";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const agentDir = dirname(fileURLToPath(import.meta.url));
 const homeDir = dirname(dirname(agentDir));
-const hostScript = join(agentDir, "cua-tool-host.mjs");
-const token = readFileSync(
-  join(agentDir, "cua-tool-broker.token"),
-  "utf8",
-).trim();
-const port = Number(process.env.CUA_PI_TOOL_BROKER_PORT || "43121");
+process.env.HOME = homeDir;
+process.env.USERPROFILE = homeDir;
+process.env.PI_CODING_AGENT_DIR = agentDir;
 
-function validToken(candidate) {
-  if (typeof candidate !== "string") return false;
-  const actual = Buffer.from(token);
-  const supplied = Buffer.from(candidate);
-  return actual.length === supplied.length && timingSafeEqual(actual, supplied);
-}
+const toolHostUrl = pathToFileURL(join(agentDir, "cua-tool-host.mjs"));
+const port = Number(process.env.CUA_PI_TOOL_BROKER_PORT || "43121");
+const hostFactories = new Map();
+const hosts = new Map();
 
 function diagnostic(socket, text) {
   if (!socket.destroyed) {
@@ -29,11 +22,40 @@ function diagnostic(socket, text) {
   }
 }
 
-function attach(socket, request, remainder) {
+function hostFactory(manifest) {
+  let factory = hostFactories.get(manifest);
+  if (factory) return factory;
+  const generation = createHash("sha256").update(manifest).digest("hex");
+  factory = import(`${toolHostUrl.href}?generation=${generation}`).then(
+    (module) => module.createToolHost,
+  );
+  hostFactories.set(manifest, factory);
+  return factory;
+}
+
+function hostEntry(cwd, manifest) {
+  const current = hosts.get(cwd);
+  if (current?.manifest === manifest) return current;
+
+  const entry = {
+    manifest,
+    host: (async () => {
+      if (current) await (await current.host).dispose();
+      const createToolHost = await hostFactory(manifest);
+      return createToolHost({ cwd, encodedManifest: manifest });
+    })(),
+  };
+  hosts.set(cwd, entry);
+  entry.host.catch(() => {
+    if (hosts.get(cwd) === entry) hosts.delete(cwd);
+  });
+  return entry;
+}
+
+async function attach(socket, request, remainder) {
   if (
     !request ||
     request.type !== "open" ||
-    !validToken(request.token) ||
     typeof request.cwd !== "string" ||
     typeof request.manifest !== "string"
   ) {
@@ -41,32 +63,30 @@ function attach(socket, request, remainder) {
     socket.end();
     return;
   }
-  const child = spawn(
-    process.execPath,
-    [hostScript, request.cwd, request.manifest],
-    {
-      cwd: request.cwd,
-      env: {
-        ...process.env,
-        HOME: homeDir,
-        USERPROFILE: homeDir,
-        PI_CODING_AGENT_DIR: agentDir,
-      },
-      stdio: ["pipe", "pipe", "pipe"],
-      windowsHide: true,
-    },
-  );
-  if (remainder.length > 0) child.stdin.write(remainder);
-  socket.pipe(child.stdin);
-  child.stdout.pipe(socket, { end: false });
-  child.stderr.on("data", (chunk) => diagnostic(socket, chunk.toString()));
-  child.on("error", (error) => diagnostic(socket, error.message));
-  child.on("close", () => socket.end());
-  socket.on("close", () => {
-    child.stdin.end();
-    const timer = setTimeout(() => child.kill("SIGKILL"), 1_000);
-    timer.unref();
+
+  socket.pause();
+  let disconnected = false;
+  socket.once("close", () => {
+    disconnected = true;
   });
+  const entry = hostEntry(request.cwd, request.manifest);
+  try {
+    const host = await entry.host;
+    if (disconnected) return;
+    const result = await host.attach({
+      input: socket,
+      output: socket,
+      initialInput: remainder,
+    });
+    if (result.disposeRequested && hosts.get(request.cwd) === entry) {
+      hosts.delete(request.cwd);
+      await host.dispose();
+    }
+  } catch (error) {
+    diagnostic(socket, error instanceof Error ? error.message : String(error));
+  } finally {
+    socket.end();
+  }
 }
 
 const server = createServer((socket) => {
@@ -86,7 +106,7 @@ const server = createServer((socket) => {
       .replace(/\r$/, "");
     const remainder = buffer.subarray(newline + 1);
     try {
-      attach(socket, JSON.parse(line), remainder);
+      void attach(socket, JSON.parse(line), remainder);
     } catch (error) {
       diagnostic(
         socket,
