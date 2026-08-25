@@ -157,7 +157,7 @@ type ExecutionTarget =
       address: string;
       localCwd: string;
       remoteCwd: string;
-      workspaceState: WorkspaceState;
+      workspaceState?: WorkspaceState;
       runtimeDigest?: string;
     };
 type UIContext = ExtensionContext | ExtensionCommandContext;
@@ -568,6 +568,22 @@ function requireSandbox(result: BackendResult): {
   return { name: result.name, os: result.os };
 }
 
+function parseWorkspaceState(value: unknown): WorkspaceState | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "object")
+    throw new Error("saved sandbox workspace state is unsupported");
+  const state = value as Record<string, unknown>;
+  if (
+    state.version !== 1 ||
+    typeof state.localRoot !== "string" ||
+    typeof state.commit !== "string" ||
+    typeof state.commitTree !== "string" ||
+    typeof state.baselineTree !== "string"
+  )
+    throw new Error("saved sandbox workspace state is unsupported");
+  return state as WorkspaceState;
+}
+
 function parseTarget(value: unknown): ExecutionTarget | undefined {
   if (value === undefined || value === null) return undefined;
   if (typeof value !== "object")
@@ -583,16 +599,7 @@ function parseTarget(value: unknown): ExecutionTarget | undefined {
     typeof data.remoteCwd !== "string"
   )
     throw new Error("saved execution target is invalid");
-  const sync = data.workspaceState as Record<string, unknown> | undefined;
-  if (
-    !sync ||
-    sync.version !== 1 ||
-    typeof sync.localRoot !== "string" ||
-    typeof sync.commit !== "string" ||
-    typeof sync.commitTree !== "string" ||
-    typeof sync.baselineTree !== "string"
-  )
-    throw new Error("saved sandbox workspace state is unsupported");
+  const workspaceState = parseWorkspaceState(data.workspaceState);
   return {
     kind: "sandbox",
     name: data.name,
@@ -600,7 +607,7 @@ function parseTarget(value: unknown): ExecutionTarget | undefined {
     address: data.address,
     localCwd: data.localCwd,
     remoteCwd: data.remoteCwd,
-    workspaceState: sync as WorkspaceState,
+    workspaceState,
     runtimeDigest:
       typeof data.runtimeDigest === "string" ? data.runtimeDigest : undefined,
   };
@@ -889,7 +896,14 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     );
     const actions: DestinationSearchOption[] = [
       ...(active?.kind === "sandbox"
-        ? [{ value: "local", label: "sync back to local directory" }]
+        ? [
+            {
+              value: "local",
+              label: active.workspaceState
+                ? "sync back to local directory"
+                : "return to local execution",
+            },
+          ]
         : []),
       ...(online.length > 0
         ? [
@@ -1032,11 +1046,11 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       workspace_id: ctx.sessionManager.getSessionId(),
       tool_packages: [...toolPackages],
       source: refresh
-        ? sandboxSource(refresh)
+        ? executionSource(refresh)
         : !resume && inheritWorkspace && target.kind === "sandbox"
-          ? sandboxSource(target)
+          ? workspaceSource(target)
           : undefined,
-      resume: resume ? sandboxSource(resume) : undefined,
+      resume: resume ? workspaceSource(resume) : undefined,
     };
     const onStatus = (status: BackendResult) => {
       ctx.ui.setStatus(
@@ -1070,7 +1084,6 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       if (
         typeof result.remote_cwd !== "string" ||
         typeof result.address !== "string" ||
-        !result.workspace_state ||
         typeof result.runtime_digest !== "string"
       ) {
         throw new Error("cua backend returned an invalid execution target");
@@ -1081,7 +1094,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         address: result.address,
         localCwd: refresh?.localCwd ?? resume?.localCwd ?? ctx.cwd,
         remoteCwd: result.remote_cwd,
-        workspaceState: result.workspace_state,
+        workspaceState: parseWorkspaceState(result.workspace_state),
         runtimeDigest: result.runtime_digest,
       };
     } catch (error) {
@@ -1103,15 +1116,21 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     );
   }
 
-  function sandboxSource(
+  function executionSource(
     active: Extract<ExecutionTarget, { kind: "sandbox" }>,
   ): Record<string, unknown> {
     return {
       address: active.address,
       os: active.os,
       remoteCwd: active.remoteCwd,
-      state: active.workspaceState,
+      ...(active.workspaceState ? { state: active.workspaceState } : {}),
     };
+  }
+
+  function workspaceSource(
+    active: Extract<ExecutionTarget, { kind: "sandbox" }>,
+  ): Record<string, unknown> | undefined {
+    return active.workspaceState ? executionSource(active) : undefined;
   }
 
   async function cleanupTarget(
@@ -1119,11 +1138,10 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     ctx: UIContext,
     signal?: AbortSignal,
   ): Promise<void> {
+    const source = workspaceSource(active);
+    if (!source) return;
     try {
-      await runBackend(
-        { action: "cleanup_workspace", source: sandboxSource(active) },
-        signal,
-      );
+      await runBackend({ action: "cleanup_workspace", source }, signal);
     } catch (error) {
       ctx.ui.notify(
         `workspace cleanup failed on ${active.name}: ${error instanceof Error ? error.message : String(error)}`,
@@ -1137,10 +1155,12 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     signal?: AbortSignal,
     onStatus?: (status: BackendResult) => void,
   ): Promise<void> {
+    const source = workspaceSource(active);
+    if (!source) return;
     await runBackend(
       {
         action: "sync_workspace_to_local",
-        source: sandboxSource(active),
+        source,
         local_cwd: active.localCwd,
       },
       signal,
@@ -1155,11 +1175,23 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       pi.events.emit("cua:workspace-diff-changed", { kind: "local" });
       return;
     }
+    const source = workspaceSource(active);
+    if (!source) {
+      pi.events.emit("cua:workspace-diff-changed", {
+        kind: "sandbox",
+        name: active.name,
+        additions: 0,
+        deletions: 0,
+        pendingSync: false,
+        syncSafe: true,
+      });
+      return;
+    }
     try {
       const result = await runBackend(
         {
           action: "workspace_diff_status",
-          source: sandboxSource(active),
+          source,
           local_cwd: active.localCwd,
         },
         new AbortController().signal,
@@ -1349,7 +1381,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         if (!destination) return;
         if (destination.kind === "local") {
           const source = target.kind === "sandbox" ? target : undefined;
-          if (source) {
+          if (source?.workspaceState) {
             pi.events.emit("cua:execution-target-changed", {
               ...source,
               state: "connecting",
@@ -1451,9 +1483,12 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     if (placementError) throw placementError;
     if (target.kind !== "sandbox" || !bridge) return;
     const localCwd = `Current working directory: ${target.localCwd}`;
-    const environment = `Execution environment: ${target.os}. All tools and user shell commands run in ${target.os}; use relative workspace paths and answer environment questions for ${target.os}.`;
+    const logicalCwd = target.workspaceState
+      ? "workspace root"
+      : "sandbox home";
+    const environment = `Execution environment: ${target.os}. All tools and user shell commands run in ${target.os}; use paths relative to the current directory and answer environment questions for ${target.os}.`;
     return {
-      systemPrompt: `${event.systemPrompt.replace(localCwd, "Current working directory: workspace root")}\n\n${environment}`,
+      systemPrompt: `${event.systemPrompt.replace(localCwd, `Current working directory: ${logicalCwd}`)}\n\n${environment}`,
     };
   });
 
