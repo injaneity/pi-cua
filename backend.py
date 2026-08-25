@@ -2254,6 +2254,10 @@ if ($cwd.Equals($root, [StringComparison]::OrdinalIgnoreCase)) {{ Write-Output '
     return lines[-2], lines[-1]
 
 
+def execution_digest(execution_key: str) -> str:
+    return hashlib.sha256(execution_key.encode()).hexdigest()
+
+
 def prepare_execution_directory(name: str, profile: str, execution_id: str) -> str:
     root = (
         f"/home/cua/.cua-pi/executions/{execution_id}"
@@ -2445,7 +2449,8 @@ def sync_workspace_to_local(
 
 def refresh_execution(
     name: str,
-    source: SandboxWorkspaceSource,
+    source: SandboxExecutionSource,
+    execution_key: str,
     tool_packages: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     states = {item["name"]: item for item in managed_sandboxes()}
@@ -2468,14 +2473,22 @@ def refresh_execution(
             guest_config_archive(config_files),
             guest_digest,
         )
-    return {
+    result: dict[str, Any] = {
         "name": name,
         "os": profile,
         "address": preflight.address,
-        "remote_cwd": source["remoteCwd"],
-        "workspace_state": source["state"],
+        "remote_cwd": (
+            source["remoteCwd"]
+            if "state" in source
+            else prepare_execution_directory(
+                preflight.address, profile, execution_digest(execution_key)[:16]
+            )
+        ),
         "runtime_digest": guest_digest,
     }
+    if "state" in source:
+        result["workspace_state"] = source["state"]
+    return result
 
 
 async def prepare_execution(
@@ -2502,8 +2515,8 @@ async def prepare_execution(
         if resume and not workspace_resume
         else discover_workspace(Path(source_cwd).expanduser().resolve())
     )
-    execution_digest = hashlib.sha256(execution_key.encode()).hexdigest()
-    execution_id = execution_digest[:16]
+    identity_digest = execution_digest(execution_key)
+    execution_id = identity_digest[:16]
     config_files = guest_config_files(tool_packages)
     guest_digest = config_digest(config_files)
     candidate = states[name].get("address") or name
@@ -2579,7 +2592,7 @@ async def prepare_execution(
             remote_url=repository.remote_url,
             commit=transfer.state["commit"],
         )
-    reference = execution_digest[:32]
+    reference = identity_digest[:32]
     workspace_id = execution_id
     workspace_root = (
         f"/home/cua/workspaces/{workspace_id}"
@@ -2653,16 +2666,18 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         return await ensure_one(str(request.get("name") or ""))
     if action == "delete":
         return await delete_one(str(request.get("name") or ""))
+    if action in {"prepare_execution", "refresh_execution"}:
+        execution_key = request.get("execution_id")
+        if not isinstance(execution_key, str) or not execution_key:
+            raise ValueError(f"{action} requires execution_id")
     if action == "refresh_execution":
         return refresh_execution(
             str(request.get("name") or ""),
-            require_sandbox_source(request.get("source")),
+            require_execution_source(request.get("source")),
+            execution_key,
             require_tool_packages(request.get("tool_packages", [])),
         )
     if action == "prepare_execution":
-        execution_key = request.get("execution_id")
-        if not isinstance(execution_key, str) or not execution_key:
-            raise ValueError("prepare_execution requires execution_id")
         source_value = request.get("source")
         source = (
             require_sandbox_source(source_value) if source_value is not None else None
