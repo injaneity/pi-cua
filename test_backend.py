@@ -701,7 +701,7 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
             patch.object(backend, "sandbox_workspace_exists") as workspace_check,
             patch.object(backend, "sync_guest_config") as sync_config,
         ):
-            result = backend.refresh_execution("linux-1", self.source)
+            result = backend.refresh_execution("linux-1", self.source, "session-1")
 
         self.assertEqual(result["address"], "100.64.0.2")
         self.assertEqual(result["remote_cwd"], self.source["remoteCwd"])
@@ -709,6 +709,34 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         full_preflight.assert_not_called()
         workspace_check.assert_not_called()
         sync_config.assert_not_called()
+
+    def test_non_git_reload_keeps_its_execution_identity(self) -> None:
+        source = backend.SandboxExecutionSource(
+            address="100.64.0.1",
+            os="linux",
+            remoteCwd="/legacy/shared/home",
+        )
+        preflight = backend.GuestRuntimePreflight("100.64.0.2", True)
+        with (
+            patch.object(
+                backend,
+                "managed_sandboxes",
+                return_value=[{"name": "linux-1", "os": "linux"}],
+            ),
+            patch.object(backend, "guest_runtime_preflight", return_value=preflight),
+            patch.object(
+                backend,
+                "run_guest_ssh",
+                return_value=subprocess.CompletedProcess([], 0, "", ""),
+            ),
+        ):
+            result = backend.refresh_execution("linux-1", source, "execution-1")
+
+        execution_id = backend.execution_digest("execution-1")[:16]
+        self.assertEqual(
+            result["remote_cwd"], f"/home/cua/.cua-pi/executions/{execution_id}"
+        )
+        self.assertNotIn("workspace_state", result)
 
     def test_reload_refresh_syncs_only_a_changed_guest_bundle(self) -> None:
         preflight = backend.GuestRuntimePreflight("100.64.0.2", False)
@@ -724,7 +752,7 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
             patch.object(backend, "guest_config_archive", return_value=b"bundle"),
             patch.object(backend, "sync_guest_config") as sync_config,
         ):
-            backend.refresh_execution("linux-1", self.source)
+            backend.refresh_execution("linux-1", self.source, "session-1")
 
         sync_config.assert_called_once_with("100.64.0.2", "linux", b"bundle", "c" * 20)
 

@@ -155,6 +155,7 @@ type ExecutionTarget =
       name: string;
       os: SandboxOS;
       address: string;
+      executionId?: string;
       localCwd: string;
       remoteCwd: string;
       workspaceState?: WorkspaceState;
@@ -605,6 +606,10 @@ function parseTarget(value: unknown): ExecutionTarget | undefined {
     name: data.name,
     os: data.os,
     address: data.address,
+    executionId:
+      typeof data.executionId === "string" && data.executionId
+        ? data.executionId
+        : undefined,
     localCwd: data.localCwd,
     remoteCwd: data.remoteCwd,
     workspaceState,
@@ -1019,14 +1024,14 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     destination: Extract<Destination, { kind: "sandbox" }>,
     ctx: UIContext,
     options: {
-      inheritWorkspace?: boolean;
+      inheritExecution?: boolean;
       resume?: Extract<ExecutionTarget, { kind: "sandbox" }>;
       refresh?: Extract<ExecutionTarget, { kind: "sandbox" }>;
     } = {},
   ): Promise<Extract<ExecutionTarget, { kind: "sandbox" }>> {
-    const { inheritWorkspace = true, resume, refresh } = options;
+    const { inheritExecution = true, resume, refresh } = options;
     if (
-      inheritWorkspace &&
+      inheritExecution &&
       bridge &&
       target.kind === "sandbox" &&
       target.name === destination.name
@@ -1034,6 +1039,13 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       return target;
     }
     captureToolProviders();
+    const executionId =
+      refresh?.executionId ??
+      resume?.executionId ??
+      (inheritExecution && target.kind === "sandbox"
+        ? target.executionId
+        : undefined) ??
+      ctx.sessionManager.getSessionId();
     ctx.ui.setStatus("cua-session", formatSandboxProgress(destination.name));
     pi.events.emit("cua:execution-target-changed", {
       ...destination,
@@ -1043,11 +1055,11 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       action: refresh ? "refresh_execution" : "prepare_execution",
       name: destination.name,
       source_cwd: resume?.localCwd ?? ctx.cwd,
-      execution_id: ctx.sessionManager.getSessionId(),
+      execution_id: executionId,
       tool_packages: [...toolPackages],
       source: refresh
         ? executionSource(refresh)
-        : !resume && inheritWorkspace && target.kind === "sandbox"
+        : !resume && inheritExecution && target.kind === "sandbox"
           ? workspaceSource(target)
           : undefined,
       resume: resume ? executionSource(resume) : undefined,
@@ -1092,6 +1104,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       return {
         ...destination,
         address: result.address,
+        executionId,
         localCwd: refresh?.localCwd ?? resume?.localCwd ?? ctx.cwd,
         remoteCwd: result.remote_cwd,
         workspaceState: parseWorkspaceState(result.workspace_state),
@@ -1112,7 +1125,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     return prepareTarget(
       { kind: "sandbox", name: saved.name, os: saved.os },
       ctx,
-      { inheritWorkspace: false, resume: saved },
+      { inheritExecution: false, resume: saved },
     );
   }
 
@@ -1431,11 +1444,11 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         const resumed =
           event.reason === "reload" &&
           current.kind === "sandbox" &&
-          current.workspaceState
+          current.executionId
             ? await prepareTarget(
                 { kind: "sandbox", name: current.name, os: current.os },
                 ctx,
-                { inheritWorkspace: false, refresh: current },
+                { inheritExecution: false, refresh: current },
               )
             : await resumeTarget(current, ctx);
         intendedTarget = resumed;
@@ -1447,9 +1460,13 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         ? loadHandoffTarget(event.previousSessionFile)
         : undefined;
       if (inherited) {
-        intendedTarget = inherited;
-        saveTarget(inherited);
-        await activate(inherited, ctx, { persist: false });
+        const prepared =
+          inherited.kind === "sandbox" && !inherited.executionId
+            ? await resumeTarget(inherited, ctx)
+            : inherited;
+        intendedTarget = prepared;
+        saveTarget(prepared);
+        await activate(prepared, ctx, { persist: false });
         return;
       }
       await activate({ kind: "local" }, ctx);
