@@ -1,7 +1,9 @@
 import {
   type AgentToolResult,
   type BashOperations,
+  createReadTool,
   type ExtensionAPI,
+  type ReadToolInput,
   type ExtensionCommandContext,
   type ExtensionContext,
   type ToolDefinition,
@@ -15,6 +17,7 @@ import {
   visibleWidth,
 } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
+import { shouldUseControllerTool } from "./session-targets.mjs";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { homedir } from "node:os";
@@ -1072,7 +1075,15 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         throw new Error(`remote tool metadata missing: ${info.name}`);
       pi.registerTool({
         ...remote,
-        async execute(id, input, signal, onUpdate) {
+        async execute(id, input, signal, onUpdate, toolCtx) {
+          if (shouldUseControllerTool(info.name, input)) {
+            return createReadTool(toolCtx.cwd).execute(
+              id,
+              input as ReadToolInput,
+              signal,
+              onUpdate,
+            );
+          }
           if (target.kind !== "sandbox" || !bridge) {
             throw new Error(`${info.name} has no active sandbox`);
           }
