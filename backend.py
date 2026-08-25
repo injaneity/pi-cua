@@ -32,7 +32,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, TypedDict, cast
+from typing import Any, NotRequired, TypedDict, cast
 from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
@@ -1347,6 +1347,13 @@ class WorkspaceState(TypedDict):
     baselineTree: str
 
 
+class SandboxExecutionSource(TypedDict):
+    address: str
+    os: str
+    remoteCwd: str
+    state: NotRequired[WorkspaceState]
+
+
 class SandboxWorkspaceSource(TypedDict):
     address: str
     os: str
@@ -1379,7 +1386,7 @@ def require_workspace_state(value: object, field: str) -> WorkspaceState:
     return cast(WorkspaceState, value)
 
 
-def require_sandbox_source(value: object) -> SandboxWorkspaceSource:
+def require_execution_source(value: object) -> SandboxExecutionSource:
     if not isinstance(value, dict):
         raise TypeError("source must be an object")
     address = value.get("address")
@@ -1393,12 +1400,21 @@ def require_sandbox_source(value: object) -> SandboxWorkspaceSource:
         or not remote_cwd
     ):
         raise TypeError("source has invalid sandbox fields")
-    return SandboxWorkspaceSource(
+    source = SandboxExecutionSource(
         address=address,
         os=cast(str, profile),
         remoteCwd=remote_cwd,
-        state=require_workspace_state(value.get("state"), "source.state"),
     )
+    if value.get("state") is not None:
+        source["state"] = require_workspace_state(value["state"], "source.state")
+    return source
+
+
+def require_sandbox_source(value: object) -> SandboxWorkspaceSource:
+    source = require_execution_source(value)
+    if "state" not in source:
+        raise TypeError("source has no Git workspace state")
+    return cast(SandboxWorkspaceSource, source)
 
 
 def require_tool_packages(value: object) -> tuple[str, ...]:
@@ -1691,6 +1707,15 @@ def inspect_workspace(source_cwd: Path) -> WorkspaceRepository:
         remote_url=remote_url,
         commit=commit,
     )
+
+
+def discover_workspace(source_cwd: Path) -> WorkspaceRepository | None:
+    try:
+        return inspect_workspace(source_cwd)
+    except subprocess.CalledProcessError as error:
+        if "not a git repository" in (error.stderr or "").lower():
+            return None
+        raise
 
 
 def powershell_literal(value: str) -> str:
@@ -2405,7 +2430,7 @@ def sync_workspace_to_local(
 
 def refresh_execution(
     name: str,
-    source: SandboxWorkspaceSource,
+    source: SandboxExecutionSource,
     tool_packages: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     states = {item["name"]: item for item in managed_sandboxes()}
@@ -2428,14 +2453,16 @@ def refresh_execution(
             guest_config_archive(config_files),
             guest_digest,
         )
-    return {
+    result: dict[str, Any] = {
         "name": name,
         "os": profile,
         "address": preflight.address,
         "remote_cwd": source["remoteCwd"],
-        "workspace_state": source["state"],
         "runtime_digest": guest_digest,
     }
+    if "state" in source:
+        result["workspace_state"] = source["state"]
+    return result
 
 
 async def prepare_execution(
@@ -2454,10 +2481,32 @@ async def prepare_execution(
         raise ValueError("prepare_execution cannot transfer and resume simultaneously")
     if resume and resume["os"] != profile:
         raise ValueError("saved sandbox profile does not match its controller record")
-    repository = inspect_workspace(Path(source_cwd).expanduser().resolve())
+    repository = discover_workspace(Path(source_cwd).expanduser().resolve())
     config_files = guest_config_files(tool_packages)
     guest_digest = config_digest(config_files)
     candidate = states[name].get("address") or name
+    if repository is None:
+        if source or resume:
+            raise RuntimeError("saved Git workspace is no longer available locally")
+        progress("sandbox.runtime", "checking guest runtime configuration")
+        runtime = guest_runtime_preflight(candidate, profile, guest_digest)
+        if runtime is None:
+            raise SandboxRepairRequired(f"sandbox repair required: {name}")
+        if not runtime.config_matches:
+            sync_guest_config(
+                runtime.address,
+                profile,
+                guest_config_archive(config_files),
+                guest_digest,
+            )
+        return {
+            "name": name,
+            "os": profile,
+            "address": runtime.address,
+            "remote_cwd": "/home/cua" if profile == "linux" else r"C:\Users\cua",
+            "runtime_digest": guest_digest,
+        }
+
     progress("sandbox.preflight", "checking health, configuration, disk, and cache")
     preflight = guest_preflight(
         candidate,
@@ -2582,7 +2631,7 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
     if action == "refresh_execution":
         return refresh_execution(
             str(request.get("name") or ""),
-            require_sandbox_source(request.get("source")),
+            require_execution_source(request.get("source")),
             require_tool_packages(request.get("tool_packages", [])),
         )
     if action == "prepare_execution":

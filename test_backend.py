@@ -506,6 +506,10 @@ class WorkspaceTests(unittest.TestCase):
                 self.assertEqual(modified.read(), b"original\n")
                 self.assertNotIn("untracked.txt", archive.getnames())
 
+    def test_non_git_directory_has_no_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertIsNone(backend.discover_workspace(Path(directory)))
+
     def test_workspace_with_content_filter_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = self.repository(directory)
@@ -706,6 +710,26 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         workspace_check.assert_not_called()
         sync_config.assert_not_called()
 
+    def test_reload_without_workspace_refreshes_only_runtime(self) -> None:
+        source = backend.SandboxExecutionSource(
+            address="100.64.0.2",
+            os="linux",
+            remoteCwd="/home/cua",
+        )
+        preflight = backend.GuestRuntimePreflight("100.64.0.2", True)
+        with (
+            patch.object(
+                backend,
+                "managed_sandboxes",
+                return_value=[{"name": "linux-1", "os": "linux"}],
+            ),
+            patch.object(backend, "guest_runtime_preflight", return_value=preflight),
+        ):
+            result = backend.refresh_execution("linux-1", source)
+
+        self.assertEqual(result["remote_cwd"], "/home/cua")
+        self.assertNotIn("workspace_state", result)
+
     def test_reload_refresh_syncs_only_a_changed_guest_bundle(self) -> None:
         preflight = backend.GuestRuntimePreflight("100.64.0.2", False)
         with (
@@ -838,6 +862,35 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("--shared --no-checkout $cache $root", script)
         self.assertNotIn("--dissociate", script)
         self.assertNotIn("git -C $cache cat-file -e", script.split("$root =", 1)[1])
+
+    async def test_prepare_execution_without_git_uses_guest_home(self) -> None:
+        for profile, remote_cwd in (
+            ("linux", "/home/cua"),
+            ("windows", r"C:\Users\cua"),
+        ):
+            with self.subTest(profile=profile):
+                preflight = backend.GuestRuntimePreflight("100.64.0.2", True)
+                with (
+                    patch.object(
+                        backend,
+                        "managed_sandboxes",
+                        return_value=[{"name": f"{profile}-1", "os": profile}],
+                    ),
+                    patch.object(backend, "inspect_workspace", return_value=None),
+                    patch.object(
+                        backend, "guest_runtime_preflight", return_value=preflight
+                    ),
+                    patch.object(backend, "guest_preflight") as full_preflight,
+                    patch.object(backend, "prepare_workspace") as prepare,
+                ):
+                    result = await backend.prepare_execution(
+                        f"{profile}-1", "/not-a-repository", "session-1"
+                    )
+
+                self.assertEqual(result["remote_cwd"], remote_cwd)
+                self.assertNotIn("workspace_state", result)
+                full_preflight.assert_not_called()
+                prepare.assert_not_called()
 
     async def test_prepare_execution_connects_capture_prepare_and_restore(self) -> None:
         transfer = backend.WorkspaceTransfer(self.state, b"final", "2" * 40)
