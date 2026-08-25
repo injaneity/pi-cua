@@ -2254,6 +2254,21 @@ if ($cwd.Equals($root, [StringComparison]::OrdinalIgnoreCase)) {{ Write-Output '
     return lines[-2], lines[-1]
 
 
+def prepare_execution_directory(name: str, profile: str, execution_id: str) -> str:
+    root = (
+        f"/home/cua/.cua-pi/executions/{execution_id}"
+        if profile == "linux"
+        else rf"C:\Users\cua\.cua-pi\executions\{execution_id}"
+    )
+    command = (
+        f"mkdir -p -- {shlex.quote(root)}"
+        if profile == "linux"
+        else f"New-Item -ItemType Directory -Force {powershell_literal(root)} | Out-Null"
+    )
+    run_guest_ssh(name, profile, command, timeout=60)
+    return root
+
+
 def cleanup_workspace_root(name: str, profile: str, root: str) -> None:
     if profile == "linux":
         if not re.fullmatch(r"/home/cua/workspaces/[0-9a-f]{16}", root):
@@ -2430,7 +2445,7 @@ def sync_workspace_to_local(
 
 def refresh_execution(
     name: str,
-    source: SandboxExecutionSource,
+    source: SandboxWorkspaceSource,
     tool_packages: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     states = {item["name"]: item for item in managed_sandboxes()}
@@ -2453,24 +2468,22 @@ def refresh_execution(
             guest_config_archive(config_files),
             guest_digest,
         )
-    result: dict[str, Any] = {
+    return {
         "name": name,
         "os": profile,
         "address": preflight.address,
         "remote_cwd": source["remoteCwd"],
+        "workspace_state": source["state"],
         "runtime_digest": guest_digest,
     }
-    if "state" in source:
-        result["workspace_state"] = source["state"]
-    return result
 
 
 async def prepare_execution(
     name: str,
     source_cwd: str,
-    workspace_key: str,
+    execution_key: str,
     source: SandboxWorkspaceSource | None = None,
-    resume: SandboxWorkspaceSource | None = None,
+    resume: SandboxExecutionSource | None = None,
     tool_packages: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     states = {item["name"]: item for item in managed_sandboxes()}
@@ -2481,12 +2494,21 @@ async def prepare_execution(
         raise ValueError("prepare_execution cannot transfer and resume simultaneously")
     if resume and resume["os"] != profile:
         raise ValueError("saved sandbox profile does not match its controller record")
-    repository = discover_workspace(Path(source_cwd).expanduser().resolve())
+    workspace_resume = (
+        cast(SandboxWorkspaceSource, resume) if resume and "state" in resume else None
+    )
+    repository = (
+        None
+        if resume and not workspace_resume
+        else discover_workspace(Path(source_cwd).expanduser().resolve())
+    )
+    execution_digest = hashlib.sha256(execution_key.encode()).hexdigest()
+    execution_id = execution_digest[:16]
     config_files = guest_config_files(tool_packages)
     guest_digest = config_digest(config_files)
     candidate = states[name].get("address") or name
     if repository is None:
-        if source or resume:
+        if source or workspace_resume:
             raise RuntimeError("saved Git workspace is no longer available locally")
         progress("sandbox.runtime", "checking guest runtime configuration")
         runtime = guest_runtime_preflight(candidate, profile, guest_digest)
@@ -2503,7 +2525,9 @@ async def prepare_execution(
             "name": name,
             "os": profile,
             "address": runtime.address,
-            "remote_cwd": "/home/cua" if profile == "linux" else r"C:\Users\cua",
+            "remote_cwd": prepare_execution_directory(
+                runtime.address, profile, execution_id
+            ),
             "runtime_digest": guest_digest,
         }
 
@@ -2531,13 +2555,15 @@ async def prepare_execution(
             guest_config_archive(config_files),
             guest_digest,
         )
-    if resume and sandbox_workspace_exists(address, profile, resume["remoteCwd"]):
+    if workspace_resume and sandbox_workspace_exists(
+        address, profile, workspace_resume["remoteCwd"]
+    ):
         return {
             "name": name,
             "os": profile,
             "address": address,
-            "remote_cwd": resume["remoteCwd"],
-            "workspace_state": resume["state"],
+            "remote_cwd": workspace_resume["remoteCwd"],
+            "workspace_state": workspace_resume["state"],
             "runtime_digest": guest_digest,
         }
 
@@ -2553,9 +2579,8 @@ async def prepare_execution(
             remote_url=repository.remote_url,
             commit=transfer.state["commit"],
         )
-    workspace_digest = hashlib.sha256(workspace_key.encode()).hexdigest()
-    reference = workspace_digest[:32]
-    workspace_id = workspace_digest[:16]
+    reference = execution_digest[:32]
+    workspace_id = execution_id
     workspace_root = (
         f"/home/cua/workspaces/{workspace_id}"
         if profile == "linux"
@@ -2631,13 +2656,13 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
     if action == "refresh_execution":
         return refresh_execution(
             str(request.get("name") or ""),
-            require_execution_source(request.get("source")),
+            require_sandbox_source(request.get("source")),
             require_tool_packages(request.get("tool_packages", [])),
         )
     if action == "prepare_execution":
-        workspace_key = request.get("workspace_id")
-        if not isinstance(workspace_key, str) or not workspace_key:
-            raise ValueError("prepare_execution requires workspace_id")
+        execution_key = request.get("execution_id")
+        if not isinstance(execution_key, str) or not execution_key:
+            raise ValueError("prepare_execution requires execution_id")
         source_value = request.get("source")
         source = (
             require_sandbox_source(source_value) if source_value is not None else None
@@ -2645,12 +2670,12 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         tool_packages = require_tool_packages(request.get("tool_packages", []))
         resume_value = request.get("resume")
         resume = (
-            require_sandbox_source(resume_value) if resume_value is not None else None
+            require_execution_source(resume_value) if resume_value is not None else None
         )
         return await prepare_execution(
             str(request.get("name") or ""),
             str(request.get("source_cwd") or ""),
-            workspace_key,
+            execution_key,
             source,
             resume,
             tool_packages,
