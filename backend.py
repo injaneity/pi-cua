@@ -2168,11 +2168,10 @@ mkdir -p /home/cua/workspaces /home/cua/.cache/cua-pi/git
         copy_guest_file(
             name, profile, git_snapshot(source.root, source.commit), snapshot_path
         )
-    remote_setup = f"""if (-not (Test-Path $cache)) {{ git clone --mirror {powershell_literal(source.remote_url)} $cache }} else {{ git -C $cache cat-file -e '{source.commit}^{{commit}}' 2>$null; if ($LASTEXITCODE -ne 0) {{ git -C $cache fetch origin {source.commit} }} }}
-if (-not (Test-Path "$root\\.git")) {{ git clone --reference-if-able $cache --dissociate --no-checkout {powershell_literal(source.remote_url)} $root }}
-git -C $root cat-file -e '{source.commit}^{{commit}}' 2>$null
-if ($LASTEXITCODE -ne 0) {{ git -C $root fetch --depth=1 origin {source.commit} }}
-git -C $root checkout --detach --force {source.commit}
+    remote_setup = f"""if (-not (Test-Path $cache)) {{ git clone --quiet --mirror {powershell_literal(source.remote_url)} $cache }} elseif (-not (Test-GitCommit $cache '{source.commit}')) {{ git -C $cache fetch --quiet origin {source.commit} }}
+if (-not (Test-Path "$root\\.git")) {{ git clone --quiet --reference-if-able $cache --dissociate --no-checkout {powershell_literal(source.remote_url)} $root }}
+if (-not (Test-GitCommit $root '{source.commit}')) {{ git -C $root fetch --quiet --depth=1 origin {source.commit} }}
+git -C $root checkout --quiet --detach --force {source.commit}
 git -C $root clean -ffd"""
     snapshot_setup = f"""New-Item -ItemType Directory -Force -Path $root | Out-Null
 if (Test-Path "$root\\.git") {{
@@ -2190,6 +2189,16 @@ git -C $root remote get-url origin 2>$null | Out-Null
 if ($LASTEXITCODE -eq 0) {{ git -C $root remote set-url origin {powershell_literal(source.remote_url)} }} else {{ git -C $root remote add origin {powershell_literal(source.remote_url)} }}
 Remove-Item -Force {powershell_literal(snapshot_path)}"""
     script = f"""$ErrorActionPreference = 'Stop'
+function Test-GitCommit([string]$Repository, [string]$Commit) {{
+  $previousErrorActionPreference = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {{
+    git -C $Repository cat-file -e "${{Commit}}^{{commit}}" 2>$null
+    return $LASTEXITCODE -eq 0
+  }} finally {{
+    $ErrorActionPreference = $previousErrorActionPreference
+  }}
+}}
 $root = {powershell_literal(workspace_root)}
 $cache = {powershell_literal(repository_cache)}
 New-Item -ItemType Directory -Force -Path 'C:\\cua\\workspaces','C:\\cua\\cache\\git' | Out-Null
