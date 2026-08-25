@@ -21,10 +21,9 @@ windows provisioning also requires `~/.ssh/cua_windows_ed25519` and its `.pub` f
 
 ## behavior
 
-- `/sandbox` changes the current session's execution target. `/sandbox linux 16 65536` creates a sandbox with 16 CPUs and 65536 MiB of memory; omitting both values uses the existing OS defaults.
-- `/new` asks for a target before the new thread starts.
-- `/fork` inherits the parent thread's target but starts a new sandbox workspace from the current local checkout.
-- `/tree` changes conversation history but not execution placement.
+- `/sandbox` opens a compact action search. while a sandbox is active, `stay on <current target>` appears first in neutral bold and gains the selection accent only when highlighted, followed by the action to sync back to local. while local, the no-op `stay on local` row is omitted. every session can connect to another online sandbox or create a sandbox. connect and create open focused nested searches where Escape returns to the action search, and create entries use the prompt-template heading accent when selected. `/sandbox linux 16 65536` creates a sandbox with 16 CPUs and 65536 MiB of memory; omitting both values uses the existing OS defaults.
+- `/new` and `/fork` start local; use `/sandbox` to opt into sandbox execution for the new thread.
+- `/tree` changes conversation history but never changes execution placement.
 - `/resume` restores placement from durable session metadata, with the controller database as a compatibility fallback for older sessions.
 - the footer shows the selected sandbox. no remote tui or conversation session is created.
 
