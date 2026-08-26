@@ -2102,6 +2102,7 @@ if [ -f /home/cua/.cua-pi/config-files ]; then
 fi
 tar -xzf {shlex.quote(archive_path)} -C /home/cua
 mv /home/cua/.cua-pi/config-files.new /home/cua/.cua-pi/config-files
+pi update --extensions --no-approve
 printf '%s\n' {shlex.quote(digest)} > {shlex.quote(version_path)}
 rm -f {shlex.quote(archive_path)}
 """
@@ -2123,10 +2124,12 @@ if (Test-Path $manifest) {{
 }}
 tar.exe -xzf {powershell_literal(archive_path)} -C $cuaHome
 Move-Item -Force (Join-Path $state 'config-files.new') $manifest
+& 'C:\ProgramData\npm\pi.cmd' update --extensions --no-approve
+if ($LASTEXITCODE -ne 0) {{ throw "Pi package synchronization failed with exit $LASTEXITCODE" }}
 Set-Content -NoNewline -Path {powershell_literal(version_path)} -Value {powershell_literal(digest)}
 Remove-Item -Force {powershell_literal(archive_path)}
 """
-    run_guest_ssh(name, profile, command, timeout=120)
+    run_guest_ssh(name, profile, command, timeout=600)
 
 
 def git_snapshot(root: Path, commit: str) -> bytes:

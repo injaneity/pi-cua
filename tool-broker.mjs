@@ -16,9 +16,11 @@ const port = Number(process.env.CUA_PI_TOOL_BROKER_PORT || "43121");
 const hostFactories = new Map();
 const hosts = new Map();
 
-function diagnostic(socket, text) {
+function openError(socket, owner, code, error) {
   if (!socket.destroyed) {
-    socket.write(`${JSON.stringify({ type: "diagnostic", data: text })}\n`);
+    socket.write(
+      `${JSON.stringify({ type: "open_error", owner, code, error })}\n`,
+    );
   }
 }
 
@@ -59,7 +61,12 @@ async function attach(socket, request, remainder) {
     typeof request.cwd !== "string" ||
     typeof request.manifest !== "string"
   ) {
-    diagnostic(socket, "invalid desktop broker handshake");
+    openError(
+      socket,
+      "broker",
+      "invalid_handshake",
+      "invalid desktop broker handshake",
+    );
     socket.end();
     return;
   }
@@ -69,34 +76,26 @@ async function attach(socket, request, remainder) {
   socket.once("close", () => {
     disconnected = true;
   });
+  const entry = hostEntry(request.cwd, request.manifest);
   try {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const entry = hostEntry(request.cwd, request.manifest);
-      try {
-        const host = await entry.host;
-        if (disconnected) return;
-        const result = await host.attach({
-          input: socket,
-          output: socket,
-          initialInput: remainder,
-        });
-        if (result.disposeRequested && hosts.get(request.cwd) === entry) {
-          hosts.delete(request.cwd);
-          await host.dispose();
-        }
-        return;
-      } catch (error) {
-        if (error?.code === "ERR_CUA_MISSING_TOOLS" && attempt === 0) {
-          if (hosts.get(request.cwd) === entry) hosts.delete(request.cwd);
-          continue;
-        }
-        diagnostic(
-          socket,
-          error instanceof Error ? error.message : String(error),
-        );
-        return;
-      }
+    const host = await entry.host;
+    if (disconnected) return;
+    const result = await host.attach({
+      input: socket,
+      output: socket,
+      initialInput: remainder,
+    });
+    if (result.disposeRequested && hosts.get(request.cwd) === entry) {
+      hosts.delete(request.cwd);
+      await host.dispose();
     }
+  } catch (error) {
+    openError(
+      socket,
+      "runtime",
+      error?.code ?? "host_start_failed",
+      error instanceof Error ? error.message : String(error),
+    );
   } finally {
     socket.end();
   }
@@ -131,8 +130,10 @@ const server = createServer((socket) => {
       }
       void attach(socket, request, remainder);
     } catch (error) {
-      diagnostic(
+      openError(
         socket,
+        "broker",
+        "invalid_handshake",
         error instanceof Error ? error.message : String(error),
       );
       socket.end();

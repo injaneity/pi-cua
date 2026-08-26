@@ -219,6 +219,8 @@ type HostMessage = {
   aborted?: boolean;
   tools?: RemoteToolInfo[];
   protocol?: number;
+  owner?: "broker" | "runtime";
+  code?: string;
 };
 
 function shellQuote(value: string): string {
@@ -265,24 +267,14 @@ function hostCommand(
   return `cd ${shellQuote(target.remoteCwd)} && exec node /home/cua/.pi/agent/cua-tool-host.mjs ${shellQuote(target.remoteCwd)} ${shellQuote(manifest)}`;
 }
 
-function hostStartupError(
+function brokerStartupError(
   target: Extract<ExecutionTarget, { kind: "sandbox" }>,
-  error: unknown,
+  message: string,
 ): Error {
-  const current = error instanceof Error ? error : new Error(String(error));
-  const exitedWithoutDetail =
-    current.message.startsWith(`remote tool host on ${target.name} exited`) &&
-    !current.message.includes(": ");
-  if (
-    target.os !== "windows" ||
-    current.message.includes(windowsBrokerTask) ||
-    (!current.message.startsWith("remote tool host did not start") &&
-      !exitedWithoutDetail)
-  )
-    return current;
+  if (target.os !== "windows") return new Error(message);
   const request = JSON.stringify({ action: "ensure", name: target.name });
   return new Error(
-    `${current.message}; Windows broker task ${windowsBrokerTask} is unavailable or stale: run cua_sandbox with ${request}, then run /reload`,
+    `${message}; Windows broker task ${windowsBrokerTask} is unavailable or stale: run cua_sandbox with ${request}, then run /reload`,
   );
 }
 
@@ -372,9 +364,9 @@ class ToolBridge {
       const timeout = setTimeout(() => {
         child.kill();
         reject(
-          hostStartupError(
+          brokerStartupError(
             this.target,
-            new Error(`remote tool host did not start on ${this.target.name}`),
+            `remote tool host did not start on ${this.target.name}`,
           ),
         );
       }, 300_000);
@@ -402,26 +394,22 @@ class ToolBridge {
           }
           try {
             const message = JSON.parse(line) as HostMessage;
-            if (message.type === "diagnostic") {
-              this.stderr =
-                `${this.stderr}\n${message.data ?? "remote tool host failed"}`
-                  .trim()
-                  .slice(-8_000);
-              continue;
+            if (message.type === "open_error") {
+              child.kill();
+              reject(
+                new Error(
+                  `remote ${message.owner ?? "runtime"} ${message.code ?? "open_failed"}: ${message.error ?? "tool host failed"}`,
+                ),
+              );
+              return;
             }
             if (message.type === "ready") {
               const tools = Array.isArray(message.tools) ? message.tools : [];
-              const names = new Set(tools.map((item) => item.name));
-              const missing = this.expectedTools.filter(
-                (name) => !names.has(name),
-              );
-              if (message.protocol !== protocolVersion || missing.length > 0) {
+              if (message.protocol !== protocolVersion) {
                 child.kill();
                 reject(
                   new Error(
-                    message.protocol !== protocolVersion
-                      ? `remote tool protocol mismatch: expected ${protocolVersion}, got ${message.protocol ?? "none"}`
-                      : `remote tool host is missing: ${missing.join(", ")}`,
+                    `remote tool protocol mismatch: expected ${protocolVersion}, got ${message.protocol ?? "none"}`,
                   ),
                 );
                 return;
@@ -453,12 +441,10 @@ class ToolBridge {
         this.ready = false;
         this.child = undefined;
         const detail = this.stderr.trim();
-        const error = hostStartupError(
-          this.target,
-          new Error(
-            `remote tool host on ${this.target.name} exited (${code ?? "signal"})${detail ? `: ${detail}` : ""}`,
-          ),
-        );
+        const message = `remote tool host on ${this.target.name} exited (${code ?? "signal"})${detail ? `: ${detail}` : ""}`;
+        const error = detail
+          ? new Error(message)
+          : brokerStartupError(this.target, message);
         reject(error);
         for (const request of this.pending.values()) request.reject(error);
         this.pending.clear();

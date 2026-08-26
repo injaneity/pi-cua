@@ -466,7 +466,29 @@ class WorkspaceTests(unittest.TestCase):
         script = run.call_args.args[2]
         self.assertIn("StartsWith('.pi/agent/')", script)
         self.assertIn("tar.exe -xzf", script)
-        self.assertIn("config-version", script)
+        self.assertIn("pi.cmd' update --extensions --no-approve", script)
+        self.assertLess(
+            script.index("update --extensions"), script.index("config-version")
+        )
+        self.assertEqual(run.call_args.kwargs["timeout"], 600)
+
+    def test_linux_guest_config_sync_installs_packages_before_commit(self) -> None:
+        with (
+            patch.object(backend, "copy_guest_file"),
+            patch.object(
+                backend,
+                "run_guest_ssh",
+                return_value=subprocess.CompletedProcess([], 0, "", ""),
+            ) as run,
+        ):
+            backend.sync_guest_config("linux-1", "linux", b"archive", "2" * 20)
+
+        script = run.call_args.args[2]
+        self.assertIn("pi update --extensions --no-approve", script)
+        self.assertLess(
+            script.index("update --extensions"), script.index("config-version")
+        )
+        self.assertEqual(run.call_args.kwargs["timeout"], 600)
 
     def test_guest_bundle_contains_only_requested_tool_packages(self) -> None:
         files = backend.guest_config_files(("git:github.com/example/tool-package",))

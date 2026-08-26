@@ -25,8 +25,7 @@ try {
       globalThis.cuaTestNextHost ||= 0;
       export async function createToolHost({ encodedManifest }) {
         const host = ++globalThis.cuaTestNextHost;
-        if (encodedManifest === "transient-missing" && !globalThis.cuaTestMissingFailed) {
-          globalThis.cuaTestMissingFailed = true;
+        if (encodedManifest === "missing-tools") {
           const error = new Error("remote tool host is missing: find_roots");
           error.code = "ERR_CUA_MISSING_TOOLS";
           throw error;
@@ -76,6 +75,20 @@ try {
     return JSON.parse(chunk.toString());
   }
 
+  async function connectError(manifest) {
+    const socket = createConnection({ host: "127.0.0.1", port });
+    await once(socket, "connect");
+    socket.write(
+      `${JSON.stringify({ type: "open", cwd: directory, manifest })}\n`,
+    );
+    const [chunk] = await once(socket, "data", {
+      signal: AbortSignal.timeout(5_000),
+    });
+    socket.end();
+    await once(socket, "close");
+    return JSON.parse(chunk.toString());
+  }
+
   async function connectOnce(message = "hello\n", manifest = "generation-1") {
     const socket = createConnection({ host: "127.0.0.1", port });
     await once(socket, "connect");
@@ -104,11 +117,9 @@ try {
   const second = await connectOnce();
   await writeFile(join(directory, "generation"), "2");
   const reconfigured = await connectOnce("hello\n", "generation-2");
-  const recovered = await connectOnce("hello\n", "transient-missing");
-  const retired = await connectOnce(
-    '{"type":"shutdown"}\n',
-    "transient-missing",
-  );
+  const failure = await connectError("missing-tools");
+  const recovered = await connectOnce("hello\n", "generation-2");
+  const retired = await connectOnce('{"type":"shutdown"}\n', "generation-2");
   const replacement = await connectOnce("hello\n", "generation-2");
   assert.equal(first.pid, broker.pid);
   assert.equal(second.pid, broker.pid);
@@ -118,6 +129,12 @@ try {
   assert.equal(second.moduleGeneration, 1);
   assert.equal(reconfigured.host, 2);
   assert.equal(reconfigured.moduleGeneration, 2);
+  assert.deepEqual(failure, {
+    type: "open_error",
+    owner: "runtime",
+    code: "ERR_CUA_MISSING_TOOLS",
+    error: "remote tool host is missing: find_roots",
+  });
   assert.equal(recovered.host, 4);
   assert.equal(retired.host, 4);
   assert.equal(replacement.host, 5);
