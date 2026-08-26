@@ -23,8 +23,14 @@ try {
       `import { readFile } from "node:fs/promises";
       const moduleGeneration = Number(await readFile(new URL("./generation", import.meta.url), "utf8"));
       globalThis.cuaTestNextHost ||= 0;
-      export async function createToolHost() {
+      export async function createToolHost({ encodedManifest }) {
         const host = ++globalThis.cuaTestNextHost;
+        if (encodedManifest === "transient-missing" && !globalThis.cuaTestMissingFailed) {
+          globalThis.cuaTestMissingFailed = true;
+          const error = new Error("remote tool host is missing: find_roots");
+          error.code = "ERR_CUA_MISSING_TOOLS";
+          throw error;
+        }
         return {
           async attach({ input, output, initialInput }) {
             output.write(JSON.stringify({ type: "ready", pid: process.pid, host, moduleGeneration }) + "\\n");
@@ -98,7 +104,11 @@ try {
   const second = await connectOnce();
   await writeFile(join(directory, "generation"), "2");
   const reconfigured = await connectOnce("hello\n", "generation-2");
-  const retired = await connectOnce('{"type":"shutdown"}\n', "generation-2");
+  const recovered = await connectOnce("hello\n", "transient-missing");
+  const retired = await connectOnce(
+    '{"type":"shutdown"}\n',
+    "transient-missing",
+  );
   const replacement = await connectOnce("hello\n", "generation-2");
   assert.equal(first.pid, broker.pid);
   assert.equal(second.pid, broker.pid);
@@ -108,8 +118,9 @@ try {
   assert.equal(second.moduleGeneration, 1);
   assert.equal(reconfigured.host, 2);
   assert.equal(reconfigured.moduleGeneration, 2);
-  assert.equal(retired.host, 2);
-  assert.equal(replacement.host, 3);
+  assert.equal(recovered.host, 4);
+  assert.equal(retired.host, 4);
+  assert.equal(replacement.host, 5);
   console.log("desktop tool broker test passed");
 } finally {
   if (broker?.exitCode === null) {

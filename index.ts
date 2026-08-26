@@ -270,7 +270,15 @@ function hostStartupError(
   error: unknown,
 ): Error {
   const current = error instanceof Error ? error : new Error(String(error));
-  if (target.os !== "windows" || current.message.includes(windowsBrokerTask))
+  const exitedWithoutDetail =
+    current.message.startsWith(`remote tool host on ${target.name} exited`) &&
+    !current.message.includes(": ");
+  if (
+    target.os !== "windows" ||
+    current.message.includes(windowsBrokerTask) ||
+    (!current.message.startsWith("remote tool host did not start") &&
+      !exitedWithoutDetail)
+  )
     return current;
   const request = JSON.stringify({ action: "ensure", name: target.name });
   return new Error(
@@ -364,7 +372,10 @@ class ToolBridge {
       const timeout = setTimeout(() => {
         child.kill();
         reject(
-          new Error(`remote tool host did not start on ${this.target.name}`),
+          hostStartupError(
+            this.target,
+            new Error(`remote tool host did not start on ${this.target.name}`),
+          ),
         );
       }, 300_000);
       child.stdout.on("data", (chunk: Buffer) => {
@@ -391,6 +402,13 @@ class ToolBridge {
           }
           try {
             const message = JSON.parse(line) as HostMessage;
+            if (message.type === "diagnostic") {
+              this.stderr =
+                `${this.stderr}\n${message.data ?? "remote tool host failed"}`
+                  .trim()
+                  .slice(-8_000);
+              continue;
+            }
             if (message.type === "ready") {
               const tools = Array.isArray(message.tools) ? message.tools : [];
               const names = new Set(tools.map((item) => item.name));
@@ -445,13 +463,9 @@ class ToolBridge {
         for (const request of this.pending.values()) request.reject(error);
         this.pending.clear();
       });
-    })
-      .catch((error) => {
-        throw hostStartupError(this.target, error);
-      })
-      .finally(() => {
-        this.startPromise = undefined;
-      });
+    }).finally(() => {
+      this.startPromise = undefined;
+    });
     return this.startPromise;
   }
 

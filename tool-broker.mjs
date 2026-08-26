@@ -69,21 +69,34 @@ async function attach(socket, request, remainder) {
   socket.once("close", () => {
     disconnected = true;
   });
-  const entry = hostEntry(request.cwd, request.manifest);
   try {
-    const host = await entry.host;
-    if (disconnected) return;
-    const result = await host.attach({
-      input: socket,
-      output: socket,
-      initialInput: remainder,
-    });
-    if (result.disposeRequested && hosts.get(request.cwd) === entry) {
-      hosts.delete(request.cwd);
-      await host.dispose();
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const entry = hostEntry(request.cwd, request.manifest);
+      try {
+        const host = await entry.host;
+        if (disconnected) return;
+        const result = await host.attach({
+          input: socket,
+          output: socket,
+          initialInput: remainder,
+        });
+        if (result.disposeRequested && hosts.get(request.cwd) === entry) {
+          hosts.delete(request.cwd);
+          await host.dispose();
+        }
+        return;
+      } catch (error) {
+        if (error?.code === "ERR_CUA_MISSING_TOOLS" && attempt === 0) {
+          if (hosts.get(request.cwd) === entry) hosts.delete(request.cwd);
+          continue;
+        }
+        diagnostic(
+          socket,
+          error instanceof Error ? error.message : String(error),
+        );
+        return;
+      }
     }
-  } catch (error) {
-    diagnostic(socket, error instanceof Error ? error.message : String(error));
   } finally {
     socket.end();
   }

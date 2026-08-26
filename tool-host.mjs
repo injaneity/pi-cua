@@ -82,6 +82,20 @@ export async function createToolHost({ cwd, encodedManifest }) {
     throw error;
   }
   session.setActiveToolsByName(session.getAllTools().map((tool) => tool.name));
+  const availableTools = new Set(
+    session.getAllTools().map((tool) => tool.name),
+  );
+  const missingTools = [...requiredTools].filter(
+    (name) => !availableTools.has(name),
+  );
+  if (missingTools.length > 0) {
+    await runtime.dispose();
+    const error = new Error(
+      `remote tool host is missing: ${missingTools.join(", ")}`,
+    );
+    error.code = "ERR_CUA_MISSING_TOOLS";
+    throw error;
+  }
 
   const tool = (name) =>
     session.agent.state.tools.find((candidate) => candidate.name === name);

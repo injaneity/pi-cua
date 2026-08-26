@@ -438,9 +438,10 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn(".pi/agent/cua-tool-host.mjs", files)
         self.assertNotIn(".pi/agent/cua-tool-broker.mjs", files)
         self.assertNotIn(".pi/agent/cua-tool-relay.mjs", files)
-        self.assertIn(
-            b'request.type === "execute"', files[".pi/agent/cua-tool-host.mjs"]
-        )
+        host = files[".pi/agent/cua-tool-host.mjs"]
+        self.assertIn(b'request.type === "execute"', host)
+        self.assertIn(b"ERR_CUA_MISSING_TOOLS", host)
+        self.assertIn(b"await runtime.dispose()", host)
         self.assertNotIn(".pi/agent/auth.json", files)
         self.assertNotIn(".pi/agent/models.json", files)
         self.assertNotIn(".pi/agent/settings.json", files)
