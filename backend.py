@@ -83,6 +83,8 @@ TAILSCALE_API_URL = "https://api.tailscale.com/api/v2"
 WINDOWS_IDENTITY = HOME / ".ssh" / "cua_windows_ed25519"
 WINDOWS_PUBLIC_KEY = WINDOWS_IDENTITY.with_suffix(".pub")
 SANDBOX_KNOWN_HOSTS = HOME / ".ssh" / "cua_known_hosts"
+WINDOWS_BROKER_TASK = "CuaPiDesktopToolBroker"
+WINDOWS_BROKER_PORT = 43121
 
 PROFILES = {
     "linux": {
@@ -1099,14 +1101,48 @@ async def bootstrap_windows(sb: Any, name: str, tailnet: str) -> str:
     return address
 
 
+def windows_broker_health_script(require_task: bool = False) -> str:
+    task_check = (
+        f"$broker = Get-ScheduledTask -TaskName '{WINDOWS_BROKER_TASK}' -ErrorAction SilentlyContinue\n"
+        "if (-not $broker -or $broker.State -eq 'Disabled') { exit 5 }\n"
+        if require_task
+        else ""
+    )
+    return rf"""{task_check}try{{$c=[Net.Sockets.TcpClient]::new('127.0.0.1',{WINDOWS_BROKER_PORT});$s=$c.GetStream();$b=[Text.Encoding]::UTF8.GetBytes("{{`"type`":`"health`"}}`n");$s.Write($b,0,$b.Length);if(([IO.StreamReader]::new($s)).ReadLine()-ne'{{"type":"broker_ready"}}'){{exit 6}}}}catch{{exit 6}}
+"""
+
+
+def windows_install_health_script() -> str:
+    return rf"if((gc -ea 0 C:\ProgramData\cua-pi\bootstrap-version)-ne'{bootstrap_digest('windows')}'){{exit 2}};if(!(gi -ea 0 C:\ProgramData\npm\pi.cmd)){{exit 3}};"
+
+
+def windows_machine_health_script() -> str:
+    return (
+        windows_install_health_script()
+        + "if((Get-Service sshd).Status-ne'Running'){exit 4};"
+        + windows_broker_health_script(require_task=True)
+    )
+
+
+def windows_ssh_health_script() -> str:
+    return (
+        windows_install_health_script()
+        + r"$v=gc -ea 0 C:\Users\cua\.cua-pi\config-version;"
+    )
+
+
+def powershell_encoded_command(script: str) -> str:
+    encoded = base64.b64encode(script.encode("utf-16le")).decode()
+    return f"powershell.exe -NoProfile -EncodedCommand {encoded}"
+
+
 def guest_health_command(profile: str) -> str:
     expected_digest = bootstrap_digest(profile)
     if profile == "linux":
         return f'test "$(cat /home/cua/.cua-pi/bootstrap-version 2>/dev/null)" = {shlex.quote(expected_digest)} && command -v pi >/dev/null && tailscale ip -4 | head -n 1'
-    return (
-        "powershell.exe -NoProfile -Command \"if((Get-Content -ErrorAction SilentlyContinue C:\\ProgramData\\cua-pi\\bootstrap-version) -ne '"
-        + expected_digest
-        + "'){exit 2}; if(-not (Test-Path C:\\ProgramData\\npm\\pi.cmd)){exit 3}; if((Get-Service sshd).Status -ne 'Running'){exit 4}; & 'C:\\Program Files\\Tailscale\\tailscale.exe' ip -4 | Select-Object -First 1\""
+    return powershell_encoded_command(
+        windows_machine_health_script()
+        + "& 'C:\\Program Files\\Tailscale\\tailscale.exe' ip -4 | Select-Object -First 1\n"
     )
 
 
@@ -1752,6 +1788,32 @@ class GuestRuntimePreflight:
     config_matches: bool
 
 
+def windows_broker_ready(name: str) -> bool:
+    try:
+        result = subprocess.run(
+            [
+                "ssh",
+                *ssh_options("windows"),
+                "-T",
+                "-W",
+                f"127.0.0.1:{WINDOWS_BROKER_PORT}",
+                f"cua@{name}",
+            ],
+            input='{"type":"health"}\n',
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    try:
+        response = json.loads(result.stdout.strip())
+    except json.JSONDecodeError:
+        return False
+    return result.returncode == 0 and response == {"type": "broker_ready"}
+
+
 def guest_runtime_preflight(
     name: str, profile: str, config_digest: str
 ) -> GuestRuntimePreflight | None:
@@ -1762,21 +1824,17 @@ config=$(cat /home/cua/.cua-pi/config-version 2>/dev/null || true)
 printf '%s|%s\n' "$address" "$config"
 """
     else:
-        script = rf"""$expected = {powershell_literal(bootstrap_digest(profile))}
-if ((Get-Content -ErrorAction SilentlyContinue C:\ProgramData\cua-pi\bootstrap-version) -ne $expected) {{ exit 20 }}
-if (-not (Test-Path C:\ProgramData\npm\pi.cmd)) {{ exit 21 }}
-$config = Get-Content -ErrorAction SilentlyContinue C:\Users\cua\.cua-pi\config-version
-Write-Output "healthy|$config"
-"""
-        encoded = base64.b64encode(script.encode("utf-16le")).decode()
-        command = f"powershell.exe -NoProfile -EncodedCommand {encoded}"
+        script = windows_ssh_health_script() + '"healthy|$v"\n'
+        command = powershell_encoded_command(script)
     try:
         result = run_guest_ssh(
             name, profile, command, timeout=30, check=False, report=False
         )
     except (OSError, RuntimeError):
         return None
-    if result.returncode != 0:
+    if result.returncode != 0 or (
+        profile == "windows" and not windows_broker_ready(name)
+    ):
         return None
     fields = next(
         (
@@ -1817,11 +1875,10 @@ printf '%s|%s|%s|%s\n' "$address" "$free_bytes" "$config" "$repository"
 """
     else:
         cache = rf"C:\cua\cache\git\{repository_key}.git"
-        script = rf"""$expected = {powershell_literal(bootstrap_digest(profile))}
-if ((Get-Content -ErrorAction SilentlyContinue C:\ProgramData\cua-pi\bootstrap-version) -ne $expected) {{ exit 20 }}
-if (-not (Test-Path C:\ProgramData\npm\pi.cmd)) {{ exit 21 }}
-$free = [IO.DriveInfo]::new('C:\').AvailableFreeSpace
-$config = Get-Content -ErrorAction SilentlyContinue C:\Users\cua\.cua-pi\config-version
+        script = (
+            windows_ssh_health_script()
+            + rf"""$free = [IO.DriveInfo]::new('C:\').AvailableFreeSpace
+$config=$v
 $repository = 0
 git -C {powershell_literal(cache)} cat-file -e {powershell_literal(commit + "^{commit}")} 2>$null
 if ($LASTEXITCODE -eq 0) {{
@@ -1832,15 +1889,17 @@ if ($LASTEXITCODE -eq 0) {{
 }}
 Write-Output "healthy|$free|$config|$repository"
 """
-        encoded = base64.b64encode(script.encode("utf-16le")).decode()
-        command = f"powershell.exe -NoProfile -EncodedCommand {encoded}"
+        )
+        command = powershell_encoded_command(script)
     try:
         result = run_guest_ssh(
             name, profile, command, timeout=60, check=False, report=False
         )
     except (OSError, RuntimeError):
         return None
-    if result.returncode != 0:
+    if result.returncode != 0 or (
+        profile == "windows" and not windows_broker_ready(name)
+    ):
         return None
     fields = next(
         (

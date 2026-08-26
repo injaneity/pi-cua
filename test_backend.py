@@ -1174,6 +1174,7 @@ class WindowsDesktopBrokerTests(unittest.TestCase):
                     [], 0, "healthy|1073741824|cccc|1\n", ""
                 ),
             ) as run,
+            patch.object(backend, "windows_broker_ready", return_value=True) as broker,
         ):
             result = backend.guest_preflight(
                 "100.64.0.2",
@@ -1182,6 +1183,7 @@ class WindowsDesktopBrokerTests(unittest.TestCase):
                 "a" * 40,
                 "cccc",
             )
+            health = backend.windows_ssh_health_script()
 
         self.assertEqual(
             result,
@@ -1189,8 +1191,51 @@ class WindowsDesktopBrokerTests(unittest.TestCase):
         )
         encoded = run.call_args.args[2].rsplit(" ", 1)[-1]
         script = backend.base64.b64decode(encoded).decode("utf-16le")
-        self.assertNotIn("Get-Service", script)
+        self.assertTrue(script.startswith(health))
+        self.assertNotIn("Get-Service sshd", script)
+        self.assertNotIn("Get-ScheduledTask", script)
+        self.assertNotIn("TcpClient", script)
         self.assertNotIn("tailscale.exe", script)
+        broker.assert_called_once_with("100.64.0.2")
+
+    def test_controller_probes_the_broker_forwarding_protocol(self) -> None:
+        response = json.dumps({"type": "broker_ready"}) + "\n"
+        with patch.object(
+            backend.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, response, ""),
+        ) as run:
+            self.assertTrue(backend.windows_broker_ready("100.64.0.2"))
+
+        self.assertIn("-W", run.call_args.args[0])
+        self.assertIn("127.0.0.1:43121", run.call_args.args[0])
+        self.assertEqual(run.call_args.kwargs["input"], '{"type":"health"}\n')
+
+    def test_ensure_health_uses_the_same_broker_contract(self) -> None:
+        with patch.object(backend, "bootstrap_digest", return_value="b" * 20):
+            command = backend.guest_health_command("windows")
+            health = backend.windows_machine_health_script()
+
+        encoded = command.rsplit(" ", 1)[-1]
+        script = backend.base64.b64decode(encoded).decode("utf-16le")
+        self.assertTrue(script.startswith(health))
+        self.assertIn("Get-ScheduledTask -TaskName 'CuaPiDesktopToolBroker'", script)
+        self.assertIn("TcpClient]::new('127.0.0.1',43121)", script)
+        self.assertIn('{"type":"broker_ready"}', script)
+        self.assertIn("tailscale.exe", script)
+
+    def test_runtime_preflight_rejects_an_unavailable_broker(self) -> None:
+        with (
+            patch.object(
+                backend,
+                "run_guest_ssh",
+                return_value=subprocess.CompletedProcess([], 0, "healthy|cccc\n", ""),
+            ),
+            patch.object(backend, "windows_broker_ready", return_value=False),
+        ):
+            result = backend.guest_runtime_preflight("100.64.0.2", "windows", "c" * 20)
+
+        self.assertIsNone(result)
 
     def test_bootstrap_registers_an_interactive_logon_task(self) -> None:
         script = backend.bootstrap_template("windows")
@@ -1203,6 +1248,13 @@ class WindowsDesktopBrokerTests(unittest.TestCase):
         self.assertIn("PermitOpen 127.0.0.1:43121", script)
         self.assertNotIn("$brokerToken", script)
         self.assertNotIn("RandomNumberGenerator", script)
+        self.assertIn("Start-ScheduledTask -TaskName CuaPiDesktopToolBroker", script)
+        self.assertLess(
+            script.index("Stop-ScheduledTask"),
+            script.index("Register-ScheduledTask"),
+        )
+        self.assertIn("did not release 127.0.0.1:43121", script)
+        self.assertIn('cua_sandbox with {"action":"ensure"', script)
 
     def test_bootstrap_owns_only_the_desktop_broker(self) -> None:
         script = backend.bootstrap_template("windows")

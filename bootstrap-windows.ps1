@@ -117,9 +117,14 @@ Invoke-Icacls @($authorizedKeys, '/inheritance:r', '/grant:r', 'cua:F', 'SYSTEM:
 Write-Output '::phase acl-complete'
 $interactiveDesktop = Get-Process explorer -IncludeUserName -ErrorAction SilentlyContinue | Where-Object SessionId -GT 0 | Select-Object -First 1
 $interactiveUser = $interactiveDesktop.UserName
-if (-not $interactiveUser) { throw 'No interactive Windows desktop user is available for the Pi tool broker' }
+if (-not $interactiveUser) { throw 'CuaPiDesktopToolBroker requires an interactive Windows desktop login; log in as the desktop user, rerun cua_sandbox with {"action":"ensure","name":"__HOSTNAME__"}, then run /reload' }
 $brokerTask = 'CuaPiDesktopToolBroker'
+function Test-BrokerPort {
+  try { $client = [Net.Sockets.TcpClient]::new('127.0.0.1', 43121); $client.Dispose(); return $true } catch { return $false }
+}
 Stop-ScheduledTask -TaskName $brokerTask -ErrorAction SilentlyContinue
+for ($attempt = 0; $attempt -lt 50 -and (Test-BrokerPort); $attempt++) { Start-Sleep -Milliseconds 200 }
+if ($attempt -eq 50) { throw 'CuaPiDesktopToolBroker did not release 127.0.0.1:43121; stop the process or restart Windows, rerun cua_sandbox with {"action":"ensure","name":"__HOSTNAME__"}, then run /reload' }
 Remove-Item -Recurse -Force -ErrorAction SilentlyContinue 'C:\cua\node-v22.20.0-win-x64'
 Remove-Item -Force -ErrorAction SilentlyContinue 'C:\ProgramData\cua-pi\start-desktop-tool-broker.vbs',"$agent\cua-tool-broker.token","$agent\cua-tool-relay.mjs"
 Unregister-ScheduledTask -TaskName $brokerTask -Confirm:$false -ErrorAction SilentlyContinue
@@ -128,12 +133,16 @@ $brokerTrigger = New-ScheduledTaskTrigger -AtLogOn -User $interactiveUser
 $brokerPrincipal = New-ScheduledTaskPrincipal -UserId $interactiveUser -LogonType Interactive -RunLevel Highest
 $brokerSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero)
 Register-ScheduledTask -TaskName $brokerTask -Action $brokerAction -Trigger $brokerTrigger -Principal $brokerPrincipal -Settings $brokerSettings | Out-Null
-Start-ScheduledTask -TaskName $brokerTask
-for ($attempt = 0; $attempt -lt 50; $attempt++) {
-  Start-Sleep -Milliseconds 200
-  try { $client = [Net.Sockets.TcpClient]::new('127.0.0.1', 43121); $client.Dispose(); break } catch {}
+$brokerReady = $false
+for ($startAttempt = 0; $startAttempt -lt 3 -and -not $brokerReady; $startAttempt++) {
+  Start-ScheduledTask -TaskName $brokerTask
+  for ($attempt = 0; $attempt -lt 50 -and -not (Test-BrokerPort); $attempt++) { Start-Sleep -Milliseconds 200 }
+  if (Test-BrokerPort) {
+    Start-Sleep -Seconds 1
+    $brokerReady = (Test-BrokerPort) -and (Get-ScheduledTask -TaskName $brokerTask).State -eq 'Running'
+  }
 }
-if ($attempt -eq 50) { throw 'Interactive Pi tool broker did not become ready' }
+if (-not $brokerReady) { throw 'CuaPiDesktopToolBroker did not remain listening on 127.0.0.1:43121; run Start-ScheduledTask -TaskName CuaPiDesktopToolBroker in elevated PowerShell, or rerun cua_sandbox with {"action":"ensure","name":"__HOSTNAME__"}, then run /reload' }
 Write-Output '::phase desktop-broker-ready'
 New-Item -Path 'HKLM:\SOFTWARE\OpenSSH' -Force | Out-Null
 New-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name 'DefaultShell' -Value 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' -PropertyType String -Force | Out-Null

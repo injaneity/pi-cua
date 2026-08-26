@@ -58,6 +58,18 @@ try {
   });
   await once(broker.stderr, "data");
 
+  async function checkHealth() {
+    const socket = createConnection({ host: "127.0.0.1", port });
+    await once(socket, "connect");
+    socket.write('{"type":"health"}\n');
+    const [chunk] = await once(socket, "data", {
+      signal: AbortSignal.timeout(5_000),
+    });
+    socket.end();
+    await once(socket, "close");
+    return JSON.parse(chunk.toString());
+  }
+
   async function connectOnce(message = "hello\n", manifest = "generation-1") {
     const socket = createConnection({ host: "127.0.0.1", port });
     await once(socket, "connect");
@@ -77,6 +89,11 @@ try {
     return JSON.parse(output.split("\n", 1)[0]);
   }
 
+  const abandonedProbe = createConnection({ host: "127.0.0.1", port });
+  await once(abandonedProbe, "connect");
+  abandonedProbe.destroy();
+  await once(abandonedProbe, "close");
+  assert.deepEqual(await checkHealth(), { type: "broker_ready" });
   const first = await connectOnce();
   const second = await connectOnce();
   await writeFile(join(directory, "generation"), "2");
