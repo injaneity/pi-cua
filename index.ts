@@ -30,6 +30,7 @@ const windowsIdentity = join(homedir(), ".ssh", "cua_windows_ed25519");
 const sandboxKnownHosts = join(homedir(), ".ssh", "cua_known_hosts");
 const protocolVersion = 2;
 const maxProtocolLine = 1024 * 1024;
+const windowsBrokerTask = "CuaPiDesktopToolBroker";
 const executionTargetEntry = "cua-execution-target";
 const executionTargetHandoffEntry = "cua-execution-target-handoff";
 const localTools = new Set(["cua_sandbox", "report_papercut"]);
@@ -264,6 +265,19 @@ function hostCommand(
   return `cd ${shellQuote(target.remoteCwd)} && exec node /home/cua/.pi/agent/cua-tool-host.mjs ${shellQuote(target.remoteCwd)} ${shellQuote(manifest)}`;
 }
 
+function hostStartupError(
+  target: Extract<ExecutionTarget, { kind: "sandbox" }>,
+  error: unknown,
+): Error {
+  const current = error instanceof Error ? error : new Error(String(error));
+  if (target.os !== "windows" || current.message.includes(windowsBrokerTask))
+    return current;
+  const request = JSON.stringify({ action: "ensure", name: target.name });
+  return new Error(
+    `${current.message}; Windows broker task ${windowsBrokerTask} is unavailable or stale: run cua_sandbox with ${request}, then run /reload`,
+  );
+}
+
 class ToolBridge {
   private child: ChildProcessWithoutNullStreams | undefined;
   private readonly pending = new Map<string, PendingRequest>();
@@ -421,16 +435,23 @@ class ToolBridge {
         this.ready = false;
         this.child = undefined;
         const detail = this.stderr.trim();
-        const error = new Error(
-          `remote tool host on ${this.target.name} exited (${code ?? "signal"})${detail ? `: ${detail}` : ""}`,
+        const error = hostStartupError(
+          this.target,
+          new Error(
+            `remote tool host on ${this.target.name} exited (${code ?? "signal"})${detail ? `: ${detail}` : ""}`,
+          ),
         );
         reject(error);
         for (const request of this.pending.values()) request.reject(error);
         this.pending.clear();
       });
-    }).finally(() => {
-      this.startPromise = undefined;
-    });
+    })
+      .catch((error) => {
+        throw hostStartupError(this.target, error);
+      })
+      .finally(() => {
+        this.startPromise = undefined;
+      });
     return this.startPromise;
   }
 

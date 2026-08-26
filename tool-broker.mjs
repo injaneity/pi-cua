@@ -91,6 +91,11 @@ async function attach(socket, request, remainder) {
 
 const server = createServer((socket) => {
   socket.setNoDelay(true);
+  socket.on("error", (error) => {
+    process.stderr.write(
+      `desktop tool broker connection failed: ${error.message}\n`,
+    );
+  });
   let buffer = Buffer.alloc(0);
   const onData = (chunk) => {
     buffer = Buffer.concat([buffer, chunk]);
@@ -106,7 +111,12 @@ const server = createServer((socket) => {
       .replace(/\r$/, "");
     const remainder = buffer.subarray(newline + 1);
     try {
-      void attach(socket, JSON.parse(line), remainder);
+      const request = JSON.parse(line);
+      if (request?.type === "health") {
+        socket.end(`${JSON.stringify({ type: "broker_ready" })}\n`);
+        return;
+      }
+      void attach(socket, request, remainder);
     } catch (error) {
       diagnostic(
         socket,
