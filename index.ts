@@ -1040,6 +1040,24 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     return names;
   }
 
+  function reportTargetProgress(
+    active: { kind: "sandbox"; name: string; os: SandboxOS },
+    ctx: UIContext,
+    phase?: string,
+    message?: string,
+  ): void {
+    ctx.ui.setStatus(
+      "cua-session",
+      formatSandboxProgress(active.name, phase, message),
+    );
+    pi.events.emit("cua:execution-target-changed", {
+      ...active,
+      state: "connecting",
+      phase,
+      message,
+    });
+  }
+
   async function prepareTarget(
     destination: Extract<Destination, { kind: "sandbox" }>,
     ctx: UIContext,
@@ -1066,11 +1084,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         ? target.executionId
         : undefined) ??
       ctx.sessionManager.getSessionId();
-    ctx.ui.setStatus("cua-session", formatSandboxProgress(destination.name));
-    pi.events.emit("cua:execution-target-changed", {
-      ...destination,
-      state: "connecting",
-    });
+    reportTargetProgress(destination, ctx);
     const request = {
       action: refresh ? "refresh_execution" : "prepare_execution",
       name: destination.name,
@@ -1084,18 +1098,8 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
           : undefined,
       resume: resume ? executionSource(resume) : undefined,
     };
-    const onStatus = (status: BackendResult) => {
-      ctx.ui.setStatus(
-        "cua-session",
-        formatSandboxProgress(destination.name, status.phase, status.message),
-      );
-      pi.events.emit("cua:execution-target-changed", {
-        ...destination,
-        state: "connecting",
-        phase: status.phase,
-        message: status.message,
-      });
-    };
+    const onStatus = (status: BackendResult) =>
+      reportTargetProgress(destination, ctx, status.phase, status.message);
     try {
       let result: BackendResult;
       try {
@@ -1566,10 +1570,28 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         saveTarget(local);
         target = local;
       } else if (source && event.reason !== "reload") {
-        await syncTargetToLocal(source);
+        if (source.workspaceState) {
+          reportTargetProgress(
+            source,
+            ctx,
+            "workspace.local.sync",
+            "syncing workspace before exit",
+          );
+        }
+        await syncTargetToLocal(source, undefined, (status) =>
+          reportTargetProgress(source, ctx, status.phase, status.message),
+        );
         const local: ExecutionTarget = { kind: "local" };
         saveTarget(local);
         target = local;
+        if (source.workspaceState) {
+          reportTargetProgress(
+            source,
+            ctx,
+            "workspace.local.cleanup",
+            "removing synced sandbox workspace",
+          );
+        }
         await cleanupTarget(source, ctx);
         disposeBridge = true;
       }
