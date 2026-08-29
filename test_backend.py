@@ -581,6 +581,50 @@ class WorkspaceTests(unittest.TestCase):
             self.assertFalse((root / "untracked.txt").exists())
             self.assertEqual((root / "created.txt").read_text(), "sandbox created\n")
 
+    def test_workspace_merge_preserves_non_conflicting_local_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.repository(directory)
+            path = root / "tracked.txt"
+            path.write_text("first\nsecond\nthird\n")
+            subprocess.run(["git", "-C", root, "add", "."], check=True)
+            subprocess.run(["git", "-C", root, "commit", "-qm", "initial"], check=True)
+            _, baseline = backend.workspace_tree(root)
+
+            path.write_text("sandbox\nsecond\nthird\n")
+            _, sandbox_tree = backend.workspace_tree(root)
+            sandbox_patch = backend.workspace_patch(root, baseline, sandbox_tree)
+
+            path.write_text("first\nsecond\nlocal\n")
+            _, local_tree = backend.workspace_tree(root)
+            local_patch, merged_tree = backend.merge_workspace_patch(
+                root, local_tree, sandbox_patch
+            )
+            backend.apply_workspace_patch(root, local_patch, merged_tree)
+
+            self.assertEqual(path.read_text(), "sandbox\nsecond\nlocal\n")
+
+    def test_workspace_merge_rejects_conflicts_without_changing_local_files(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.repository(directory)
+            path = root / "tracked.txt"
+            path.write_text("original\n")
+            subprocess.run(["git", "-C", root, "add", "."], check=True)
+            subprocess.run(["git", "-C", root, "commit", "-qm", "initial"], check=True)
+            _, baseline = backend.workspace_tree(root)
+
+            path.write_text("sandbox\n")
+            _, sandbox_tree = backend.workspace_tree(root)
+            sandbox_patch = backend.workspace_patch(root, baseline, sandbox_tree)
+
+            path.write_text("local\n")
+            _, local_tree = backend.workspace_tree(root)
+            with self.assertRaisesRegex(RuntimeError, "changes conflict"):
+                backend.merge_workspace_patch(root, local_tree, sandbox_patch)
+
+            self.assertEqual(path.read_text(), "local\n")
+
     def test_parse_numstat_ignores_binary_files(self) -> None:
         self.assertEqual(
             backend.parse_numstat(
@@ -626,7 +670,7 @@ class WorkspaceTests(unittest.TestCase):
                 "additions": 17,
                 "deletions": 5,
                 "pending_sync": True,
-                "sync_safe": False,
+                "sync_safe": True,
             },
         )
         stats.assert_called_once_with(

@@ -1654,6 +1654,52 @@ def remote_workspace_patch(
     return result.stdout
 
 
+def merge_workspace_patch(
+    root: Path, local_tree: str, sandbox_patch: bytes
+) -> tuple[bytes, str]:
+    if not sandbox_patch:
+        return b"", local_tree
+    with tempfile.TemporaryDirectory() as directory:
+        environment = {**os.environ, "GIT_INDEX_FILE": str(Path(directory) / "index")}
+        subprocess.run(
+            ["git", "-C", str(root), "read-tree", local_tree],
+            check=True,
+            capture_output=True,
+            env=environment,
+            timeout=300,
+        )
+        merged = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "apply",
+                "--cached",
+                "--3way",
+                "--binary",
+                "--whitespace=nowarn",
+            ],
+            input=sandbox_patch,
+            capture_output=True,
+            check=False,
+            env=environment,
+            timeout=300,
+        )
+        if merged.returncode != 0:
+            raise RuntimeError(
+                "local and sandbox workspace changes conflict; resolve one side before syncing"
+            )
+        merged_tree = subprocess.run(
+            ["git", "-C", str(root), "write-tree"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=300,
+        ).stdout.strip()
+    return workspace_patch(root, local_tree, merged_tree), merged_tree
+
+
 def apply_workspace_patch(root: Path, patch: bytes, expected_tree: str) -> None:
     command = ["git", "-C", str(root), "apply", "--binary", "--whitespace=nowarn"]
     if patch:
@@ -2415,7 +2461,6 @@ def workspace_diff_status(
     if requested_root != local_root:
         raise RuntimeError("local workspace path changed since sandbox activation")
 
-    _, local_tree = workspace_tree(local_root)
     source_root, _ = workspace_location(
         source["address"], source["os"], source["remoteCwd"]
     )
@@ -2431,7 +2476,7 @@ def workspace_diff_status(
         "additions": additions,
         "deletions": deletions,
         "pending_sync": final_tree != state["baselineTree"],
-        "sync_safe": local_tree == state["baselineTree"],
+        "sync_safe": True,
     }
 
 
@@ -2485,28 +2530,31 @@ def sync_workspace_to_local(
     if requested_root != local_root:
         raise RuntimeError("local workspace path changed since sandbox activation")
 
-    progress("workspace.local.verify", "checking the local workspace baseline")
+    progress("workspace.local.verify", "capturing the current local workspace")
     _, local_tree = workspace_tree(local_root)
-    if local_tree != workspace_state["baselineTree"]:
-        raise RuntimeError(
-            "local workspace changed while the sandbox was active; restore it to the departure state before syncing"
-        )
 
     progress("workspace.local.diff", "capturing sandbox changes")
-    current_patch, final_tree = capture_sandbox_patch(
+    sandbox_patch, sandbox_tree = capture_sandbox_patch(
         source, workspace_state["baselineTree"]
     )
+    patch_to_apply = sandbox_patch
+    final_tree = sandbox_tree
+    if local_tree != workspace_state["baselineTree"]:
+        progress("workspace.local.merge", "merging local and sandbox changes")
+        patch_to_apply, final_tree = merge_workspace_patch(
+            local_root, local_tree, sandbox_patch
+        )
     progress(
         "workspace.local.apply",
-        f"applying {len(current_patch) / 1048576:.1f} MiB of sandbox changes",
+        f"applying {len(patch_to_apply) / 1048576:.1f} MiB of sandbox changes",
     )
     try:
-        apply_workspace_patch(local_root, current_patch, final_tree)
+        apply_workspace_patch(local_root, patch_to_apply, final_tree)
     except subprocess.CalledProcessError as error:
         raise RuntimeError(
             "sandbox changes do not apply cleanly to the local workspace"
         ) from error
-    return {"local_cwd": local_cwd, "changed": bool(current_patch)}
+    return {"local_cwd": local_cwd, "changed": bool(sandbox_patch)}
 
 
 def refresh_execution(
