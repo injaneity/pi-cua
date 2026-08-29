@@ -670,7 +670,6 @@ class WorkspaceTests(unittest.TestCase):
                 "additions": 17,
                 "deletions": 5,
                 "pending_sync": True,
-                "sync_safe": True,
             },
         )
         stats.assert_called_once_with(

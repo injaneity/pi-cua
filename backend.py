@@ -2476,7 +2476,6 @@ def workspace_diff_status(
         "additions": additions,
         "deletions": deletions,
         "pending_sync": final_tree != state["baselineTree"],
-        "sync_safe": True,
     }
 
 

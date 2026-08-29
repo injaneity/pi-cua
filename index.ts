@@ -135,7 +135,6 @@ type BackendResult = {
   additions?: number;
   deletions?: number;
   pending_sync?: boolean;
-  sync_safe?: boolean;
   removed?: boolean;
 };
 class BackendError extends Error {
@@ -1217,7 +1216,6 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         additions: 0,
         deletions: 0,
         pendingSync: false,
-        syncSafe: true,
       });
       return;
     }
@@ -1237,8 +1235,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         target.address !== active.address ||
         typeof result.additions !== "number" ||
         typeof result.deletions !== "number" ||
-        typeof result.pending_sync !== "boolean" ||
-        typeof result.sync_safe !== "boolean"
+        typeof result.pending_sync !== "boolean"
       )
         return;
       pi.events.emit("cua:workspace-diff-changed", {
@@ -1247,7 +1244,6 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         additions: result.additions,
         deletions: result.deletions,
         pendingSync: result.pending_sync,
-        syncSafe: result.sync_safe,
       });
     } catch {
       // A status refresh must not interrupt the active Pi session.
