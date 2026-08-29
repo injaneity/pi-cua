@@ -1456,7 +1456,21 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     },
   });
 
-  pi.on("session_start", async (event, ctx) => {
+  let pendingSessionStart:
+    | {
+        reason: "startup" | "reload" | "new" | "resume" | "fork";
+        previousSessionFile?: string;
+      }
+    | undefined;
+
+  pi.on("session_start", (event) => {
+    pendingSessionStart = event;
+  });
+
+  pi.on("resources_discover", async (_event, ctx) => {
+    const event = pendingSessionStart;
+    pendingSessionStart = undefined;
+    if (!event) return;
     let intendedTarget: ExecutionTarget | undefined;
     try {
       const current = loadSessionTarget(ctx);
