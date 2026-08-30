@@ -1303,6 +1303,12 @@ class WindowsDesktopBrokerTests(unittest.TestCase):
 
         self.assertIsNone(result)
 
+    def test_bootstrap_disables_the_shutdown_event_tracker(self) -> None:
+        script = backend.bootstrap_template("windows")
+
+        self.assertIn("Windows NT\\Reliability", script)
+        self.assertIn("-Name ShutdownReasonOn -Value 0", script)
+
     def test_bootstrap_registers_an_interactive_logon_task(self) -> None:
         script = backend.bootstrap_template("windows")
 

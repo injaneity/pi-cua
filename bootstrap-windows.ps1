@@ -1,5 +1,8 @@
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+$reliabilityPolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Reliability'
+New-Item -Path $reliabilityPolicy -Force | Out-Null
+New-ItemProperty -Path $reliabilityPolicy -Name ShutdownReasonOn -Value 0 -PropertyType DWord -Force | Out-Null
 function Add-MachinePath([string]$PathToAdd) {
   $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
   if (($machinePath -split ';') -notcontains $PathToAdd) {
