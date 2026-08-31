@@ -1068,14 +1068,6 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     } = {},
   ): Promise<Extract<ExecutionTarget, { kind: "sandbox" }>> {
     const { inheritExecution = true, resume, refresh } = options;
-    if (
-      inheritExecution &&
-      bridge &&
-      target.kind === "sandbox" &&
-      target.name === destination.name
-    ) {
-      return target;
-    }
     captureToolProviders();
     const executionId =
       refresh?.executionId ??
@@ -1437,12 +1429,15 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
           await ctx.reload();
           return;
         }
-        if (
-          bridge &&
-          target.kind === "sandbox" &&
-          target.name === destination.name
-        )
+        if (target.kind === "sandbox" && target.name === destination.name) {
+          const refreshed = await prepareTarget(destination, ctx, {
+            inheritExecution: false,
+            resume: target,
+          });
+          saveTarget(refreshed);
+          await ctx.reload();
           return;
+        }
         const source = target.kind === "sandbox" ? target : undefined;
         const prepared = await prepareTarget(destination, ctx);
         await activate(prepared, ctx);
