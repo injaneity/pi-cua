@@ -240,6 +240,10 @@ function sshArgs(
     "-o",
     "ConnectTimeout=10",
     "-o",
+    "ServerAliveInterval=15",
+    "-o",
+    "ServerAliveCountMax=2",
+    "-o",
     "LogLevel=ERROR",
     "-T",
     ...(target.os === "windows" ? ["-W", "127.0.0.1:43121"] : []),
@@ -283,11 +287,15 @@ class ToolBridge {
   private startPromise: Promise<void> | undefined;
   private stderr = "";
   private ready = false;
+  private hasStarted = false;
   private readonly remoteTools = new Map<string, RemoteToolInfo>();
 
   constructor(
-    private readonly target: Extract<ExecutionTarget, { kind: "sandbox" }>,
+    private target: Extract<ExecutionTarget, { kind: "sandbox" }>,
     private readonly expectedTools: string[],
+    private readonly renewTarget: (
+      target: Extract<ExecutionTarget, { kind: "sandbox" }>,
+    ) => Promise<Extract<ExecutionTarget, { kind: "sandbox" }>>,
   ) {}
 
   private send(message: Record<string, unknown>): void {
@@ -327,10 +335,8 @@ class ToolBridge {
     }
   }
 
-  private async start(): Promise<void> {
-    if (this.ready) return;
-    if (this.startPromise) return this.startPromise;
-    this.startPromise = new Promise<void>((resolve, reject) => {
+  private open(): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
       this.stderr = "";
       const manifest = encodedToolManifest(
         this.expectedTools,
@@ -448,7 +454,17 @@ class ToolBridge {
         for (const request of this.pending.values()) request.reject(error);
         this.pending.clear();
       });
-    }).finally(() => {
+    });
+  }
+
+  private start(): Promise<void> {
+    if (this.ready) return Promise.resolve();
+    if (this.startPromise) return this.startPromise;
+    this.startPromise = (async () => {
+      if (this.hasStarted) this.target = await this.renewTarget(this.target);
+      this.hasStarted = true;
+      await this.open();
+    })().finally(() => {
       this.startPromise = undefined;
     });
     return this.startPromise;
@@ -914,11 +930,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
   ): Promise<Destination | undefined> {
     if (!ctx.hasUI) return undefined;
     const listed = await runBackend({ action: "list" }, ctx.signal);
-    const online = (listed.sandboxes ?? []).filter(
-      (sandbox) =>
-        sandbox.online &&
-        !(active?.kind === "sandbox" && sandbox.name === active.name),
-    );
+    const online = (listed.sandboxes ?? []).filter((sandbox) => sandbox.online);
     const actions: DestinationSearchOption[] = [
       ...(active?.kind === "sandbox"
         ? [
@@ -934,7 +946,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         ? [
             {
               value: "connect",
-              label: `connect to ${active?.kind === "sandbox" ? "another" : "an existing"} sandbox (${online.length} available)`,
+              label: `${active?.kind === "sandbox" ? "connect or reconnect to" : "connect to"} a sandbox (${online.length} available)`,
             },
           ]
         : []),
@@ -977,7 +989,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         online.map((sandbox) => ({
           value: sandbox.name,
           label: sandbox.name,
-          description: `${sandbox.os} • reachable over Tailscale`,
+          description: `${sandbox.os} • ${active?.kind === "sandbox" && sandbox.name === active.name ? "current; reconnect" : "reachable over Tailscale"}`,
         })),
       );
       if (!name) continue;
@@ -1064,13 +1076,11 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     options: {
       inheritExecution?: boolean;
       resume?: Extract<ExecutionTarget, { kind: "sandbox" }>;
-      refresh?: Extract<ExecutionTarget, { kind: "sandbox" }>;
     } = {},
   ): Promise<Extract<ExecutionTarget, { kind: "sandbox" }>> {
-    const { inheritExecution = true, resume, refresh } = options;
+    const { inheritExecution = true, resume } = options;
     captureToolProviders();
     const executionId =
-      refresh?.executionId ??
       resume?.executionId ??
       (inheritExecution && target.kind === "sandbox"
         ? target.executionId
@@ -1078,14 +1088,13 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       ctx.sessionManager.getSessionId();
     reportTargetProgress(destination, ctx);
     const request = {
-      action: refresh ? "refresh_execution" : "prepare_execution",
+      action: "prepare_execution",
       name: destination.name,
       source_cwd: resume?.localCwd ?? ctx.cwd,
       execution_id: executionId,
       tool_packages: [...toolPackages],
-      source: refresh
-        ? executionSource(refresh)
-        : !resume && inheritExecution && target.kind === "sandbox"
+      source:
+        !resume && inheritExecution && target.kind === "sandbox"
           ? workspaceSource(target)
           : undefined,
       resume: resume ? executionSource(resume) : undefined,
@@ -1121,7 +1130,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         ...destination,
         address: result.address,
         executionId,
-        localCwd: refresh?.localCwd ?? resume?.localCwd ?? ctx.cwd,
+        localCwd: resume?.localCwd ?? ctx.cwd,
         remoteCwd: result.remote_cwd,
         workspaceState: parseWorkspaceState(result.workspace_state),
         runtimeDigest: result.runtime_digest,
@@ -1143,6 +1152,28 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       ctx,
       { inheritExecution: false, resume: saved },
     );
+  }
+
+  async function renewExecutionTarget(
+    active: Extract<ExecutionTarget, { kind: "sandbox" }>,
+    ctx: UIContext,
+  ): Promise<Extract<ExecutionTarget, { kind: "sandbox" }>> {
+    const renewed = await prepareTarget(
+      { kind: "sandbox", name: active.name, os: active.os },
+      ctx,
+      { inheritExecution: false, resume: active },
+    );
+    if (
+      target.kind === "sandbox" &&
+      target.name === active.name &&
+      target.executionId === active.executionId
+    ) {
+      target = renewed;
+      saveTarget(renewed);
+      ctx.ui.setStatus("cua-session", undefined);
+      pi.events.emit("cua:execution-target-changed", renewed);
+    }
+    return renewed;
   }
 
   function executionSource(
@@ -1289,7 +1320,11 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     }
     const expectedTools = captureToolProviders();
     const nextBridge =
-      next.kind === "sandbox" ? new ToolBridge(next, expectedTools) : undefined;
+      next.kind === "sandbox"
+        ? new ToolBridge(next, expectedTools, (active) =>
+            renewExecutionTarget(active, ctx),
+          )
+        : undefined;
     if (next.kind === "sandbox") {
       ctx.ui.setStatus(
         "cua-session",
@@ -1471,16 +1506,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       const current = loadSessionTarget(ctx);
       if (current) {
         intendedTarget = current;
-        const resumed =
-          event.reason === "reload" &&
-          current.kind === "sandbox" &&
-          current.executionId
-            ? await prepareTarget(
-                { kind: "sandbox", name: current.name, os: current.os },
-                ctx,
-                { inheritExecution: false, refresh: current },
-              )
-            : await resumeTarget(current, ctx);
+        const resumed = await resumeTarget(current, ctx);
         intendedTarget = resumed;
         if (resumed !== current) saveTarget(resumed);
         await activate(resumed, ctx, { persist: false });
@@ -1490,10 +1516,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         ? loadHandoffTarget(event.previousSessionFile)
         : undefined;
       if (inherited) {
-        const prepared =
-          inherited.kind === "sandbox" && !inherited.executionId
-            ? await resumeTarget(inherited, ctx)
-            : inherited;
+        const prepared = await resumeTarget(inherited, ctx);
         intendedTarget = prepared;
         saveTarget(prepared);
         await activate(prepared, ctx, { persist: false });

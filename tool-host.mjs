@@ -48,17 +48,7 @@ export async function createToolHost({ cwd, encodedManifest }) {
   }
   const requiredTools = new Set(tools);
   const createRuntime = async ({ cwd, sessionManager, sessionStartEvent }) => {
-    const services = await pi.createAgentSessionServices({
-      cwd,
-      resourceLoaderOptions: {
-        extensionsOverride: (base) => ({
-          ...base,
-          extensions: base.extensions.filter((extension) =>
-            [...extension.tools.keys()].some((name) => requiredTools.has(name)),
-          ),
-        }),
-      },
-    });
+    const services = await pi.createAgentSessionServices({ cwd });
     return {
       ...(await pi.createAgentSessionFromServices({
         services,

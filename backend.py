@@ -2556,50 +2556,6 @@ def sync_workspace_to_local(
     return {"local_cwd": local_cwd, "changed": bool(sandbox_patch)}
 
 
-def refresh_execution(
-    name: str,
-    source: SandboxExecutionSource,
-    execution_key: str,
-    tool_packages: tuple[str, ...] = (),
-) -> dict[str, Any]:
-    states = {item["name"]: item for item in managed_sandboxes()}
-    if name not in states:
-        raise ValueError(f"unknown managed sandbox: {name}")
-    profile = states[name]["os"]
-    if source["os"] != profile:
-        raise ValueError("saved sandbox profile does not match its controller record")
-    config_files = guest_config_files(tool_packages)
-    guest_digest = config_digest(config_files)
-    candidate = states[name].get("address") or source["address"] or name
-    progress("sandbox.runtime", "checking guest runtime configuration")
-    preflight = guest_runtime_preflight(candidate, profile, guest_digest)
-    if preflight is None:
-        raise SandboxRepairRequired(f"sandbox repair required: {name}")
-    if not preflight.config_matches:
-        sync_guest_config(
-            preflight.address,
-            profile,
-            guest_config_archive(config_files),
-            guest_digest,
-        )
-    result: dict[str, Any] = {
-        "name": name,
-        "os": profile,
-        "address": preflight.address,
-        "remote_cwd": (
-            source["remoteCwd"]
-            if "state" in source
-            else prepare_execution_directory(
-                preflight.address, profile, execution_digest(execution_key)[:16]
-            )
-        ),
-        "runtime_digest": guest_digest,
-    }
-    if "state" in source:
-        result["workspace_state"] = source["state"]
-    return result
-
-
 async def prepare_execution(
     name: str,
     source_cwd: str,
@@ -2775,18 +2731,10 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         return await ensure_one(str(request.get("name") or ""))
     if action == "delete":
         return await delete_one(str(request.get("name") or ""))
-    if action in {"prepare_execution", "refresh_execution"}:
+    if action == "prepare_execution":
         execution_key = request.get("execution_id")
         if not isinstance(execution_key, str) or not execution_key:
-            raise ValueError(f"{action} requires execution_id")
-    if action == "refresh_execution":
-        return refresh_execution(
-            str(request.get("name") or ""),
-            require_execution_source(request.get("source")),
-            execution_key,
-            require_tool_packages(request.get("tool_packages", [])),
-        )
-    if action == "prepare_execution":
+            raise ValueError("prepare_execution requires execution_id")
         source_value = request.get("source")
         source = (
             require_sandbox_source(source_value) if source_value is not None else None
@@ -2805,7 +2753,7 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
             tool_packages,
         )
     raise ValueError(
-        "action must be list, create, ensure, delete, prepare_execution, refresh_execution, sync_workspace_to_local, cleanup_workspace, or workspace_diff_status"
+        "action must be list, create, ensure, delete, prepare_execution, sync_workspace_to_local, cleanup_workspace, or workspace_diff_status"
     )
 
 
@@ -2831,7 +2779,6 @@ def main() -> None:
             "ensure",
             "delete",
             "prepare_execution",
-            "refresh_execution",
             "sync_workspace_to_local",
             "cleanup_workspace",
         }:

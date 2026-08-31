@@ -753,75 +753,6 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.transfer = backend.WorkspaceTransfer(self.state, b"final", "3" * 40)
 
-    def test_reload_refresh_skips_workspace_and_repository_preflight(self) -> None:
-        preflight = backend.GuestRuntimePreflight("100.64.0.2", True)
-        with (
-            patch.object(
-                backend,
-                "managed_sandboxes",
-                return_value=[{"name": "linux-1", "os": "linux"}],
-            ),
-            patch.object(backend, "guest_runtime_preflight", return_value=preflight),
-            patch.object(backend, "inspect_workspace") as inspect,
-            patch.object(backend, "guest_preflight") as full_preflight,
-            patch.object(backend, "sandbox_workspace_exists") as workspace_check,
-            patch.object(backend, "sync_guest_config") as sync_config,
-        ):
-            result = backend.refresh_execution("linux-1", self.source, "session-1")
-
-        self.assertEqual(result["address"], "100.64.0.2")
-        self.assertEqual(result["remote_cwd"], self.source["remoteCwd"])
-        inspect.assert_not_called()
-        full_preflight.assert_not_called()
-        workspace_check.assert_not_called()
-        sync_config.assert_not_called()
-
-    def test_non_git_reload_keeps_its_execution_identity(self) -> None:
-        source = backend.SandboxExecutionSource(
-            address="100.64.0.1",
-            os="linux",
-            remoteCwd="/legacy/shared/home",
-        )
-        preflight = backend.GuestRuntimePreflight("100.64.0.2", True)
-        with (
-            patch.object(
-                backend,
-                "managed_sandboxes",
-                return_value=[{"name": "linux-1", "os": "linux"}],
-            ),
-            patch.object(backend, "guest_runtime_preflight", return_value=preflight),
-            patch.object(
-                backend,
-                "run_guest_ssh",
-                return_value=subprocess.CompletedProcess([], 0, "", ""),
-            ),
-        ):
-            result = backend.refresh_execution("linux-1", source, "execution-1")
-
-        execution_id = backend.execution_digest("execution-1")[:16]
-        self.assertEqual(
-            result["remote_cwd"], f"/home/cua/.cua-pi/executions/{execution_id}"
-        )
-        self.assertNotIn("workspace_state", result)
-
-    def test_reload_refresh_syncs_only_a_changed_guest_bundle(self) -> None:
-        preflight = backend.GuestRuntimePreflight("100.64.0.2", False)
-        with (
-            patch.object(
-                backend,
-                "managed_sandboxes",
-                return_value=[{"name": "linux-1", "os": "linux"}],
-            ),
-            patch.object(backend, "guest_config_files", return_value={"x": b""}),
-            patch.object(backend, "config_digest", return_value="c" * 20),
-            patch.object(backend, "guest_runtime_preflight", return_value=preflight),
-            patch.object(backend, "guest_config_archive", return_value=b"bundle"),
-            patch.object(backend, "sync_guest_config") as sync_config,
-        ):
-            backend.refresh_execution("linux-1", self.source, "session-1")
-
-        sync_config.assert_called_once_with("100.64.0.2", "linux", b"bundle", "c" * 20)
-
     def test_local_capture_builds_one_verified_transfer(self) -> None:
         with (
             patch.object(
@@ -1142,6 +1073,7 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
                 "linux-1", "/local", "session-1", resume=self.source
             )
 
+        self.assertEqual(result["address"], "100.64.0.2")
         self.assertEqual(result["remote_cwd"], self.source["remoteCwd"])
         self.assertEqual(result["workspace_state"], self.state)
         capture.assert_not_called()
