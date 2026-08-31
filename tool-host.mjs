@@ -5,7 +5,7 @@ import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { join, resolve } from "node:path";
 
-const protocolVersion = 2;
+const protocolVersion = 3;
 const maxProtocolLine = 1024 * 1024;
 
 if (process.platform === "win32") {
@@ -33,22 +33,26 @@ console.log = (...values) => console.error(...values);
 console.info = (...values) => console.error(...values);
 console.warn = (...values) => console.error(...values);
 
-export async function createToolHost({ cwd, encodedManifest }) {
-  if (!cwd || !encodedManifest) {
-    throw new Error("tool host requires cwd and required-tools manifest");
+export async function createToolHost({ cwd, agentDir, encodedManifest }) {
+  if (!cwd || !agentDir || !encodedManifest) {
+    throw new Error("tool host requires cwd, agent directory, and manifest");
   }
   const decodedManifest = JSON.parse(
     Buffer.from(encodedManifest, "base64").toString("utf8"),
   );
-  const tools = Array.isArray(decodedManifest)
-    ? decodedManifest
-    : decodedManifest?.tools;
-  if (!Array.isArray(tools) || tools.some((name) => typeof name !== "string")) {
-    throw new Error("tool host received an invalid required-tools manifest");
+  const tools = decodedManifest?.tools;
+  const runtimeDigest = decodedManifest?.runtimeDigest;
+  if (
+    !Array.isArray(tools) ||
+    tools.some((name) => typeof name !== "string") ||
+    typeof runtimeDigest !== "string" ||
+    !/^[0-9a-f]{20}$/.test(runtimeDigest)
+  ) {
+    throw new Error("tool host received an invalid execution manifest");
   }
   const requiredTools = new Set(tools);
   const createRuntime = async ({ cwd, sessionManager, sessionStartEvent }) => {
-    const services = await pi.createAgentSessionServices({ cwd });
+    const services = await pi.createAgentSessionServices({ cwd, agentDir });
     return {
       ...(await pi.createAgentSessionFromServices({
         services,
@@ -61,7 +65,7 @@ export async function createToolHost({ cwd, encodedManifest }) {
   };
   const runtime = await pi.createAgentSessionRuntime(createRuntime, {
     cwd,
-    agentDir: pi.getAgentDir(),
+    agentDir,
     sessionManager: pi.SessionManager.inMemory(cwd),
   });
   const session = runtime.session;
@@ -80,8 +84,12 @@ export async function createToolHost({ cwd, encodedManifest }) {
   );
   if (missingTools.length > 0) {
     await runtime.dispose();
+    const diagnostics = runtime.diagnostics
+      .map((item) => item.message)
+      .filter(Boolean)
+      .join("; ");
     const error = new Error(
-      `remote tool host is missing: ${missingTools.join(", ")}`,
+      `remote tool host is missing: ${missingTools.join(", ")}${diagnostics ? `; diagnostics: ${diagnostics}` : ""}`,
     );
     error.code = "ERR_CUA_MISSING_TOOLS";
     throw error;
@@ -317,7 +325,12 @@ export async function createToolHost({ cwd, encodedManifest }) {
     input.once("end", detach);
     input.once("close", detach);
     input.once("error", detach);
-    write({ type: "ready", protocol: protocolVersion, tools: manifest() });
+    write({
+      type: "ready",
+      protocol: protocolVersion,
+      runtimeDigest,
+      tools: manifest(),
+    });
     onData(Buffer.alloc(0));
     input.resume?.();
     await closed;
@@ -340,11 +353,14 @@ const invokedDirectly =
   resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (invokedDirectly) {
   const cwd = process.argv[2];
-  const encodedManifest = process.argv[3];
-  if (!cwd || !encodedManifest) {
-    throw new Error("usage: cua-pi-tool-host <cwd> <required-tools-base64>");
+  const agentDir = process.argv[3];
+  const encodedManifest = process.argv[4];
+  if (!cwd || !agentDir || !encodedManifest) {
+    throw new Error(
+      "usage: cua-pi-tool-host <cwd> <agent-dir> <execution-manifest-base64>",
+    );
   }
-  const host = await createToolHost({ cwd, encodedManifest });
+  const host = await createToolHost({ cwd, agentDir, encodedManifest });
   await host.attach({ input: process.stdin, output: process.stdout });
   await host.dispose();
 }

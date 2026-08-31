@@ -18,17 +18,22 @@ import {
   visibleWidth,
 } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import {
+  spawn,
+  spawnSync,
+  type ChildProcessWithoutNullStreams,
+} from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join, parse } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const extensionDir = dirname(fileURLToPath(import.meta.url));
 const backend = join(extensionDir, "backend.py");
 const windowsIdentity = join(homedir(), ".ssh", "cua_windows_ed25519");
 const sandboxKnownHosts = join(homedir(), ".ssh", "cua_known_hosts");
-const protocolVersion = 2;
+const protocolVersion = 3;
 const maxProtocolLine = 1024 * 1024;
 const windowsBrokerTask = "CuaPiDesktopToolBroker";
 const executionTargetEntry = "cua-execution-target";
@@ -148,20 +153,78 @@ class BackendError extends Error {
 
 type Destination =
   { kind: "local" } | { kind: "sandbox"; name: string; os: SandboxOS };
-type ExecutionTarget =
+type StoredExecutionTarget =
   | { kind: "local" }
   | {
       kind: "sandbox";
       name: string;
       os: SandboxOS;
-      address: string;
       executionId?: string;
       localCwd: string;
       remoteCwd: string;
       workspaceState?: WorkspaceState;
-      runtimeDigest?: string;
     };
+type ExecutionTarget =
+  | { kind: "local" }
+  | (Extract<StoredExecutionTarget, { kind: "sandbox" }> & {
+      address: string;
+      runtimeDigest: string;
+    });
 type UIContext = ExtensionContext | ExtensionCommandContext;
+
+type ToolWithSource = ReturnType<ExtensionAPI["getAllTools"]>[number];
+
+function packageRoot(path: string, packageName?: string): string | undefined {
+  let current = dirname(path);
+  for (;;) {
+    const manifest = join(current, "package.json");
+    if (existsSync(manifest)) {
+      if (!packageName) return current;
+      try {
+        const value = JSON.parse(readFileSync(manifest, "utf8")) as {
+          name?: unknown;
+        };
+        if (value.name === packageName) return current;
+      } catch {}
+    }
+    if (existsSync(join(current, ".git"))) return current;
+    const parent = dirname(current);
+    if (parent === current || current === parse(current).root) return undefined;
+    current = parent;
+  }
+}
+
+function immutablePackageSource(tool: ToolWithSource): string {
+  const source = tool.sourceInfo.source;
+  if (source.startsWith("npm:")) {
+    const match = source.match(/^npm:(@[^/]+\/[^@]+|[^@]+)(?:@.+)?$/);
+    if (!match) throw new Error(`unsupported npm tool package: ${source}`);
+    const root = packageRoot(tool.sourceInfo.path, match[1]);
+    if (!root)
+      throw new Error(`cannot locate installed tool package: ${source}`);
+    const manifest = JSON.parse(
+      readFileSync(join(root, "package.json"), "utf8"),
+    ) as {
+      version?: unknown;
+    };
+    if (typeof manifest.version !== "string" || !manifest.version)
+      throw new Error(`tool package has no version: ${source}`);
+    return `npm:${match[1]}@${manifest.version}`;
+  }
+
+  const root = packageRoot(tool.sourceInfo.path);
+  if (!root) throw new Error(`cannot locate installed tool package: ${source}`);
+  const revision = spawnSync("git", ["-C", root, "rev-parse", "HEAD"], {
+    encoding: "utf8",
+  });
+  const commit = revision.stdout.trim();
+  if (revision.status !== 0 || !/^[0-9a-f]{40,64}$/.test(commit))
+    throw new Error(`cannot resolve tool package revision: ${source}`);
+  const marker = source.lastIndexOf("@");
+  const pathStart = Math.max(source.lastIndexOf("/"), source.lastIndexOf(":"));
+  const repository = marker > pathStart ? source.slice(0, marker) : source;
+  return `${repository}@${commit}`;
+}
 
 function formatSandboxProgress(
   name: string,
@@ -218,6 +281,7 @@ type HostMessage = {
   aborted?: boolean;
   tools?: RemoteToolInfo[];
   protocol?: number;
+  runtimeDigest?: string;
   owner?: "broker" | "runtime";
   code?: string;
 };
@@ -253,21 +317,32 @@ function sshArgs(
 
 function encodedToolManifest(
   expectedTools: string[],
-  runtimeDigest?: string,
+  runtimeDigest: string,
 ): string {
   return Buffer.from(
     JSON.stringify({
       tools: expectedTools,
-      runtimeDigest: runtimeDigest ?? null,
+      runtimeDigest,
     }),
   ).toString("base64");
+}
+
+function runtimeAgentDir(
+  target: Extract<ExecutionTarget, { kind: "sandbox" }>,
+): string {
+  if (!target.runtimeDigest)
+    throw new Error(`sandbox ${target.name} has no runtime generation`);
+  return target.os === "windows"
+    ? `C:\\Users\\cua\\.cua-pi\\runtimes\\${target.runtimeDigest}\\agent`
+    : `/home/cua/.cua-pi/runtimes/${target.runtimeDigest}/agent`;
 }
 
 function hostCommand(
   target: Extract<ExecutionTarget, { kind: "sandbox" }>,
   manifest: string,
 ): string {
-  return `cd ${shellQuote(target.remoteCwd)} && exec node /home/cua/.pi/agent/cua-tool-host.mjs ${shellQuote(target.remoteCwd)} ${shellQuote(manifest)}`;
+  const agentDir = runtimeAgentDir(target);
+  return `cd ${shellQuote(target.remoteCwd)} && exec node ${shellQuote(`${agentDir}/cua-tool-host.mjs`)} ${shellQuote(target.remoteCwd)} ${shellQuote(agentDir)} ${shellQuote(manifest)}`;
 }
 
 function brokerStartupError(
@@ -287,15 +362,11 @@ class ToolBridge {
   private startPromise: Promise<void> | undefined;
   private stderr = "";
   private ready = false;
-  private hasStarted = false;
   private readonly remoteTools = new Map<string, RemoteToolInfo>();
 
   constructor(
-    private target: Extract<ExecutionTarget, { kind: "sandbox" }>,
+    private readonly target: Extract<ExecutionTarget, { kind: "sandbox" }>,
     private readonly expectedTools: string[],
-    private readonly renewTarget: (
-      target: Extract<ExecutionTarget, { kind: "sandbox" }>,
-    ) => Promise<Extract<ExecutionTarget, { kind: "sandbox" }>>,
   ) {}
 
   private send(message: Record<string, unknown>): void {
@@ -338,6 +409,10 @@ class ToolBridge {
   private open(): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       this.stderr = "";
+      if (!this.target.runtimeDigest)
+        throw new Error(
+          `sandbox ${this.target.name} has no runtime generation`,
+        );
       const manifest = encodedToolManifest(
         this.expectedTools,
         this.target.runtimeDigest,
@@ -360,6 +435,7 @@ class ToolBridge {
           `${JSON.stringify({
             type: "open",
             cwd: this.target.remoteCwd,
+            agentDir: runtimeAgentDir(this.target),
             manifest,
           })}\n`,
         );
@@ -403,7 +479,7 @@ class ToolBridge {
               child.kill();
               reject(
                 new Error(
-                  `remote ${message.owner ?? "runtime"} ${message.code ?? "open_failed"}: ${message.error ?? "tool host failed"}`,
+                  `remote ${message.owner ?? "runtime"} ${message.code ?? "open_failed"} on ${this.target.name} generation ${this.target.runtimeDigest}: ${message.error ?? "tool host failed"}`,
                 ),
               );
               return;
@@ -415,6 +491,15 @@ class ToolBridge {
                 reject(
                   new Error(
                     `remote tool protocol mismatch: expected ${protocolVersion}, got ${message.protocol ?? "none"}`,
+                  ),
+                );
+                return;
+              }
+              if (message.runtimeDigest !== this.target.runtimeDigest) {
+                child.kill();
+                reject(
+                  new Error(
+                    `remote runtime generation mismatch on ${this.target.name}: expected ${this.target.runtimeDigest}, got ${message.runtimeDigest ?? "none"}`,
                   ),
                 );
                 return;
@@ -457,21 +542,17 @@ class ToolBridge {
     });
   }
 
-  private start(): Promise<void> {
+  connect(): Promise<void> {
     if (this.ready) return Promise.resolve();
     if (this.startPromise) return this.startPromise;
-    this.startPromise = (async () => {
-      if (this.hasStarted) this.target = await this.renewTarget(this.target);
-      this.hasStarted = true;
-      await this.open();
-    })().finally(() => {
+    this.startPromise = this.open().finally(() => {
       this.startPromise = undefined;
     });
     return this.startPromise;
   }
 
-  connect(): Promise<void> {
-    return this.start();
+  get connected(): boolean {
+    return this.ready;
   }
 
   definition(name: string): RemoteToolInfo | undefined {
@@ -487,7 +568,7 @@ class ToolBridge {
       onData?: (data: Buffer) => void;
     } = {},
   ): Promise<T> {
-    await this.start();
+    if (!this.ready) throw new Error("remote tool host is not connected");
     if (options.signal?.aborted) throw new Error("aborted");
     return new Promise<T>((resolve, reject) => {
       let settled = false;
@@ -621,7 +702,7 @@ function parseWorkspaceState(value: unknown): WorkspaceState | undefined {
   return state as WorkspaceState;
 }
 
-function parseTarget(value: unknown): ExecutionTarget | undefined {
+function parseTarget(value: unknown): StoredExecutionTarget | undefined {
   if (value === undefined || value === null) return undefined;
   if (typeof value !== "object")
     throw new Error("saved execution target is invalid");
@@ -631,7 +712,6 @@ function parseTarget(value: unknown): ExecutionTarget | undefined {
     data.kind !== "sandbox" ||
     typeof data.name !== "string" ||
     (data.os !== "linux" && data.os !== "windows") ||
-    typeof data.address !== "string" ||
     typeof data.localCwd !== "string" ||
     typeof data.remoteCwd !== "string"
   )
@@ -641,7 +721,6 @@ function parseTarget(value: unknown): ExecutionTarget | undefined {
     kind: "sandbox",
     name: data.name,
     os: data.os,
-    address: data.address,
     executionId:
       typeof data.executionId === "string" && data.executionId
         ? data.executionId
@@ -649,8 +728,6 @@ function parseTarget(value: unknown): ExecutionTarget | undefined {
     localCwd: data.localCwd,
     remoteCwd: data.remoteCwd,
     workspaceState,
-    runtimeDigest:
-      typeof data.runtimeDigest === "string" ? data.runtimeDigest : undefined,
   };
 }
 
@@ -658,9 +735,15 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
   let target: ExecutionTarget = { kind: "local" };
   let placementError: Error | undefined;
   let bridge: ToolBridge | undefined;
+  let reconnectPromise: Promise<ToolBridge> | undefined;
   let workspaceDiffGeneration = 0;
-  const proxiedTools = new Set<string>();
-  const toolPackages = new Set<string>();
+  let routeCatalog:
+    | Readonly<{
+        tools: readonly string[];
+        packages: readonly string[];
+        definitions: readonly ToolWithSource[];
+      }>
+    | undefined;
 
   async function runBackend(
     request: Record<string, unknown>,
@@ -741,7 +824,9 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     });
   }
 
-  function loadSessionTarget(ctx: UIContext): ExecutionTarget | undefined {
+  function loadSessionTarget(
+    ctx: UIContext,
+  ): StoredExecutionTarget | undefined {
     return parseTarget(
       latestCustomEntryData(
         ctx.sessionManager.getEntries(),
@@ -752,7 +837,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
 
   function loadHandoffTarget(
     previousSessionFile?: string,
-  ): ExecutionTarget | undefined {
+  ): StoredExecutionTarget | undefined {
     if (!previousSessionFile) return undefined;
     const previous = SessionManager.open(previousSessionFile);
     return parseTarget(
@@ -760,8 +845,23 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     );
   }
 
-  function saveTarget(next: ExecutionTarget): void {
-    pi.appendEntry(executionTargetEntry, next);
+  function storedTarget(
+    next: ExecutionTarget | StoredExecutionTarget,
+  ): StoredExecutionTarget {
+    if (next.kind === "local") return next;
+    return {
+      kind: "sandbox",
+      name: next.name,
+      os: next.os,
+      executionId: next.executionId,
+      localCwd: next.localCwd,
+      remoteCwd: next.remoteCwd,
+      workspaceState: next.workspaceState,
+    };
+  }
+
+  function saveTarget(next: ExecutionTarget | StoredExecutionTarget): void {
+    pi.appendEntry(executionTargetEntry, storedTarget(next));
   }
 
   async function createSandbox(
@@ -1033,11 +1133,17 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     return { kind: "sandbox", name: item.name, os: item.os };
   }
 
-  function captureToolProviders(): string[] {
-    const names: string[] = [];
-    for (const tool of pi.getAllTools()) {
-      if (localTools.has(tool.name)) continue;
-      names.push(tool.name);
+  function executionRoutes(): Readonly<{
+    tools: readonly string[];
+    packages: readonly string[];
+    definitions: readonly ToolWithSource[];
+  }> {
+    if (routeCatalog) return routeCatalog;
+    const definitions = pi
+      .getAllTools()
+      .filter((tool) => !localTools.has(tool.name));
+    const packages = new Set<string>();
+    for (const tool of definitions) {
       if (
         tool.sourceInfo.origin === "package" &&
         tool.sourceInfo.scope === "user" &&
@@ -1046,10 +1152,15 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         ) &&
         !tool.sourceInfo.source.toLowerCase().includes("pi-cua")
       ) {
-        toolPackages.add(tool.sourceInfo.source);
+        packages.add(immutablePackageSource(tool));
       }
     }
-    return names;
+    routeCatalog = Object.freeze({
+      tools: Object.freeze(definitions.map((tool) => tool.name)),
+      packages: Object.freeze([...packages]),
+      definitions: Object.freeze(definitions),
+    });
+    return routeCatalog;
   }
 
   function reportTargetProgress(
@@ -1070,16 +1181,16 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     });
   }
 
-  async function prepareTarget(
+  async function materializeTarget(
     destination: Extract<Destination, { kind: "sandbox" }>,
     ctx: UIContext,
     options: {
       inheritExecution?: boolean;
-      resume?: Extract<ExecutionTarget, { kind: "sandbox" }>;
+      resume?: Extract<StoredExecutionTarget, { kind: "sandbox" }>;
     } = {},
   ): Promise<Extract<ExecutionTarget, { kind: "sandbox" }>> {
     const { inheritExecution = true, resume } = options;
-    captureToolProviders();
+    const routes = executionRoutes();
     const executionId =
       resume?.executionId ??
       (inheritExecution && target.kind === "sandbox"
@@ -1088,16 +1199,22 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       ctx.sessionManager.getSessionId();
     reportTargetProgress(destination, ctx);
     const request = {
-      action: "prepare_execution",
+      action: "activate_execution",
       name: destination.name,
       source_cwd: resume?.localCwd ?? ctx.cwd,
       execution_id: executionId,
-      tool_packages: [...toolPackages],
+      tool_packages: routes.packages,
       source:
         !resume && inheritExecution && target.kind === "sandbox"
           ? workspaceSource(target)
           : undefined,
-      resume: resume ? executionSource(resume) : undefined,
+      resume: resume
+        ? {
+            os: resume.os,
+            remoteCwd: resume.remoteCwd,
+            ...(resume.workspaceState ? { state: resume.workspaceState } : {}),
+          }
+        : undefined,
     };
     const onStatus = (status: BackendResult) =>
       reportTargetProgress(destination, ctx, status.phase, status.message);
@@ -1143,37 +1260,15 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
   }
 
   async function resumeTarget(
-    saved: ExecutionTarget,
+    saved: StoredExecutionTarget,
     ctx: UIContext,
   ): Promise<ExecutionTarget> {
     if (saved.kind === "local") return saved;
-    return prepareTarget(
+    return materializeTarget(
       { kind: "sandbox", name: saved.name, os: saved.os },
       ctx,
       { inheritExecution: false, resume: saved },
     );
-  }
-
-  async function renewExecutionTarget(
-    active: Extract<ExecutionTarget, { kind: "sandbox" }>,
-    ctx: UIContext,
-  ): Promise<Extract<ExecutionTarget, { kind: "sandbox" }>> {
-    const renewed = await prepareTarget(
-      { kind: "sandbox", name: active.name, os: active.os },
-      ctx,
-      { inheritExecution: false, resume: active },
-    );
-    if (
-      target.kind === "sandbox" &&
-      target.name === active.name &&
-      target.executionId === active.executionId
-    ) {
-      target = renewed;
-      saveTarget(renewed);
-      ctx.ui.setStatus("cua-session", undefined);
-      pi.events.emit("cua:execution-target-changed", renewed);
-    }
-    return renewed;
   }
 
   function executionSource(
@@ -1277,14 +1372,10 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     }
   }
 
-  function installProxies(): void {
-    if (target.kind !== "sandbox") return;
+  function installProxies(nextBridge: ToolBridge): void {
     const active = pi.getActiveTools();
-    for (const info of pi.getAllTools()) {
-      if (localTools.has(info.name)) continue;
-      const owned = info.sourceInfo.path.startsWith(extensionDir);
-      if (owned && proxiedTools.has(info.name)) continue;
-      const remote = bridge?.definition(info.name);
+    for (const info of executionRoutes().definitions) {
+      const remote = nextBridge.definition(info.name);
       if (!remote)
         throw new Error(`remote tool metadata missing: ${info.name}`);
       pi.registerTool({
@@ -1298,13 +1389,10 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
               onUpdate,
             );
           }
-          if (target.kind !== "sandbox" || !bridge) {
-            throw new Error(`${info.name} has no active sandbox`);
-          }
-          return bridge.execute(info.name, id, input, signal, onUpdate);
+          const activeBridge = await connectedBridge(toolCtx);
+          return activeBridge.execute(info.name, id, input, signal, onUpdate);
         },
       });
-      proxiedTools.add(info.name);
     }
     pi.setActiveTools(active);
   }
@@ -1318,13 +1406,9 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       if (options.persist !== false) saveTarget(next);
       return;
     }
-    const expectedTools = captureToolProviders();
+    const expectedTools = [...executionRoutes().tools];
     const nextBridge =
-      next.kind === "sandbox"
-        ? new ToolBridge(next, expectedTools, (active) =>
-            renewExecutionTarget(active, ctx),
-          )
-        : undefined;
+      next.kind === "sandbox" ? new ToolBridge(next, expectedTools) : undefined;
     if (next.kind === "sandbox") {
       ctx.ui.setStatus(
         "cua-session",
@@ -1343,6 +1427,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     }
     try {
       await nextBridge?.connect();
+      if (next.kind === "sandbox" && nextBridge) installProxies(nextBridge);
       if (options.persist !== false) saveTarget(next);
     } catch (error) {
       nextBridge?.close(true);
@@ -1354,10 +1439,38 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     target = next;
     placementError = undefined;
     bridge = nextBridge;
-    if (next.kind === "sandbox") installProxies();
     ctx.ui.setStatus("cua-session", undefined);
     pi.events.emit("cua:execution-target-changed", next);
     void refreshWorkspaceDiff();
+  }
+
+  async function connectedBridge(ctx: UIContext): Promise<ToolBridge> {
+    if (target.kind !== "sandbox")
+      throw new Error("this session has no active sandbox");
+    if (bridge?.connected) return bridge;
+    if (reconnectPromise) return reconnectPromise;
+    const active = target;
+    reconnectPromise = (async () => {
+      const renewed = await materializeTarget(
+        { kind: "sandbox", name: active.name, os: active.os },
+        ctx,
+        { inheritExecution: false, resume: active },
+      );
+      if (
+        target.kind !== "sandbox" ||
+        target.name !== active.name ||
+        target.executionId !== active.executionId
+      ) {
+        throw new Error("sandbox target changed while reconnecting");
+      }
+      await activate(renewed, ctx);
+      if (!bridge?.connected)
+        throw new Error(`remote tool host on ${renewed.name} did not connect`);
+      return bridge;
+    })().finally(() => {
+      reconnectPromise = undefined;
+    });
+    return reconnectPromise;
   }
 
   pi.registerTool({
@@ -1464,19 +1577,18 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
           await ctx.reload();
           return;
         }
-        if (target.kind === "sandbox" && target.name === destination.name) {
-          const refreshed = await prepareTarget(destination, ctx, {
-            inheritExecution: false,
-            resume: target,
-          });
-          saveTarget(refreshed);
-          await ctx.reload();
-          return;
-        }
         const source = target.kind === "sandbox" ? target : undefined;
-        const prepared = await prepareTarget(destination, ctx);
+        const reconnecting = source?.name === destination.name;
+        const prepared = await materializeTarget(
+          destination,
+          ctx,
+          reconnecting
+            ? { inheritExecution: false, resume: source }
+            : undefined,
+        );
         await activate(prepared, ctx);
-        if (source) await cleanupTarget(source, ctx, ctx.signal);
+        if (source && !reconnecting)
+          await cleanupTarget(source, ctx, ctx.signal);
       } catch (error) {
         ctx.ui.notify(
           error instanceof Error ? error.message : String(error),
@@ -1501,7 +1613,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     const event = pendingSessionStart;
     pendingSessionStart = undefined;
     if (!event) return;
-    let intendedTarget: ExecutionTarget | undefined;
+    let intendedTarget: StoredExecutionTarget | ExecutionTarget | undefined;
     try {
       const current = loadSessionTarget(ctx);
       if (current) {
@@ -1527,7 +1639,6 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       placementError =
         error instanceof Error ? error : new Error(String(error));
       if (intendedTarget?.kind === "sandbox") {
-        target = intendedTarget;
         ctx.ui.setStatus(
           "cua-session",
           `${intendedTarget.name} (failed to connect)`,
@@ -1564,16 +1675,20 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     };
   });
 
-  pi.on("user_bash", () => {
+  pi.on("user_bash", (_event, ctx) => {
     if (placementError) throw placementError;
     if (target.kind !== "sandbox" || !bridge) return;
     const operations: BashOperations = {
-      exec: (command, _cwd, options) =>
-        bridge!.bash(`bash-${crypto.randomUUID()}`, command, {
-          onData: options.onData,
-          signal: options.signal,
-          timeout: options.timeout,
-        }),
+      exec: async (command, _cwd, options) =>
+        (await connectedBridge(ctx)).bash(
+          `bash-${crypto.randomUUID()}`,
+          command,
+          {
+            onData: options.onData,
+            signal: options.signal,
+            timeout: options.timeout,
+          },
+        ),
     };
     return { operations };
   });
@@ -1583,7 +1698,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     let disposeBridge = false;
     try {
       if (source && shouldHandoffExecutionTarget(event.reason)) {
-        pi.appendEntry(executionTargetHandoffEntry, source);
+        pi.appendEntry(executionTargetHandoffEntry, storedTarget(source));
         const local: ExecutionTarget = { kind: "local" };
         saveTarget(local);
         target = local;

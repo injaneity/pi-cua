@@ -236,15 +236,15 @@ def bootstrap_digest(profile: str) -> str:
     return digest.hexdigest()[:20]
 
 
-def guest_config_files(packages: tuple[str, ...] = ()) -> dict[str, bytes]:
+def guest_runtime_files(packages: tuple[str, ...] = ()) -> dict[str, bytes]:
     files = remote_pi_files()
-    files[".pi/agent/settings.json"] = (
+    files["settings.json"] = (
         json.dumps({"packages": list(packages)}, indent=2).encode() + b"\n"
     )
     return files
 
 
-def config_digest(files: dict[str, bytes]) -> str:
+def runtime_digest(files: dict[str, bytes]) -> str:
     digest = hashlib.sha256()
     for path, content in sorted(files.items()):
         digest.update(path.encode())
@@ -823,9 +823,7 @@ def next_name(profile: str) -> str:
 
 
 def remote_pi_files() -> dict[str, bytes]:
-    files = {
-        ".pi/agent/cua-tool-host.mjs": (EXTENSION_DIR / "tool-host.mjs").read_bytes()
-    }
+    files = {"cua-tool-host.mjs": (EXTENSION_DIR / "tool-host.mjs").read_bytes()}
     extensions = PI_DIR / "extensions"
     if extensions.exists():
         for source in extensions.rglob("*"):
@@ -841,7 +839,7 @@ def remote_pi_files() -> dict[str, bytes]:
             ):
                 continue
             remote = PurePosixPath(*parts).as_posix()
-            files[f".pi/agent/{remote}"] = source.read_bytes()
+            files[remote] = source.read_bytes()
     return files
 
 
@@ -1125,10 +1123,7 @@ def windows_machine_health_script() -> str:
 
 
 def windows_ssh_health_script() -> str:
-    return (
-        windows_install_health_script()
-        + r"$v=gc -ea 0 C:\Users\cua\.cua-pi\config-version;"
-    )
+    return windows_install_health_script()
 
 
 def powershell_encoded_command(script: str) -> str:
@@ -1383,6 +1378,12 @@ class WorkspaceState(TypedDict):
     baselineTree: str
 
 
+class SandboxResumeSource(TypedDict):
+    os: str
+    remoteCwd: str
+    state: NotRequired[WorkspaceState]
+
+
 class SandboxExecutionSource(TypedDict):
     address: str
     os: str
@@ -1443,6 +1444,19 @@ def require_execution_source(value: object) -> SandboxExecutionSource:
     )
     if value.get("state") is not None:
         source["state"] = require_workspace_state(value["state"], "source.state")
+    return source
+
+
+def require_resume_source(value: object) -> SandboxResumeSource:
+    if not isinstance(value, dict):
+        raise TypeError("resume must be an object")
+    profile = value.get("os")
+    remote_cwd = value.get("remoteCwd")
+    if profile not in PROFILES or not isinstance(remote_cwd, str) or not remote_cwd:
+        raise TypeError("resume has invalid sandbox fields")
+    source = SandboxResumeSource(os=cast(str, profile), remoteCwd=remote_cwd)
+    if value.get("state") is not None:
+        source["state"] = require_workspace_state(value["state"], "resume.state")
     return source
 
 
@@ -1824,14 +1838,14 @@ def ssh_options(profile: str) -> list[str]:
 class GuestPreflight:
     address: str
     free_bytes: int
-    config_matches: bool
+    runtime_available: bool
     repository_available: bool
 
 
 @dataclass(frozen=True)
 class GuestRuntimePreflight:
     address: str
-    config_matches: bool
+    runtime_available: bool
 
 
 def windows_broker_ready(name: str) -> bool:
@@ -1861,16 +1875,24 @@ def windows_broker_ready(name: str) -> bool:
 
 
 def guest_runtime_preflight(
-    name: str, profile: str, config_digest: str
+    name: str, profile: str, runtime_digest: str
 ) -> GuestRuntimePreflight | None:
     if profile == "linux":
+        complete = shlex.quote(f"/home/cua/.cua-pi/runtimes/{runtime_digest}/complete")
         command = f"""set -u
 address=$({guest_health_command(profile)}) || exit 20
-config=$(cat /home/cua/.cua-pi/config-version 2>/dev/null || true)
-printf '%s|%s\n' "$address" "$config"
+if [ -f {complete} ]; then ready=1; else ready=0; fi
+printf '%s|%s\n' "$address" "$ready"
 """
     else:
-        script = windows_ssh_health_script() + '"healthy|$v"\n'
+        complete = powershell_literal(
+            rf"C:\Users\cua\.cua-pi\runtimes\{runtime_digest}\complete"
+        )
+        script = (
+            windows_ssh_health_script()
+            + f'$ready = if (Test-Path {complete}) {{ "1" }} else {{ "0" }}\n'
+            + '"healthy|$ready"\n'
+        )
         command = powershell_encoded_command(script)
     try:
         result = run_guest_ssh(
@@ -1894,7 +1916,7 @@ printf '%s|%s\n' "$address" "$config"
         return None
     return GuestRuntimePreflight(
         address=name if profile == "windows" else fields[0],
-        config_matches=fields[1] == config_digest,
+        runtime_available=fields[1] == "1",
     )
 
 
@@ -1903,15 +1925,16 @@ def guest_preflight(
     profile: str,
     remote_url: str,
     commit: str,
-    config_digest: str,
+    runtime_digest: str,
 ) -> GuestPreflight | None:
     repository_key = hashlib.sha256(remote_url.encode()).hexdigest()[:20]
     if profile == "linux":
         cache = f"/home/cua/.cache/cua-pi/git/{repository_key}.git"
+        complete = shlex.quote(f"/home/cua/.cua-pi/runtimes/{runtime_digest}/complete")
         command = f"""set -u
 address=$({guest_health_command(profile)}) || exit 20
 free_bytes=$(( $(df -Pk /home/cua | awk 'NR == 2 {{ print $4 }}') * 1024 ))
-config=$(cat /home/cua/.cua-pi/config-version 2>/dev/null || true)
+if [ -f {complete} ]; then config=1; else config=0; fi
 if git -C {shlex.quote(cache)} cat-file -e {shlex.quote(commit + "^{commit}")} 2>/dev/null || git ls-remote --exit-code {shlex.quote(remote_url)} HEAD >/dev/null 2>&1; then
   repository=1
 else
@@ -1921,10 +1944,13 @@ printf '%s|%s|%s|%s\n' "$address" "$free_bytes" "$config" "$repository"
 """
     else:
         cache = rf"C:\cua\cache\git\{repository_key}.git"
+        complete = powershell_literal(
+            rf"C:\Users\cua\.cua-pi\runtimes\{runtime_digest}\complete"
+        )
         script = (
             windows_ssh_health_script()
             + rf"""$free = [IO.DriveInfo]::new('C:\').AvailableFreeSpace
-$config=$v
+$config = if (Test-Path {complete}) {{ 1 }} else {{ 0 }}
 $repository = 0
 git -C {powershell_literal(cache)} cat-file -e {powershell_literal(commit + "^{commit}")} 2>$null
 if ($LASTEXITCODE -eq 0) {{
@@ -1960,7 +1986,7 @@ Write-Output "healthy|$free|$config|$repository"
     return GuestPreflight(
         address=name if profile == "windows" else fields[0],
         free_bytes=int(fields[1]),
-        config_matches=fields[2] == config_digest,
+        runtime_available=fields[2] == "1",
         repository_available=fields[3] == "1",
     )
 
@@ -2117,62 +2143,67 @@ def copy_guest_file(name: str, profile: str, content: bytes, remote_path: str) -
     progress(f"scp.{name}", f"uploaded {size} to {remote_path}")
 
 
-def guest_config_archive(files: dict[str, bytes]) -> bytes:
-    manifest = "".join(f"{path}\n" for path in sorted(files))
+def guest_runtime_archive(files: dict[str, bytes]) -> bytes:
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
         for path, content in files.items():
-            info = tarfile.TarInfo(path)
+            info = tarfile.TarInfo(f"agent/{path}")
             info.size = len(content)
             info.mode = 0o644
             archive.addfile(info, io.BytesIO(content))
-        content = manifest.encode()
-        info = tarfile.TarInfo(".cua-pi/config-files.new")
-        info.size = len(content)
-        info.mode = 0o600
-        archive.addfile(info, io.BytesIO(content))
     return buffer.getvalue()
 
 
-def sync_guest_config(name: str, profile: str, content: bytes, digest: str) -> None:
+def install_guest_runtime(name: str, profile: str, content: bytes, digest: str) -> None:
     if profile == "linux":
-        version_path = "/home/cua/.cua-pi/config-version"
-        archive_path = f"/tmp/cua-pi-config-{digest}.tgz"
+        archive_path = f"/tmp/cua-pi-runtime-{digest}.tgz"
         copy_guest_file(name, profile, content, archive_path)
         command = f"""set -eu
-mkdir -p /home/cua/.cua-pi
+runtimes=/home/cua/.cua-pi/runtimes
+runtime="$runtimes/{digest}"
+staging="$runtimes/.{digest}.$$"
+mkdir -p "$runtimes"
+rm -rf "$staging"
+mkdir -p "$staging"
+tar -xzf {shlex.quote(archive_path)} -C "$staging"
+PI_CODING_AGENT_DIR="$staging/agent" pi update --extensions --no-approve
+printf '%s\n' {shlex.quote(digest)} > "$staging/complete"
+rm -rf "$runtime"
+mv "$staging" "$runtime"
 if [ -f /home/cua/.cua-pi/config-files ]; then
   while IFS= read -r path; do
-    case "$path" in .pi/agent/*) rm -f -- "/home/cua/$path" ;; esac
+    case "$path" in .pi/agent/cua-tool-broker.mjs) ;; .pi/agent/*) rm -f -- "/home/cua/$path" ;; esac
   done < /home/cua/.cua-pi/config-files
 fi
-tar -xzf {shlex.quote(archive_path)} -C /home/cua
-mv /home/cua/.cua-pi/config-files.new /home/cua/.cua-pi/config-files
-pi update --extensions --no-approve
-printf '%s\n' {shlex.quote(digest)} > {shlex.quote(version_path)}
+rm -f /home/cua/.cua-pi/config-files /home/cua/.cua-pi/config-version
 rm -f {shlex.quote(archive_path)}
 """
     else:
-        version_path = r"C:\Users\cua\.cua-pi\config-version"
-        archive_path = rf"C:\Windows\Temp\cua-pi-config-{digest}.tgz"
+        archive_path = rf"C:\Windows\Temp\cua-pi-runtime-{digest}.tgz"
         copy_guest_file(name, profile, content, archive_path)
         command = rf"""$ErrorActionPreference = 'Stop'
-$cuaHome = 'C:\Users\cua'
-$state = Join-Path $cuaHome '.cua-pi'
-$manifest = Join-Path $state 'config-files'
-New-Item -ItemType Directory -Force -Path $state | Out-Null
-if (Test-Path $manifest) {{
-  Get-Content $manifest | ForEach-Object {{
+$runtimes = 'C:\Users\cua\.cua-pi\runtimes'
+$runtime = Join-Path $runtimes {powershell_literal(digest)}
+$staging = Join-Path $runtimes {powershell_literal("." + digest + "-staging")}
+New-Item -ItemType Directory -Force -Path $runtimes | Out-Null
+Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $staging
+New-Item -ItemType Directory -Force -Path $staging | Out-Null
+tar.exe -xzf {powershell_literal(archive_path)} -C $staging
+$env:PI_CODING_AGENT_DIR = Join-Path $staging 'agent'
+& 'C:\ProgramData\npm\pi.cmd' update --extensions --no-approve
+if ($LASTEXITCODE -ne 0) {{ throw "Pi package synchronization failed with exit $LASTEXITCODE" }}
+Set-Content -NoNewline -Path (Join-Path $staging 'complete') -Value {powershell_literal(digest)}
+Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $runtime
+Move-Item -Force $staging $runtime
+$legacyManifest = 'C:\Users\cua\.cua-pi\config-files'
+if (Test-Path $legacyManifest) {{
+  Get-Content $legacyManifest | ForEach-Object {{
     if ($_.StartsWith('.pi/agent/') -and $_ -ne '.pi/agent/cua-tool-broker.mjs') {{
-      Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $cuaHome ($_.Replace('/', '\\')))
+      Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path 'C:\Users\cua' ($_.Replace('/', '\\')))
     }}
   }}
 }}
-tar.exe -xzf {powershell_literal(archive_path)} -C $cuaHome
-Move-Item -Force (Join-Path $state 'config-files.new') $manifest
-& 'C:\ProgramData\npm\pi.cmd' update --extensions --no-approve
-if ($LASTEXITCODE -ne 0) {{ throw "Pi package synchronization failed with exit $LASTEXITCODE" }}
-Set-Content -NoNewline -Path {powershell_literal(version_path)} -Value {powershell_literal(digest)}
+Remove-Item -Force -ErrorAction SilentlyContinue $legacyManifest, 'C:\Users\cua\.cua-pi\config-version'
 Remove-Item -Force {powershell_literal(archive_path)}
 """
     run_guest_ssh(name, profile, command, timeout=600)
@@ -2366,7 +2397,7 @@ def execution_digest(execution_key: str) -> str:
     return hashlib.sha256(execution_key.encode()).hexdigest()
 
 
-def prepare_execution_directory(name: str, profile: str, execution_id: str) -> str:
+def execution_directory(name: str, profile: str, execution_id: str) -> str:
     root = (
         f"/home/cua/.cua-pi/executions/{execution_id}"
         if profile == "linux"
@@ -2556,12 +2587,12 @@ def sync_workspace_to_local(
     return {"local_cwd": local_cwd, "changed": bool(sandbox_patch)}
 
 
-async def prepare_execution(
+async def activate_execution(
     name: str,
     source_cwd: str,
     execution_key: str,
     source: SandboxWorkspaceSource | None = None,
-    resume: SandboxExecutionSource | None = None,
+    resume: SandboxResumeSource | None = None,
     tool_packages: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     states = {item["name"]: item for item in managed_sandboxes()}
@@ -2569,7 +2600,7 @@ async def prepare_execution(
         raise ValueError(f"unknown managed sandbox: {name}")
     profile = states[name]["os"]
     if source and resume:
-        raise ValueError("prepare_execution cannot transfer and resume simultaneously")
+        raise ValueError("activate_execution cannot transfer and resume simultaneously")
     if resume and resume["os"] != profile:
         raise ValueError("saved sandbox profile does not match its controller record")
     workspace_resume = (
@@ -2582,8 +2613,8 @@ async def prepare_execution(
     )
     identity_digest = execution_digest(execution_key)
     execution_id = identity_digest[:16]
-    config_files = guest_config_files(tool_packages)
-    guest_digest = config_digest(config_files)
+    config_files = guest_runtime_files(tool_packages)
+    guest_digest = runtime_digest(config_files)
     candidate = states[name].get("address") or name
     if repository is None:
         if source or workspace_resume:
@@ -2592,20 +2623,18 @@ async def prepare_execution(
         runtime = guest_runtime_preflight(candidate, profile, guest_digest)
         if runtime is None:
             raise SandboxRepairRequired(f"sandbox repair required: {name}")
-        if not runtime.config_matches:
-            sync_guest_config(
+        if not runtime.runtime_available:
+            install_guest_runtime(
                 runtime.address,
                 profile,
-                guest_config_archive(config_files),
+                guest_runtime_archive(config_files),
                 guest_digest,
             )
         return {
             "name": name,
             "os": profile,
             "address": runtime.address,
-            "remote_cwd": prepare_execution_directory(
-                runtime.address, profile, execution_id
-            ),
+            "remote_cwd": execution_directory(runtime.address, profile, execution_id),
             "runtime_digest": guest_digest,
         }
 
@@ -2626,11 +2655,11 @@ async def prepare_execution(
             "workspace setup requires 1 GiB free; "
             f"only {preflight.free_bytes // 1048576} MiB is available"
         )
-    if not preflight.config_matches:
-        sync_guest_config(
+    if not preflight.runtime_available:
+        install_guest_runtime(
             address,
             profile,
-            guest_config_archive(config_files),
+            guest_runtime_archive(config_files),
             guest_digest,
         )
     if workspace_resume and sandbox_workspace_exists(
@@ -2731,10 +2760,10 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         return await ensure_one(str(request.get("name") or ""))
     if action == "delete":
         return await delete_one(str(request.get("name") or ""))
-    if action == "prepare_execution":
+    if action == "activate_execution":
         execution_key = request.get("execution_id")
         if not isinstance(execution_key, str) or not execution_key:
-            raise ValueError("prepare_execution requires execution_id")
+            raise ValueError("activate_execution requires execution_id")
         source_value = request.get("source")
         source = (
             require_sandbox_source(source_value) if source_value is not None else None
@@ -2742,9 +2771,9 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         tool_packages = require_tool_packages(request.get("tool_packages", []))
         resume_value = request.get("resume")
         resume = (
-            require_execution_source(resume_value) if resume_value is not None else None
+            require_resume_source(resume_value) if resume_value is not None else None
         )
-        return await prepare_execution(
+        return await activate_execution(
             str(request.get("name") or ""),
             str(request.get("source_cwd") or ""),
             execution_key,
@@ -2753,7 +2782,7 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
             tool_packages,
         )
     raise ValueError(
-        "action must be list, create, ensure, delete, prepare_execution, sync_workspace_to_local, cleanup_workspace, or workspace_diff_status"
+        "action must be list, create, ensure, delete, activate_execution, sync_workspace_to_local, cleanup_workspace, or workspace_diff_status"
     )
 
 
@@ -2778,7 +2807,7 @@ def main() -> None:
             "create",
             "ensure",
             "delete",
-            "prepare_execution",
+            "activate_execution",
             "sync_workspace_to_local",
             "cleanup_workspace",
         }:
