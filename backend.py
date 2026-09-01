@@ -1828,10 +1828,45 @@ def ssh_options(profile: str) -> list[str]:
         f"UserKnownHostsFile={SANDBOX_KNOWN_HOSTS}",
         "-o",
         "ConnectTimeout=10",
+        "-o",
+        "ControlMaster=no",
+        "-o",
+        f"ControlPath={Path.home() / '.ssh' / 'cua-%C'}",
+        "-o",
+        "ServerAliveInterval=15",
+        "-o",
+        "ServerAliveCountMax=2",
     ]
     if profile == "windows":
         options[:0] = ["-i", str(ensure_windows_identity())]
     return options
+
+
+def ensure_guest_ssh_master(name: str, profile: str) -> None:
+    """Keep one detached transport alive for activation and bridge startup."""
+    try:
+        subprocess.run(
+            [
+                "ssh",
+                "-o",
+                "ControlMaster=auto",
+                "-o",
+                "ControlPersist=60",
+                *ssh_options(profile),
+                "-N",
+                "-f",
+                f"cua@{name}",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+            check=False,
+            start_new_session=True,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        # The ordinary SSH preflight retains the actionable transport error.
+        pass
 
 
 @dataclass(frozen=True)
@@ -2594,6 +2629,7 @@ async def activate_execution(
     source: SandboxWorkspaceSource | None = None,
     resume: SandboxResumeSource | None = None,
     tool_packages: tuple[str, ...] = (),
+    verify_resume: bool = True,
 ) -> dict[str, Any]:
     states = {item["name"]: item for item in managed_sandboxes()}
     if name not in states:
@@ -2606,16 +2642,27 @@ async def activate_execution(
     workspace_resume = (
         cast(SandboxWorkspaceSource, resume) if resume and "state" in resume else None
     )
-    repository = (
-        None
-        if resume and not workspace_resume
-        else discover_workspace(Path(source_cwd).expanduser().resolve())
-    )
     identity_digest = execution_digest(execution_key)
     execution_id = identity_digest[:16]
     config_files = guest_runtime_files(tool_packages)
     guest_digest = runtime_digest(config_files)
     candidate = states[name].get("address") or name
+    if resume and not verify_resume:
+        return {
+            "name": name,
+            "os": profile,
+            "address": candidate,
+            "remote_cwd": resume["remoteCwd"],
+            **({"workspace_state": resume["state"]} if "state" in resume else {}),
+            "runtime_digest": guest_digest,
+            "activation_verified": False,
+        }
+    repository = (
+        None
+        if resume and not workspace_resume
+        else discover_workspace(Path(source_cwd).expanduser().resolve())
+    )
+    ensure_guest_ssh_master(candidate, profile)
     if repository is None:
         if source or workspace_resume:
             raise RuntimeError("saved Git workspace is no longer available locally")
@@ -2636,6 +2683,7 @@ async def activate_execution(
             "address": runtime.address,
             "remote_cwd": execution_directory(runtime.address, profile, execution_id),
             "runtime_digest": guest_digest,
+            "activation_verified": True,
         }
 
     progress("sandbox.preflight", "checking health, configuration, disk, and cache")
@@ -2672,6 +2720,7 @@ async def activate_execution(
             "remote_cwd": workspace_resume["remoteCwd"],
             "workspace_state": workspace_resume["state"],
             "runtime_digest": guest_digest,
+            "activation_verified": True,
         }
 
     transfer = (
@@ -2720,6 +2769,7 @@ async def activate_execution(
         "remote_cwd": remote_cwd,
         "workspace_state": transfer.state,
         "runtime_digest": guest_digest,
+        "activation_verified": True,
     }
 
 
@@ -2773,6 +2823,9 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         resume = (
             require_resume_source(resume_value) if resume_value is not None else None
         )
+        verify_resume = request.get("verify_resume", True)
+        if not isinstance(verify_resume, bool):
+            raise TypeError("activate_execution verify_resume must be a boolean")
         return await activate_execution(
             str(request.get("name") or ""),
             str(request.get("source_cwd") or ""),
@@ -2780,6 +2833,7 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
             source,
             resume,
             tool_packages,
+            verify_resume,
         )
     raise ValueError(
         "action must be list, create, ensure, delete, activate_execution, sync_workspace_to_local, cleanup_workspace, or workspace_diff_status"

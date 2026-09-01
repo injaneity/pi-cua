@@ -137,6 +137,7 @@ type BackendResult = {
   remote_cwd?: string;
   workspace_state?: WorkspaceState;
   runtime_digest?: string;
+  activation_verified?: boolean;
   additions?: number;
   deletions?: number;
   pending_sync?: boolean;
@@ -169,6 +170,7 @@ type ExecutionTarget =
   | (Extract<StoredExecutionTarget, { kind: "sandbox" }> & {
       address: string;
       runtimeDigest: string;
+      activationVerified: boolean;
     });
 type UIContext = ExtensionContext | ExtensionCommandContext;
 
@@ -303,6 +305,10 @@ function sshArgs(
     `UserKnownHostsFile=${sandboxKnownHosts}`,
     "-o",
     "ConnectTimeout=10",
+    "-o",
+    "ControlMaster=no",
+    "-o",
+    `ControlPath=${join(homedir(), ".ssh", "cua-%C")}`,
     "-o",
     "ServerAliveInterval=15",
     "-o",
@@ -1187,9 +1193,10 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     options: {
       inheritExecution?: boolean;
       resume?: Extract<StoredExecutionTarget, { kind: "sandbox" }>;
+      verifyResume?: boolean;
     } = {},
   ): Promise<Extract<ExecutionTarget, { kind: "sandbox" }>> {
-    const { inheritExecution = true, resume } = options;
+    const { inheritExecution = true, resume, verifyResume = false } = options;
     const routes = executionRoutes();
     const executionId =
       resume?.executionId ??
@@ -1204,6 +1211,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       source_cwd: resume?.localCwd ?? ctx.cwd,
       execution_id: executionId,
       tool_packages: routes.packages,
+      verify_resume: !resume || verifyResume,
       source:
         !resume && inheritExecution && target.kind === "sandbox"
           ? workspaceSource(target)
@@ -1238,7 +1246,8 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       if (
         typeof result.remote_cwd !== "string" ||
         typeof result.address !== "string" ||
-        typeof result.runtime_digest !== "string"
+        typeof result.runtime_digest !== "string" ||
+        typeof result.activation_verified !== "boolean"
       ) {
         throw new Error("cua backend returned an invalid execution target");
       }
@@ -1251,6 +1260,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         remoteCwd: result.remote_cwd,
         workspaceState: parseWorkspaceState(result.workspace_state),
         runtimeDigest: result.runtime_digest,
+        activationVerified: result.activation_verified,
       };
     } catch (error) {
       ctx.ui.setStatus("cua-session", undefined);
@@ -1407,28 +1417,48 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       return;
     }
     const expectedTools = [...executionRoutes().tools];
-    const nextBridge =
-      next.kind === "sandbox" ? new ToolBridge(next, expectedTools) : undefined;
-    if (next.kind === "sandbox") {
+    let resolved = next;
+    let nextBridge =
+      resolved.kind === "sandbox"
+        ? new ToolBridge(resolved, expectedTools)
+        : undefined;
+    if (resolved.kind === "sandbox") {
       ctx.ui.setStatus(
         "cua-session",
         formatSandboxProgress(
-          next.name,
+          resolved.name,
           "connect.tools",
           "starting remote tools",
         ),
       );
       pi.events.emit("cua:execution-target-changed", {
-        ...next,
+        ...resolved,
         state: "connecting",
         phase: "connect.tools",
         message: "starting remote tools",
       });
     }
     try {
-      await nextBridge?.connect();
-      if (next.kind === "sandbox" && nextBridge) installProxies(nextBridge);
-      if (options.persist !== false) saveTarget(next);
+      try {
+        await nextBridge?.connect();
+      } catch (error) {
+        if (resolved.kind !== "sandbox" || resolved.activationVerified)
+          throw error;
+        nextBridge?.close(true);
+        resolved = await materializeTarget(
+          { kind: "sandbox", name: resolved.name, os: resolved.os },
+          ctx,
+          {
+            inheritExecution: false,
+            resume: resolved,
+            verifyResume: true,
+          },
+        );
+        nextBridge = new ToolBridge(resolved, expectedTools);
+        await nextBridge.connect();
+      }
+      if (resolved.kind === "sandbox" && nextBridge) installProxies(nextBridge);
+      if (options.persist !== false) saveTarget(resolved);
     } catch (error) {
       nextBridge?.close(true);
       ctx.ui.setStatus("cua-session", undefined);
@@ -1436,11 +1466,11 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       throw error;
     }
     bridge?.close(true);
-    target = next;
+    target = resolved;
     placementError = undefined;
     bridge = nextBridge;
     ctx.ui.setStatus("cua-session", undefined);
-    pi.events.emit("cua:execution-target-changed", next);
+    pi.events.emit("cua:execution-target-changed", resolved);
     void refreshWorkspaceDiff();
   }
 

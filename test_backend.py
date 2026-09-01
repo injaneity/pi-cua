@@ -916,6 +916,42 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotEqual(first, second)
 
+    async def test_unverified_resume_defers_remote_checks_to_the_host(self) -> None:
+        resume = backend.SandboxResumeSource(
+            os="linux",
+            remoteCwd="/home/cua/workspaces/existing",
+        )
+        with (
+            patch.object(
+                backend,
+                "managed_sandboxes",
+                return_value=[
+                    {
+                        "name": "linux-1",
+                        "os": "linux",
+                        "address": "100.64.0.2",
+                    }
+                ],
+            ),
+            patch.object(backend, "discover_workspace") as discover,
+            patch.object(backend, "ensure_guest_ssh_master") as master,
+            patch.object(backend, "guest_runtime_preflight") as preflight,
+        ):
+            result = await backend.activate_execution(
+                "linux-1",
+                "/local",
+                "session-1",
+                resume=resume,
+                verify_resume=False,
+            )
+
+        self.assertEqual(result["address"], "100.64.0.2")
+        self.assertEqual(result["remote_cwd"], resume["remoteCwd"])
+        self.assertFalse(result["activation_verified"])
+        discover.assert_not_called()
+        master.assert_not_called()
+        preflight.assert_not_called()
+
     async def test_activate_execution_resumes_without_git_state(self) -> None:
         resume = backend.SandboxResumeSource(
             os="linux",
