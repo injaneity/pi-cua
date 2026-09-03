@@ -143,6 +143,7 @@ class ExternalMacTests(unittest.IsolatedAsyncioTestCase):
                 "run_guest_ssh",
                 return_value=subprocess.CompletedProcess([], 0, "100.64.0.9\n", ""),
             ) as run,
+            patch.object(backend, "pi_version", return_value="0.84.4"),
             patch.object(backend, "local_tailscale_identity") as tailnet,
         ):
             result = await backend.ensure_one("mac-1")
