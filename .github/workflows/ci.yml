@@ -10,7 +10,7 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
           enable-cache: false
       - uses: actions/setup-node@v7
