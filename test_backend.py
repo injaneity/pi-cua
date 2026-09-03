@@ -623,6 +623,7 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn(b'request.type === "execute"', host)
         self.assertIn(b"ERR_CUA_MISSING_TOOLS", host)
         self.assertIn(b"await runtime.dispose()", host)
+        self.assertIn(b"npm_config_cache", host)
         self.assertNotIn("auth.json", files)
         self.assertNotIn("models.json", files)
         self.assertNotIn("settings.json", files)
@@ -715,6 +716,7 @@ class WorkspaceTests(unittest.TestCase):
         script = run.call_args.args[2]
         self.assertIn("/Users/administrator/.cua-pi/runtimes", script)
         self.assertIn("PATH=/usr/local/bin:/usr/bin:/bin", script)
+        self.assertIn('npm_config_cache="$staging/.npm-cache"', script)
         self.assertNotIn("config-files", script)
 
     def test_guest_bundle_contains_only_requested_tool_packages(self) -> None:

@@ -2393,7 +2393,7 @@ mkdir -p "$runtimes"
 rm -rf "$staging"
 mkdir -p "$staging"
 tar -xzf {shlex.quote(archive_path)} -C "$staging"
-npm_config_omit=dev npm_config_legacy_peer_deps=true PI_CODING_AGENT_DIR="$staging/agent" pi update --extensions --no-approve
+npm_config_cache="$staging/.npm-cache" npm_config_omit=dev npm_config_legacy_peer_deps=true PI_CODING_AGENT_DIR="$staging/agent" pi update --extensions --no-approve
 printf '%s\n' {shlex.quote(digest)} > "$staging/complete"
 rm -rf "$runtime"
 mv "$staging" "$runtime"
