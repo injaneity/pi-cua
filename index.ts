@@ -968,7 +968,8 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       });
       return { kind: "sandbox", ...sandbox };
     } catch (error) {
-      pi.events.emit("cua:execution-target-changed", target);
+      if (!runtimeClosed)
+        pi.events.emit("cua:execution-target-changed", target);
       throw error;
     }
   }
@@ -1234,6 +1235,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     phase?: string,
     message?: string,
   ): void {
+    if (runtimeClosed) return;
     ctx.ui.setStatus(
       "cua-session",
       formatSandboxProgress(active.name, phase, message),
@@ -1313,6 +1315,10 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       ) {
         throw new Error("cua backend returned an invalid execution target");
       }
+      if (runtimeClosed)
+        throw new Error(
+          "extension runtime was replaced during sandbox connection",
+        );
       pi.events.emit("cua:sandboxes-changed", result);
       return {
         ...destination,
@@ -1326,8 +1332,10 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         reconciled: result.reconciled,
       };
     } catch (error) {
-      ctx.ui.setStatus("cua-session", undefined);
-      pi.events.emit("cua:execution-target-changed", target);
+      if (!runtimeClosed) {
+        ctx.ui.setStatus("cua-session", undefined);
+        pi.events.emit("cua:execution-target-changed", target);
+      }
       throw error;
     }
   }
@@ -1475,6 +1483,10 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     ctx: UIContext,
     options: { persist?: boolean } = {},
   ): Promise<void> {
+    if (runtimeClosed)
+      throw new Error(
+        "extension runtime was replaced during sandbox connection",
+      );
     if (next === target && bridge) {
       if (options.persist !== false) saveTarget(next);
       return;
