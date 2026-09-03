@@ -177,7 +177,7 @@ type ExecutionTarget =
       reconciled: boolean;
     });
 type ExecutionTargetIntent = {
-  destination: Extract<Destination, { kind: "sandbox" }>;
+  destination: Destination;
   source: StoredExecutionTarget;
 };
 type UIContext = ExtensionContext | ExtensionCommandContext;
@@ -372,6 +372,7 @@ class ToolBridge {
   private startPromise: Promise<void> | undefined;
   private stderr = "";
   private ready = false;
+  private closed = false;
   private readonly remoteTools = new Map<string, RemoteToolInfo>();
 
   constructor(
@@ -462,6 +463,7 @@ class ToolBridge {
         );
       }, 300_000);
       child.stdout.on("data", (chunk: Buffer) => {
+        if (this.closed || this.child !== child) return;
         stdout += decoder.write(chunk);
         if (stdout.length > maxProtocolLine && !stdout.includes("\n")) {
           child.kill();
@@ -553,6 +555,8 @@ class ToolBridge {
   }
 
   connect(): Promise<void> {
+    if (this.closed)
+      return Promise.reject(new Error("remote tool bridge is closed"));
     if (this.ready) return Promise.resolve();
     if (this.startPromise) return this.startPromise;
     this.startPromise = this.open().finally(() => {
@@ -647,16 +651,23 @@ class ToolBridge {
   }
 
   close(dispose = false): void {
+    if (this.closed) return;
+    this.closed = true;
+    const error = new Error("remote tool bridge is closed");
+    for (const request of this.pending.values()) request.reject(error);
+    this.pending.clear();
     const child = this.child;
+    this.child = undefined;
+    this.ready = false;
     if (!child) return;
     if (child.stdin.writable) {
-      this.send({ type: dispose ? "shutdown" : "detach" });
+      child.stdin.write(
+        `${JSON.stringify({ type: dispose ? "shutdown" : "detach" })}\n`,
+      );
       child.stdin.end();
     }
     const killTimer = setTimeout(() => child.kill(), 1_000);
     killTimer.unref();
-    this.child = undefined;
-    this.ready = false;
   }
 }
 
@@ -751,23 +762,27 @@ function parseTargetIntent(value: unknown): ExecutionTargetIntent | undefined {
     throw new Error("saved sandbox connection intent is invalid");
   const data = value as Record<string, unknown>;
   const destination = data.destination as Record<string, unknown> | undefined;
-  if (
-    !destination ||
-    destination.kind !== "sandbox" ||
-    typeof destination.name !== "string" ||
-    (destination.os !== "linux" && destination.os !== "windows")
-  )
+  if (!destination)
     throw new Error("saved sandbox connection intent is invalid");
-  const source = parseTarget(data.source);
-  if (!source) throw new Error("saved sandbox connection intent is invalid");
-  return {
-    destination: {
+  let parsedDestination: Destination;
+  if (destination.kind === "local") {
+    parsedDestination = { kind: "local" };
+  } else if (
+    destination.kind === "sandbox" &&
+    typeof destination.name === "string" &&
+    (destination.os === "linux" || destination.os === "windows")
+  ) {
+    parsedDestination = {
       kind: "sandbox",
       name: destination.name,
       os: destination.os,
-    },
-    source,
-  };
+    };
+  } else {
+    throw new Error("saved sandbox connection intent is invalid");
+  }
+  const source = parseTarget(data.source);
+  if (!source) throw new Error("saved sandbox connection intent is invalid");
+  return { destination: parsedDestination, source };
 }
 
 export default function cuaSandbox(pi: ExtensionAPI): void {
@@ -916,9 +931,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     pi.appendEntry(executionTargetEntry, storedTarget(next));
   }
 
-  function saveConnectionIntent(
-    destination: Extract<Destination, { kind: "sandbox" }>,
-  ): void {
+  function saveConnectionIntent(destination: Destination): void {
     pi.appendEntry(executionTargetIntentEntry, {
       destination,
       source: storedTarget(target),
@@ -950,6 +963,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         { action: "create", os, ...resources },
         ctx.signal,
         (status) => {
+          if (runtimeClosed) return;
           pi.events.emit("cua:execution-target-changed", {
             kind: "progress",
             state: "creating",
@@ -959,6 +973,10 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
           });
         },
       );
+      if (runtimeClosed)
+        throw new Error(
+          "extension runtime was replaced during sandbox creation",
+        );
       const sandbox = requireSandbox(result);
       pi.events.emit("cua:sandboxes-changed", result);
       pi.events.emit("cua:execution-target-changed", {
@@ -1405,6 +1423,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
   }
 
   async function refreshWorkspaceDiff(): Promise<void> {
+    if (runtimeClosed) return;
     const generation = ++workspaceDiffGeneration;
     const active = target;
     if (active.kind === "local") {
@@ -1432,6 +1451,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         new AbortController().signal,
       );
       if (
+        runtimeClosed ||
         generation !== workspaceDiffGeneration ||
         target.kind !== "sandbox" ||
         target.name !== active.name ||
@@ -1663,6 +1683,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         await ctx.waitForIdle();
         const destination = await destinationFromArgument(args, ctx);
         if (!destination) return;
+        saveConnectionIntent(destination);
         if (destination.kind === "local") {
           const source = target.kind === "sandbox" ? target : undefined;
           if (source?.workspaceState) {
@@ -1684,12 +1705,12 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
           const local: ExecutionTarget = { kind: "local" };
           await activate(local, ctx);
           if (source) await cleanupTarget(source, ctx, ctx.signal);
+          clearConnectionIntent();
           await ctx.reload();
           return;
         }
         const source = target.kind === "sandbox" ? target : undefined;
         const reconnecting = source?.name === destination.name;
-        saveConnectionIntent(destination);
         const prepared = await materializeTarget(
           destination,
           ctx,
@@ -1733,17 +1754,36 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       const intent = loadConnectionIntent(ctx);
       if (intent) {
         intendedTarget = intent.destination;
+        let source: Extract<ExecutionTarget, { kind: "sandbox" }> | undefined;
         if (intent.source.kind === "sandbox") {
-          const source = await resumeTarget(intent.source, ctx);
-          if (source.kind !== "sandbox")
+          const resumed = await resumeTarget(intent.source, ctx);
+          if (resumed.kind !== "sandbox")
             throw new Error("sandbox connection intent lost its source target");
+          source = resumed;
           await activate(source, ctx, { persist: false });
-          if (source.name === intent.destination.name) {
-            clearConnectionIntent();
-            return;
-          }
         } else {
           await activate({ kind: "local" }, ctx, { persist: false });
+        }
+        if (intent.destination.kind === "local") {
+          if (source?.workspaceState) {
+            const activeSource = source;
+            await syncTargetToLocal(activeSource, undefined, (status) =>
+              reportTargetProgress(
+                activeSource,
+                ctx,
+                status.phase,
+                status.message,
+              ),
+            );
+          }
+          await activate({ kind: "local" }, ctx);
+          if (source) await cleanupTarget(source, ctx);
+          clearConnectionIntent();
+          return;
+        }
+        if (source?.name === intent.destination.name) {
+          clearConnectionIntent();
+          return;
         }
         const prepared = await materializeTarget(intent.destination, ctx);
         intendedTarget = prepared;
@@ -1833,6 +1873,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
 
   pi.on("session_shutdown", async (event, ctx) => {
     runtimeClosed = true;
+    workspaceDiffGeneration += 1;
     const source = target.kind === "sandbox" ? target : undefined;
     let disposeBridge = false;
     try {
