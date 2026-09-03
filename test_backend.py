@@ -422,13 +422,16 @@ class WorkspaceTests(unittest.TestCase):
             )
 
     def test_linux_preflight_combines_health_config_disk_and_repository(self) -> None:
-        with patch.object(
-            backend,
-            "run_guest_ssh",
-            return_value=subprocess.CompletedProcess(
-                [], 0, "100.64.0.2|1073741824|1|1\n", ""
-            ),
-        ) as run:
+        with (
+            patch.object(backend, "bootstrap_digest", return_value="b" * 20),
+            patch.object(
+                backend,
+                "run_guest_ssh",
+                return_value=subprocess.CompletedProcess(
+                    [], 0, "100.64.0.2|1073741824|1|1\n", ""
+                ),
+            ) as run,
+        ):
             result = backend.guest_preflight(
                 "linux-1",
                 "linux",
@@ -1381,11 +1384,14 @@ class WindowsDesktopBrokerTests(unittest.TestCase):
 
     def test_controller_probes_the_broker_forwarding_protocol(self) -> None:
         response = json.dumps({"type": "broker_ready"}) + "\n"
-        with patch.object(
-            backend.subprocess,
-            "run",
-            return_value=subprocess.CompletedProcess([], 0, response, ""),
-        ) as run:
+        with (
+            patch.object(backend, "ensure_windows_identity"),
+            patch.object(
+                backend.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess([], 0, response, ""),
+            ) as run,
+        ):
             self.assertTrue(backend.windows_broker_ready("100.64.0.2"))
 
         self.assertIn("-W", run.call_args.args[0])
@@ -1407,10 +1413,13 @@ class WindowsDesktopBrokerTests(unittest.TestCase):
 
     def test_runtime_preflight_rejects_an_unavailable_broker(self) -> None:
         with (
+            patch.object(backend, "bootstrap_digest", return_value="b" * 20),
             patch.object(
                 backend,
                 "run_guest_ssh",
-                return_value=subprocess.CompletedProcess([], 0, "healthy|1\n", ""),
+                return_value=subprocess.CompletedProcess(
+                    [], 0, "healthy|1073741824|1\n", ""
+                ),
             ),
             patch.object(backend, "windows_broker_ready", return_value=False),
         ):
