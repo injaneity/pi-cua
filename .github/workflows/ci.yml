@@ -9,9 +9,11 @@ jobs:
   verify:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: false
+      - uses: actions/setup-node@v7
         with:
           node-version: 22.20.0
       - run: npm install --no-save typescript prettier @types/node @earendil-works/pi-coding-agent @earendil-works/pi-ai @earendil-works/pi-tui typebox
