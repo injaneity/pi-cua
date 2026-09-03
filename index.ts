@@ -38,6 +38,7 @@ const maxProtocolLine = 1024 * 1024;
 const windowsBrokerTask = "CuaPiDesktopToolBroker";
 const executionTargetEntry = "cua-execution-target";
 const executionTargetHandoffEntry = "cua-execution-target-handoff";
+const executionTargetIntentEntry = "cua-execution-target-intent";
 const localTools = new Set(["cua_sandbox", "report_papercut"]);
 
 function latestCustomEntryData(
@@ -175,6 +176,10 @@ type ExecutionTarget =
       runtimeDigest: string;
       reconciled: boolean;
     });
+type ExecutionTargetIntent = {
+  destination: Extract<Destination, { kind: "sandbox" }>;
+  source: StoredExecutionTarget;
+};
 type UIContext = ExtensionContext | ExtensionCommandContext;
 
 type ToolWithSource = ReturnType<ExtensionAPI["getAllTools"]>[number];
@@ -740,12 +745,38 @@ function parseTarget(value: unknown): StoredExecutionTarget | undefined {
   };
 }
 
+function parseTargetIntent(value: unknown): ExecutionTargetIntent | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "object")
+    throw new Error("saved sandbox connection intent is invalid");
+  const data = value as Record<string, unknown>;
+  const destination = data.destination as Record<string, unknown> | undefined;
+  if (
+    !destination ||
+    destination.kind !== "sandbox" ||
+    typeof destination.name !== "string" ||
+    (destination.os !== "linux" && destination.os !== "windows")
+  )
+    throw new Error("saved sandbox connection intent is invalid");
+  const source = parseTarget(data.source);
+  if (!source) throw new Error("saved sandbox connection intent is invalid");
+  return {
+    destination: {
+      kind: "sandbox",
+      name: destination.name,
+      os: destination.os,
+    },
+    source,
+  };
+}
+
 export default function cuaSandbox(pi: ExtensionAPI): void {
   let target: ExecutionTarget = { kind: "local" };
   let placementError: Error | undefined;
   let bridge: ToolBridge | undefined;
   let reconnectPromise: Promise<ToolBridge> | undefined;
   let workspaceDiffGeneration = 0;
+  let runtimeClosed = false;
   let routeCatalog:
     | Readonly<{
         tools: readonly string[];
@@ -844,6 +875,17 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     );
   }
 
+  function loadConnectionIntent(
+    ctx: UIContext,
+  ): ExecutionTargetIntent | undefined {
+    return parseTargetIntent(
+      latestCustomEntryData(
+        ctx.sessionManager.getEntries(),
+        executionTargetIntentEntry,
+      ),
+    );
+  }
+
   function loadHandoffTarget(
     previousSessionFile?: string,
   ): StoredExecutionTarget | undefined {
@@ -872,6 +914,19 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
 
   function saveTarget(next: ExecutionTarget | StoredExecutionTarget): void {
     pi.appendEntry(executionTargetEntry, storedTarget(next));
+  }
+
+  function saveConnectionIntent(
+    destination: Extract<Destination, { kind: "sandbox" }>,
+  ): void {
+    pi.appendEntry(executionTargetIntentEntry, {
+      destination,
+      source: storedTarget(target),
+    });
+  }
+
+  function clearConnectionIntent(): void {
+    pi.appendEntry(executionTargetIntentEntry, null);
   }
 
   async function createSandbox(
@@ -1464,12 +1519,18 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         nextBridge = new ToolBridge(resolved, expectedTools);
         await nextBridge.connect();
       }
+      if (runtimeClosed)
+        throw new Error(
+          "extension runtime was replaced during sandbox connection",
+        );
       if (resolved.kind === "sandbox" && nextBridge) installProxies(nextBridge);
       if (options.persist !== false) saveTarget(resolved);
     } catch (error) {
       nextBridge?.close(true);
-      ctx.ui.setStatus("cua-session", undefined);
-      pi.events.emit("cua:execution-target-changed", target);
+      if (!runtimeClosed) {
+        ctx.ui.setStatus("cua-session", undefined);
+        pi.events.emit("cua:execution-target-changed", target);
+      }
       throw error;
     }
     bridge?.close(true);
@@ -1616,6 +1677,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         }
         const source = target.kind === "sandbox" ? target : undefined;
         const reconnecting = source?.name === destination.name;
+        saveConnectionIntent(destination);
         const prepared = await materializeTarget(
           destination,
           ctx,
@@ -1624,9 +1686,12 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
             : undefined,
         );
         await activate(prepared, ctx);
+        clearConnectionIntent();
         if (source && !reconnecting)
           await cleanupTarget(source, ctx, ctx.signal);
       } catch (error) {
+        if (runtimeClosed) return;
+        clearConnectionIntent();
         ctx.ui.notify(
           error instanceof Error ? error.message : String(error),
           "error",
@@ -1650,8 +1715,30 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     const event = pendingSessionStart;
     pendingSessionStart = undefined;
     if (!event) return;
-    let intendedTarget: StoredExecutionTarget | ExecutionTarget | undefined;
+    let intendedTarget:
+      StoredExecutionTarget | ExecutionTarget | Destination | undefined;
     try {
+      const intent = loadConnectionIntent(ctx);
+      if (intent) {
+        intendedTarget = intent.destination;
+        if (intent.source.kind === "sandbox") {
+          const source = await resumeTarget(intent.source, ctx);
+          if (source.kind !== "sandbox")
+            throw new Error("sandbox connection intent lost its source target");
+          await activate(source, ctx, { persist: false });
+          if (source.name === intent.destination.name) {
+            clearConnectionIntent();
+            return;
+          }
+        } else {
+          await activate({ kind: "local" }, ctx, { persist: false });
+        }
+        const prepared = await materializeTarget(intent.destination, ctx);
+        intendedTarget = prepared;
+        await activate(prepared, ctx);
+        clearConnectionIntent();
+        return;
+      }
       const current = loadSessionTarget(ctx);
       if (current) {
         intendedTarget = current;
@@ -1673,6 +1760,8 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       }
       await activate({ kind: "local" }, ctx);
     } catch (error) {
+      if (runtimeClosed) return;
+      clearConnectionIntent();
       placementError =
         error instanceof Error ? error : new Error(String(error));
       if (intendedTarget?.kind === "sandbox") {
@@ -1731,6 +1820,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", async (event, ctx) => {
+    runtimeClosed = true;
     const source = target.kind === "sandbox" ? target : undefined;
     let disposeBridge = false;
     try {
