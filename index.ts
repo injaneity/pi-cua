@@ -112,6 +112,7 @@ type SandboxItem = {
   os: SandboxOS;
   pool: string;
   address?: string;
+  generation?: string;
   online: boolean;
 };
 type WorkspaceState = {
@@ -137,7 +138,8 @@ type BackendResult = {
   remote_cwd?: string;
   workspace_state?: WorkspaceState;
   runtime_digest?: string;
-  activation_verified?: boolean;
+  reconciled?: boolean;
+  sandbox_generation?: string;
   additions?: number;
   deletions?: number;
   pending_sync?: boolean;
@@ -161,6 +163,7 @@ type StoredExecutionTarget =
       name: string;
       os: SandboxOS;
       executionId?: string;
+      sandboxGeneration?: string;
       localCwd: string;
       remoteCwd: string;
       workspaceState?: WorkspaceState;
@@ -170,7 +173,7 @@ type ExecutionTarget =
   | (Extract<StoredExecutionTarget, { kind: "sandbox" }> & {
       address: string;
       runtimeDigest: string;
-      activationVerified: boolean;
+      reconciled: boolean;
     });
 type UIContext = ExtensionContext | ExtensionCommandContext;
 
@@ -305,10 +308,6 @@ function sshArgs(
     `UserKnownHostsFile=${sandboxKnownHosts}`,
     "-o",
     "ConnectTimeout=10",
-    "-o",
-    "ControlMaster=no",
-    "-o",
-    `ControlPath=${join(homedir(), ".ssh", "cua-%C")}`,
     "-o",
     "ServerAliveInterval=15",
     "-o",
@@ -731,6 +730,10 @@ function parseTarget(value: unknown): StoredExecutionTarget | undefined {
       typeof data.executionId === "string" && data.executionId
         ? data.executionId
         : undefined,
+    sandboxGeneration:
+      typeof data.sandboxGeneration === "string" && data.sandboxGeneration
+        ? data.sandboxGeneration
+        : undefined,
     localCwd: data.localCwd,
     remoteCwd: data.remoteCwd,
     workspaceState,
@@ -860,6 +863,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       name: next.name,
       os: next.os,
       executionId: next.executionId,
+      sandboxGeneration: next.sandboxGeneration,
       localCwd: next.localCwd,
       remoteCwd: next.remoteCwd,
       workspaceState: next.workspaceState,
@@ -1193,10 +1197,10 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     options: {
       inheritExecution?: boolean;
       resume?: Extract<StoredExecutionTarget, { kind: "sandbox" }>;
-      verifyResume?: boolean;
+      forceReconcile?: boolean;
     } = {},
   ): Promise<Extract<ExecutionTarget, { kind: "sandbox" }>> {
-    const { inheritExecution = true, resume, verifyResume = false } = options;
+    const { inheritExecution = true, resume, forceReconcile = false } = options;
     const routes = executionRoutes();
     const executionId =
       resume?.executionId ??
@@ -1211,7 +1215,8 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       source_cwd: resume?.localCwd ?? ctx.cwd,
       execution_id: executionId,
       tool_packages: routes.packages,
-      verify_resume: !resume || verifyResume,
+      force_reconcile: !resume || forceReconcile,
+      sandbox_generation: resume?.sandboxGeneration,
       source:
         !resume && inheritExecution && target.kind === "sandbox"
           ? workspaceSource(target)
@@ -1247,7 +1252,9 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         typeof result.remote_cwd !== "string" ||
         typeof result.address !== "string" ||
         typeof result.runtime_digest !== "string" ||
-        typeof result.activation_verified !== "boolean"
+        typeof result.reconciled !== "boolean" ||
+        (result.sandbox_generation !== undefined &&
+          typeof result.sandbox_generation !== "string")
       ) {
         throw new Error("cua backend returned an invalid execution target");
       }
@@ -1256,11 +1263,12 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         ...destination,
         address: result.address,
         executionId,
+        sandboxGeneration: result.sandbox_generation,
         localCwd: resume?.localCwd ?? ctx.cwd,
         remoteCwd: result.remote_cwd,
         workspaceState: parseWorkspaceState(result.workspace_state),
         runtimeDigest: result.runtime_digest,
-        activationVerified: result.activation_verified,
+        reconciled: result.reconciled,
       };
     } catch (error) {
       ctx.ui.setStatus("cua-session", undefined);
@@ -1442,8 +1450,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       try {
         await nextBridge?.connect();
       } catch (error) {
-        if (resolved.kind !== "sandbox" || resolved.activationVerified)
-          throw error;
+        if (resolved.kind !== "sandbox" || resolved.reconciled) throw error;
         nextBridge?.close(true);
         resolved = await materializeTarget(
           { kind: "sandbox", name: resolved.name, os: resolved.os },
@@ -1451,7 +1458,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
           {
             inheritExecution: false,
             resume: resolved,
-            verifyResume: true,
+            forceReconcile: true,
           },
         );
         nextBridge = new ToolBridge(resolved, expectedTools);

@@ -238,6 +238,7 @@ def bootstrap_digest(profile: str) -> str:
 
 def guest_runtime_files(packages: tuple[str, ...] = ()) -> dict[str, bytes]:
     files = remote_pi_files()
+    files["cua-runtime.json"] = b'{"packageInstall":"production-without-peer-copies"}\n'
     files["settings.json"] = (
         json.dumps({"packages": list(packages)}, indent=2).encode() + b"\n"
     )
@@ -399,6 +400,11 @@ def controller_sandboxes() -> list[dict[str, Any]]:
                 "os": record["os"],
                 "pool": record["pool"],
                 "address": (record.get("addresses") or [None])[0],
+                **(
+                    {"generation": record["deviceId"]}
+                    if isinstance(record.get("deviceId"), str)
+                    else {}
+                ),
             }
             for record in controller_sandbox_records()
             if all(isinstance(record.get(key), str) for key in ("name", "os", "pool"))
@@ -1828,45 +1834,10 @@ def ssh_options(profile: str) -> list[str]:
         f"UserKnownHostsFile={SANDBOX_KNOWN_HOSTS}",
         "-o",
         "ConnectTimeout=10",
-        "-o",
-        "ControlMaster=no",
-        "-o",
-        f"ControlPath={Path.home() / '.ssh' / 'cua-%C'}",
-        "-o",
-        "ServerAliveInterval=15",
-        "-o",
-        "ServerAliveCountMax=2",
     ]
     if profile == "windows":
         options[:0] = ["-i", str(ensure_windows_identity())]
     return options
-
-
-def ensure_guest_ssh_master(name: str, profile: str) -> None:
-    """Keep one detached transport alive for activation and bridge startup."""
-    try:
-        subprocess.run(
-            [
-                "ssh",
-                "-o",
-                "ControlMaster=auto",
-                "-o",
-                "ControlPersist=60",
-                *ssh_options(profile),
-                "-N",
-                "-f",
-                f"cua@{name}",
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=15,
-            check=False,
-            start_new_session=True,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        # The ordinary SSH preflight retains the actionable transport error.
-        pass
 
 
 @dataclass(frozen=True)
@@ -2201,7 +2172,7 @@ mkdir -p "$runtimes"
 rm -rf "$staging"
 mkdir -p "$staging"
 tar -xzf {shlex.quote(archive_path)} -C "$staging"
-PI_CODING_AGENT_DIR="$staging/agent" pi update --extensions --no-approve
+npm_config_omit=dev npm_config_legacy_peer_deps=true PI_CODING_AGENT_DIR="$staging/agent" pi update --extensions --no-approve
 printf '%s\n' {shlex.quote(digest)} > "$staging/complete"
 rm -rf "$runtime"
 mv "$staging" "$runtime"
@@ -2225,6 +2196,8 @@ Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $staging
 New-Item -ItemType Directory -Force -Path $staging | Out-Null
 tar.exe -xzf {powershell_literal(archive_path)} -C $staging
 $env:PI_CODING_AGENT_DIR = Join-Path $staging 'agent'
+$env:npm_config_omit = 'dev'
+$env:npm_config_legacy_peer_deps = 'true'
 & 'C:\ProgramData\npm\pi.cmd' update --extensions --no-approve
 if ($LASTEXITCODE -ne 0) {{ throw "Pi package synchronization failed with exit $LASTEXITCODE" }}
 Set-Content -NoNewline -Path (Join-Path $staging 'complete') -Value {powershell_literal(digest)}
@@ -2629,7 +2602,8 @@ async def activate_execution(
     source: SandboxWorkspaceSource | None = None,
     resume: SandboxResumeSource | None = None,
     tool_packages: tuple[str, ...] = (),
-    verify_resume: bool = True,
+    force_reconcile: bool = True,
+    sandbox_generation: str | None = None,
 ) -> dict[str, Any]:
     states = {item["name"]: item for item in managed_sandboxes()}
     if name not in states:
@@ -2647,7 +2621,13 @@ async def activate_execution(
     config_files = guest_runtime_files(tool_packages)
     guest_digest = runtime_digest(config_files)
     candidate = states[name].get("address") or name
-    if resume and not verify_resume:
+    current_generation = states[name].get("generation")
+    if (
+        resume
+        and not force_reconcile
+        and isinstance(current_generation, str)
+        and sandbox_generation == current_generation
+    ):
         return {
             "name": name,
             "os": profile,
@@ -2655,14 +2635,14 @@ async def activate_execution(
             "remote_cwd": resume["remoteCwd"],
             **({"workspace_state": resume["state"]} if "state" in resume else {}),
             "runtime_digest": guest_digest,
-            "activation_verified": False,
+            "sandbox_generation": current_generation,
+            "reconciled": False,
         }
     repository = (
         None
         if resume and not workspace_resume
         else discover_workspace(Path(source_cwd).expanduser().resolve())
     )
-    ensure_guest_ssh_master(candidate, profile)
     if repository is None:
         if source or workspace_resume:
             raise RuntimeError("saved Git workspace is no longer available locally")
@@ -2683,7 +2663,8 @@ async def activate_execution(
             "address": runtime.address,
             "remote_cwd": execution_directory(runtime.address, profile, execution_id),
             "runtime_digest": guest_digest,
-            "activation_verified": True,
+            "sandbox_generation": current_generation,
+            "reconciled": True,
         }
 
     progress("sandbox.preflight", "checking health, configuration, disk, and cache")
@@ -2703,16 +2684,20 @@ async def activate_execution(
             "workspace setup requires 1 GiB free; "
             f"only {preflight.free_bytes // 1048576} MiB is available"
         )
-    if not preflight.runtime_available:
-        install_guest_runtime(
-            address,
-            profile,
-            guest_runtime_archive(config_files),
-            guest_digest,
-        )
+    runtime_content = (
+        guest_runtime_archive(config_files) if not preflight.runtime_available else None
+    )
     if workspace_resume and sandbox_workspace_exists(
         address, profile, workspace_resume["remoteCwd"]
     ):
+        if runtime_content:
+            await asyncio.to_thread(
+                install_guest_runtime,
+                address,
+                profile,
+                runtime_content,
+                guest_digest,
+            )
         return {
             "name": name,
             "os": profile,
@@ -2720,7 +2705,8 @@ async def activate_execution(
             "remote_cwd": workspace_resume["remoteCwd"],
             "workspace_state": workspace_resume["state"],
             "runtime_digest": guest_digest,
-            "activation_verified": True,
+            "sandbox_generation": current_generation,
+            "reconciled": True,
         }
 
     transfer = (
@@ -2728,6 +2714,21 @@ async def activate_execution(
         if source
         else capture_local_workspace(repository)
     )
+    runtime_install = (
+        asyncio.create_task(
+            asyncio.to_thread(
+                install_guest_runtime,
+                address,
+                profile,
+                runtime_content,
+                guest_digest,
+            )
+        )
+        if runtime_content
+        else None
+    )
+    if runtime_install:
+        await asyncio.sleep(0)
     if source:
         repository = WorkspaceRepository(
             root=repository.root,
@@ -2752,7 +2753,11 @@ async def activate_execution(
         )
         progress("workspace.baseline", "reconstructing the destination workspace")
         restore_sandbox_workspace(address, profile, workspace_root, transfer, reference)
+        if runtime_install:
+            await runtime_install
     except BaseException:
+        if runtime_install:
+            await asyncio.gather(runtime_install, return_exceptions=True)
         try:
             progress("workspace.destination.cleanup", "removing incomplete workspace")
             cleanup_workspace_root(address, profile, workspace_root)
@@ -2769,7 +2774,8 @@ async def activate_execution(
         "remote_cwd": remote_cwd,
         "workspace_state": transfer.state,
         "runtime_digest": guest_digest,
-        "activation_verified": True,
+        "sandbox_generation": current_generation,
+        "reconciled": True,
     }
 
 
@@ -2823,9 +2829,12 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         resume = (
             require_resume_source(resume_value) if resume_value is not None else None
         )
-        verify_resume = request.get("verify_resume", True)
-        if not isinstance(verify_resume, bool):
-            raise TypeError("activate_execution verify_resume must be a boolean")
+        force_reconcile = request.get("force_reconcile", True)
+        if not isinstance(force_reconcile, bool):
+            raise TypeError("activate_execution force_reconcile must be a boolean")
+        sandbox_generation = request.get("sandbox_generation")
+        if sandbox_generation is not None and not isinstance(sandbox_generation, str):
+            raise TypeError("activate_execution sandbox_generation must be a string")
         return await activate_execution(
             str(request.get("name") or ""),
             str(request.get("source_cwd") or ""),
@@ -2833,7 +2842,8 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
             source,
             resume,
             tool_packages,
-            verify_resume,
+            force_reconcile,
+            sandbox_generation,
         )
     raise ValueError(
         "action must be list, create, ensure, delete, activate_execution, sync_workspace_to_local, cleanup_workspace, or workspace_diff_status"

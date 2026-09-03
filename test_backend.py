@@ -429,7 +429,12 @@ class WorkspaceTests(unittest.TestCase):
                 {"packages": []},
             )
             self.assertEqual(
-                sorted(archive.getnames()), ["agent/example.ts", "agent/settings.json"]
+                sorted(archive.getnames()),
+                [
+                    "agent/cua-runtime.json",
+                    "agent/example.ts",
+                    "agent/settings.json",
+                ],
             )
 
     def test_remote_config_includes_generic_tool_host(self) -> None:
@@ -916,7 +921,9 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotEqual(first, second)
 
-    async def test_unverified_resume_defers_remote_checks_to_the_host(self) -> None:
+    async def test_matching_generation_resume_defers_remote_checks_to_the_host(
+        self,
+    ) -> None:
         resume = backend.SandboxResumeSource(
             os="linux",
             remoteCwd="/home/cua/workspaces/existing",
@@ -930,11 +937,11 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
                         "name": "linux-1",
                         "os": "linux",
                         "address": "100.64.0.2",
+                        "generation": "node-1",
                     }
                 ],
             ),
             patch.object(backend, "discover_workspace") as discover,
-            patch.object(backend, "ensure_guest_ssh_master") as master,
             patch.object(backend, "guest_runtime_preflight") as preflight,
         ):
             result = await backend.activate_execution(
@@ -942,15 +949,56 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
                 "/local",
                 "session-1",
                 resume=resume,
-                verify_resume=False,
+                force_reconcile=False,
+                sandbox_generation="node-1",
             )
 
         self.assertEqual(result["address"], "100.64.0.2")
         self.assertEqual(result["remote_cwd"], resume["remoteCwd"])
-        self.assertFalse(result["activation_verified"])
+        self.assertEqual(result["sandbox_generation"], "node-1")
+        self.assertFalse(result["reconciled"])
         discover.assert_not_called()
-        master.assert_not_called()
         preflight.assert_not_called()
+
+    async def test_replacement_generation_bypasses_the_matching_generation_resume(
+        self,
+    ) -> None:
+        resume = backend.SandboxResumeSource(os="linux", remoteCwd="/home/cua")
+        preflight = backend.GuestRuntimePreflight("100.64.0.2", True)
+        with (
+            patch.object(
+                backend,
+                "managed_sandboxes",
+                return_value=[
+                    {
+                        "name": "linux-1",
+                        "os": "linux",
+                        "address": "100.64.0.2",
+                        "generation": "node-2",
+                    }
+                ],
+            ),
+            patch.object(
+                backend, "guest_runtime_preflight", return_value=preflight
+            ) as check,
+            patch.object(
+                backend,
+                "run_guest_ssh",
+                return_value=subprocess.CompletedProcess([], 0, "", ""),
+            ),
+        ):
+            result = await backend.activate_execution(
+                "linux-1",
+                "/local",
+                "session-1",
+                resume=resume,
+                force_reconcile=False,
+                sandbox_generation="node-1",
+            )
+
+        self.assertTrue(result["reconciled"])
+        self.assertEqual(result["sandbox_generation"], "node-2")
+        check.assert_called_once()
 
     async def test_activate_execution_resumes_without_git_state(self) -> None:
         resume = backend.SandboxResumeSource(
