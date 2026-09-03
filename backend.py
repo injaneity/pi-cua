@@ -415,8 +415,10 @@ def controller_sandboxes() -> list[dict[str, Any]]:
 
 def migrate_sdk_sandbox_records() -> None:
     """Adopt records created before the controller JSON index shipped."""
+    marker = CONTROLLER_DIR / ".sdk-state-migrated"
+    if marker.exists():
+        return
     with operation_lock(CONTROLLER_LOCK):
-        marker = CONTROLLER_DIR / ".sdk-state-migrated"
         if marker.exists():
             return
         if STATE_DIR.exists():

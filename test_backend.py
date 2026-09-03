@@ -202,6 +202,20 @@ class ManagedSandboxTests(unittest.TestCase):
                 )
                 self.assertTrue((controller_dir / ".sdk-state-migrated").exists())
 
+    def test_completed_migration_does_not_wait_for_the_mutation_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            controller_dir = Path(directory)
+            (controller_dir / ".sdk-state-migrated").touch()
+            with (
+                patch.object(backend, "CONTROLLER_DIR", controller_dir),
+                patch.object(
+                    backend,
+                    "operation_lock",
+                    side_effect=AssertionError("migration took the mutation lock"),
+                ),
+            ):
+                backend.migrate_sdk_sandbox_records()
+
     def test_controller_record_is_the_only_runtime_index(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state_dir = Path(directory)
