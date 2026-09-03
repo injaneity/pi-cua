@@ -1,7 +1,7 @@
 {
   "name": "pi-cua",
   "version": "0.1.0",
-  "description": "Run local Pi sessions against persistent Linux and Windows CUA sandboxes",
+  "description": "Run local Pi sessions against persistent CUA sandboxes and external macOS hosts",
   "type": "module",
   "keywords": [
     "pi-package",

@@ -75,16 +75,18 @@ def cancel_worker(_signum: int, _frame: Any) -> None:
     raise OperationCancelled("operation cancelled")
 
 
-CLOUD_ACTIONS = {"create", "ensure", "delete"}
 FLEET_KEYCHAIN_SERVICE = "cua-sandbox-fleet-api"
 TAILSCALE_KEYCHAIN_SERVICE = "cua-sandbox-tailscale-oauth"
 TAILSCALE_TOKEN_URL = "https://api.tailscale.com/api/v2/oauth/token"
 TAILSCALE_API_URL = "https://api.tailscale.com/api/v2"
 WINDOWS_IDENTITY = HOME / ".ssh" / "cua_windows_ed25519"
 WINDOWS_PUBLIC_KEY = WINDOWS_IDENTITY.with_suffix(".pub")
+MACOS_IDENTITY = HOME / ".ssh" / "cua_macos_ed25519"
 SANDBOX_KNOWN_HOSTS = HOME / ".ssh" / "cua_known_hosts"
 WINDOWS_BROKER_TASK = "CuaPiDesktopToolBroker"
 WINDOWS_BROKER_PORT = 43121
+
+SUPPORTED_PROFILES = {"linux", "windows", "macos"}
 
 PROFILES = {
     "linux": {
@@ -328,12 +330,35 @@ def profile_for_pool(pool: object) -> str | None:
     return default or (match.group("profile") if match else None)
 
 
+def is_unix(profile: str) -> bool:
+    return profile in {"linux", "macos"}
+
+
+def guest_home(profile: str) -> str:
+    return "/Users/administrator" if profile == "macos" else "/home/cua"
+
+
+def ssh_user(profile: str) -> str:
+    return "administrator" if profile == "macos" else "cua"
+
+
 def sandbox_record(name: str) -> dict[str, Any] | None:
     try:
         value = json.loads((SANDBOX_RECORD_DIR / f"{name}.json").read_text())
     except (OSError, json.JSONDecodeError):
         return None
     return value if isinstance(value, dict) else None
+
+
+def uses_fleet(request: dict[str, Any]) -> bool:
+    action = request.get("action")
+    if action == "create":
+        return True
+    if action not in {"ensure", "delete"}:
+        return False
+    name = request.get("name")
+    record = sandbox_record(name) if isinstance(name, str) else None
+    return record is None or record.get("kind") != "external"
 
 
 def write_sandbox_record(record: dict[str, Any]) -> None:
@@ -401,6 +426,7 @@ def controller_sandboxes() -> list[dict[str, Any]]:
                 "name": record["name"],
                 "os": record["os"],
                 "pool": record["pool"],
+                **({"kind": "external"} if record.get("kind") == "external" else {}),
                 "address": (record.get("addresses") or [None])[0],
                 **(
                     {"generation": record["deviceId"]}
@@ -454,7 +480,11 @@ def restore_cua_state(name: str) -> None:
     """Materialize the SDK connection index from the controller record."""
     state_path = STATE_DIR / f"{name}.json"
     record = sandbox_record(name)
-    if record is None or not isinstance(record.get("pool"), str):
+    if (
+        record is None
+        or record.get("kind") == "external"
+        or not isinstance(record.get("pool"), str)
+    ):
         return
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     temporary = state_path.with_suffix(".json.tmp")
@@ -1170,6 +1200,8 @@ def powershell_encoded_command(script: str) -> str:
 
 
 def guest_health_command(profile: str) -> str:
+    if profile == "macos":
+        return f'PATH=/usr/local/bin:/usr/bin:/bin; export PATH; test "$(node --version)" = v22.20.0 && test "$(pi --version)" = {shlex.quote(pi_version())} && command -v git >/dev/null && test "$(uname -s)" = Darwin && tailscale ip -4 | head -n 1'
     expected_digest = bootstrap_digest(profile)
     if profile == "linux":
         return f'test "$(cat /home/cua/.cua-pi/bootstrap-version 2>/dev/null)" = {shlex.quote(expected_digest)} && command -v pi >/dev/null && tailscale ip -4 | head -n 1'
@@ -1242,11 +1274,109 @@ async def complete_tailscale_enrollment(
     )
 
 
+def register_external_macos(name: str, address: str) -> dict[str, Any]:
+    validate_name(name)
+    if sandbox_record(name) is not None:
+        raise ValueError(f"managed sandbox already exists: {name}")
+    if not re.fullmatch(r"[A-Za-z0-9._:-]+", address):
+        raise ValueError("external address must be a host or IP")
+    if not MACOS_IDENTITY.is_file():
+        raise RuntimeError(f"macOS SSH identity is missing: {MACOS_IDENTITY}")
+    known = subprocess.run(
+        ["ssh-keygen", "-F", address, "-f", str(SANDBOX_KNOWN_HOSTS)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if known.returncode != 0 or not known.stdout.strip():
+        raise RuntimeError(f"SSH host key is not pinned for external host: {address}")
+    status = local_tailscale_status() or {}
+    peer = next(
+        (
+            item
+            for item in (status.get("Peer") or {}).values()
+            if isinstance(item, dict)
+            and (
+                str(item.get("HostName") or "").lower() == name.lower()
+                or str(item.get("DNSName") or "").lower().startswith(f"{name.lower()}.")
+            )
+        ),
+        None,
+    )
+    generation = (
+        peer.get("StableID") or peer.get("ID") if isinstance(peer, dict) else None
+    )
+    if not isinstance(generation, str) or not generation:
+        raise RuntimeError(f"external host is not a Tailscale peer named {name}")
+    record = {
+        "name": name,
+        "os": "macos",
+        "pool": "external",
+        "kind": "external",
+        "addresses": [address],
+        "sshUser": "administrator",
+        "updatedAt": datetime.now(timezone.utc).isoformat(),
+        **({"deviceId": generation} if isinstance(generation, str) else {}),
+    }
+    write_sandbox_record(record)
+    try:
+        result = run_guest_ssh(
+            address,
+            "macos",
+            guest_health_command("macos"),
+            timeout=30,
+            report=False,
+        )
+        health = guest_health_address(result, name)
+    except Exception:
+        remove_sandbox_record(name)
+        raise
+    return {
+        "name": name,
+        "os": "macos",
+        "address": address,
+        "changed": True,
+        "health": health,
+    }
+
+
+def guest_health_address(result: subprocess.CompletedProcess[str], name: str) -> str:
+    lines = result.stdout.strip().splitlines()
+    if not lines:
+        raise RuntimeError(f"external host returned no Tailscale address: {name}")
+    return lines[-1]
+
+
+def unregister_external(name: str) -> dict[str, Any]:
+    record = sandbox_record(name)
+    if record is None or record.get("kind") != "external":
+        raise ValueError(f"unknown external sandbox: {name}")
+    remove_sandbox_record(name)
+    return {"name": name, "removed": True}
+
+
 async def ensure_one(name: str) -> dict[str, Any]:
     states = {item["name"]: item for item in managed_sandboxes()}
     if name not in states:
         raise ValueError(f"unknown managed sandbox: {name}")
     profile = states[name]["os"]
+    if states[name].get("kind") == "external":
+        address = str(states[name].get("address") or "")
+        result = run_guest_ssh(
+            address,
+            profile,
+            guest_health_command(profile),
+            timeout=30,
+            report=False,
+        )
+        return {
+            "name": name,
+            "os": profile,
+            "address": address,
+            "changed": False,
+            "health": guest_health_address(result, name),
+        }
     tailnet = local_tailscale_identity()
 
     restore_cua_state(name)
@@ -1388,6 +1518,10 @@ async def delete_one(name: str) -> dict[str, Any]:
     states = {item["name"]: item for item in managed_sandboxes()}
     if name not in states:
         raise ValueError(f"unknown managed sandbox: {name}")
+    if states[name].get("kind") == "external":
+        raise ValueError(
+            f"{name} is an external host; unregister it instead of deleting it"
+        )
     from cua_sandbox import Pool, Sandbox
 
     # Release by persisted claim reference. Connecting first would make deletion
@@ -1484,7 +1618,7 @@ def require_execution_source(value: object) -> SandboxExecutionSource:
     if (
         not isinstance(address, str)
         or not address
-        or profile not in PROFILES
+        or profile not in SUPPORTED_PROFILES
         or not isinstance(remote_cwd, str)
         or not remote_cwd
     ):
@@ -1504,7 +1638,11 @@ def require_resume_source(value: object) -> SandboxResumeSource:
         raise TypeError("resume must be an object")
     profile = value.get("os")
     remote_cwd = value.get("remoteCwd")
-    if profile not in PROFILES or not isinstance(remote_cwd, str) or not remote_cwd:
+    if (
+        profile not in SUPPORTED_PROFILES
+        or not isinstance(remote_cwd, str)
+        or not remote_cwd
+    ):
         raise TypeError("resume has invalid sandbox fields")
     source = SandboxResumeSource(os=cast(str, profile), remoteCwd=remote_cwd)
     if value.get("state") is not None:
@@ -1619,8 +1757,8 @@ for (let i = 0; i + 2 < fields.length; i += 3) {
 
 def reject_remote_workspace_filters(name: str, profile: str, root: str) -> None:
     command = (
-        f"node -e {shlex.quote(WORKSPACE_FILTER_CHECK)} {shlex.quote(root)}"
-        if profile == "linux"
+        f"{'/usr/local/bin/node' if profile == 'macos' else 'node'} -e {shlex.quote(WORKSPACE_FILTER_CHECK)} {shlex.quote(root)}"
+        if is_unix(profile)
         else f"& 'C:\\cua\\node\\node.exe' -e {powershell_literal(WORKSPACE_FILTER_CHECK)} {powershell_literal(root)}"
     )
     run_guest_ssh(name, profile, command, timeout=60)
@@ -1635,7 +1773,7 @@ def remote_workspace_tree(
 ) -> str:
     reject_remote_workspace_filters(name, profile, root)
     ref = f"refs/cua-pi/sync/{reference}" if reference else None
-    if profile == "linux":
+    if is_unix(profile):
         command = f"""set -eu
 index=$(mktemp)
 rm -f "$index"
@@ -1709,11 +1847,11 @@ def remote_workspace_patch(
         raise ValueError("workspace diff requires full Git tree IDs")
     command = (
         f"git -C {shlex.quote(root)} diff --binary --full-index {shlex.quote(base_tree)} {shlex.quote(final_tree)} --"
-        if profile == "linux"
+        if is_unix(profile)
         else f"git -C {powershell_literal(root)} diff --binary --full-index {base_tree} {final_tree} --"
     )
     result = subprocess.run(
-        ["ssh", *ssh_options(profile), f"cua@{name}", command],
+        ["ssh", *ssh_options(profile), ssh_destination(name, profile), command],
         capture_output=True,
         timeout=600,
         check=False,
@@ -1806,11 +1944,11 @@ def apply_remote_workspace_patch(
         patch_id = uuid.uuid4().hex
         remote_path = (
             f"/tmp/cua-workspace-{patch_id}.patch"
-            if profile == "linux"
+            if is_unix(profile)
             else rf"C:\Windows\Temp\cua-workspace-{patch_id}.patch"
         )
         copy_guest_file(name, profile, patch, remote_path)
-        if profile == "linux":
+        if is_unix(profile):
             command = f"""set -eu
 trap 'rm -f {shlex.quote(remote_path)}' EXIT
 git -C {shlex.quote(root)} apply --binary --whitespace=nowarn {shlex.quote(remote_path)}
@@ -1895,7 +2033,13 @@ def ssh_options(profile: str) -> list[str]:
     ]
     if profile == "windows":
         options[:0] = ["-i", str(ensure_windows_identity())]
+    elif profile == "macos":
+        options[:0] = ["-i", str(MACOS_IDENTITY)]
     return options
+
+
+def ssh_destination(name: str, profile: str) -> str:
+    return f"{ssh_user(profile)}@{name}"
 
 
 @dataclass(frozen=True)
@@ -1942,11 +2086,12 @@ def windows_broker_ready(name: str) -> bool:
 def guest_runtime_preflight(
     name: str, profile: str, runtime_digest: str
 ) -> GuestRuntimePreflight | None:
-    if profile == "linux":
-        complete = shlex.quote(f"/home/cua/.cua-pi/runtimes/{runtime_digest}/complete")
+    if is_unix(profile):
+        home = guest_home(profile)
+        complete = shlex.quote(f"{home}/.cua-pi/runtimes/{runtime_digest}/complete")
         command = f"""set -u
 address=$({guest_health_command(profile)}) || exit 20
-free_bytes=$(( $(df -Pk /home/cua | awk 'NR == 2 {{ print $4 }}') * 1024 ))
+free_bytes=$(( $(df -Pk {shlex.quote(home)} | awk 'NR == 2 {{ print $4 }}') * 1024 ))
 if [ -f {complete} ]; then ready=1; else ready=0; fi
 printf '%s|%s|%s\n' "$address" "$free_bytes" "$ready"
 """
@@ -1982,7 +2127,7 @@ printf '%s|%s|%s\n' "$address" "$free_bytes" "$ready"
     if len(fields) != 3 or not fields[1].isdigit() or fields[2] not in {"0", "1"}:
         return None
     return GuestRuntimePreflight(
-        address=name if profile == "windows" else fields[0],
+        address=name if profile in {"windows", "macos"} else fields[0],
         free_bytes=int(fields[1]),
         runtime_available=fields[2] == "1",
     )
@@ -1996,12 +2141,13 @@ def guest_preflight(
     runtime_digest: str,
 ) -> GuestPreflight | None:
     repository_key = hashlib.sha256(remote_url.encode()).hexdigest()[:20]
-    if profile == "linux":
-        cache = f"/home/cua/.cache/cua-pi/git/{repository_key}.git"
-        complete = shlex.quote(f"/home/cua/.cua-pi/runtimes/{runtime_digest}/complete")
+    if is_unix(profile):
+        home = guest_home(profile)
+        cache = f"{home}/.cache/cua-pi/git/{repository_key}.git"
+        complete = shlex.quote(f"{home}/.cua-pi/runtimes/{runtime_digest}/complete")
         command = f"""set -u
 address=$({guest_health_command(profile)}) || exit 20
-free_bytes=$(( $(df -Pk /home/cua | awk 'NR == 2 {{ print $4 }}') * 1024 ))
+free_bytes=$(( $(df -Pk {shlex.quote(home)} | awk 'NR == 2 {{ print $4 }}') * 1024 ))
 if [ -f {complete} ]; then config=1; else config=0; fi
 if git -C {shlex.quote(cache)} cat-file -e {shlex.quote(commit + "^{commit}")} 2>/dev/null || git ls-remote --exit-code {shlex.quote(remote_url)} HEAD >/dev/null 2>&1; then
   repository=1
@@ -2052,7 +2198,7 @@ Write-Output "healthy|$free|$config|$repository"
     if len(fields) != 4 or not fields[1].isdigit() or fields[3] not in {"0", "1"}:
         return None
     return GuestPreflight(
-        address=name if profile == "windows" else fields[0],
+        address=name if profile in {"windows", "macos"} else fields[0],
         free_bytes=int(fields[1]),
         runtime_available=fields[2] == "1",
         repository_available=fields[3] == "1",
@@ -2071,7 +2217,7 @@ def run_guest_ssh(
 ) -> subprocess.CompletedProcess[str]:
     if report:
         progress(f"ssh.{name}", "running remote command")
-    argv = ["ssh", *ssh_options(profile), f"cua@{name}", command]
+    argv = ["ssh", *ssh_options(profile), ssh_destination(name, profile), command]
     if stream_phase is None:
         try:
             result = subprocess.run(
@@ -2134,8 +2280,8 @@ def run_guest_ssh(
 def guest_file_size(name: str, profile: str, remote_path: str) -> int | None:
     """Best-effort size of a remote file over the multiplexed ssh connection."""
     command = (
-        f"stat -c %s {shlex.quote(remote_path)} 2>/dev/null || echo 0"
-        if profile == "linux"
+        f"wc -c < {shlex.quote(remote_path)} 2>/dev/null || echo 0"
+        if is_unix(profile)
         else f"(Get-Item -LiteralPath {powershell_literal(remote_path)} -ErrorAction SilentlyContinue).Length"
     )
     try:
@@ -2167,7 +2313,7 @@ def copy_guest_file(name: str, profile: str, content: bytes, remote_path: str) -
                 "scp",
                 *ssh_options(profile),
                 source.name,
-                f"cua@{name}:{target_path}",
+                f"{ssh_destination(name, profile)}:{target_path}",
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -2223,11 +2369,24 @@ def guest_runtime_archive(files: dict[str, bytes]) -> bytes:
 
 
 def install_guest_runtime(name: str, profile: str, content: bytes, digest: str) -> None:
-    if profile == "linux":
+    if is_unix(profile):
+        home = guest_home(profile)
         archive_path = f"/tmp/cua-pi-runtime-{digest}.tgz"
         copy_guest_file(name, profile, content, archive_path)
+        legacy_cleanup = (
+            f"""if [ -f {shlex.quote(home + "/.cua-pi/config-files")} ]; then
+  while IFS= read -r path; do
+    case "$path" in .pi/agent/cua-tool-broker.mjs) ;; .pi/agent/*) rm -f -- {shlex.quote(home + "/")}"$path" ;; esac
+  done < {shlex.quote(home + "/.cua-pi/config-files")}
+fi
+rm -f {shlex.quote(home + "/.cua-pi/config-files")} {shlex.quote(home + "/.cua-pi/config-version")}"""
+            if profile == "linux"
+            else ""
+        )
         command = f"""set -eu
-runtimes=/home/cua/.cua-pi/runtimes
+PATH=/usr/local/bin:/usr/bin:/bin:$PATH
+export PATH
+runtimes={shlex.quote(home + "/.cua-pi/runtimes")}
 runtime="$runtimes/{digest}"
 staging="$runtimes/.{digest}.$$"
 mkdir -p "$runtimes"
@@ -2238,13 +2397,8 @@ npm_config_omit=dev npm_config_legacy_peer_deps=true PI_CODING_AGENT_DIR="$stagi
 printf '%s\n' {shlex.quote(digest)} > "$staging/complete"
 rm -rf "$runtime"
 mv "$staging" "$runtime"
-find "$runtimes" -mindepth 1 -maxdepth 1 -type d -regextype posix-extended -regex '.*/[0-9a-f]{{20}}' -printf '%T@ %p\n' | sort -rn | tail -n +4 | cut -d' ' -f2- | xargs -r rm -rf --
-if [ -f /home/cua/.cua-pi/config-files ]; then
-  while IFS= read -r path; do
-    case "$path" in .pi/agent/cua-tool-broker.mjs) ;; .pi/agent/*) rm -f -- "/home/cua/$path" ;; esac
-  done < /home/cua/.cua-pi/config-files
-fi
-rm -f /home/cua/.cua-pi/config-files /home/cua/.cua-pi/config-version
+ls -dt "$runtimes"/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f] 2>/dev/null | tail -n +4 | while IFS= read -r old; do rm -rf -- "$old"; done
+{legacy_cleanup}
 rm -f {shlex.quote(archive_path)}
 """
     else:
@@ -2300,9 +2454,10 @@ async def prepare_workspace(
 ) -> str:
     progress(f"workspace.{name}.baseline", f"preparing {source.root}")
     repository_key = hashlib.sha256(source.remote_url.encode()).hexdigest()[:20]
-    if profile == "linux":
-        workspace_root = f"/home/cua/workspaces/{workspace_id}"
-        repository_cache = f"/home/cua/.cache/cua-pi/git/{repository_key}.git"
+    if is_unix(profile):
+        home = guest_home(profile)
+        workspace_root = f"{home}/workspaces/{workspace_id}"
+        repository_cache = f"{home}/.cache/cua-pi/git/{repository_key}.git"
         snapshot_path = f"/tmp/cua-snapshot-{workspace_id}.tgz"
         if not repository_available:
             progress(
@@ -2345,7 +2500,7 @@ else
 fi
 rm -f {shlex.quote(snapshot_path)}"""
         command = f"""set -eu
-mkdir -p /home/cua/workspaces /home/cua/.cache/cua-pi/git
+mkdir -p {shlex.quote(home + "/workspaces")} {shlex.quote(home + "/.cache/cua-pi/git")}
 {remote_setup if repository_available else snapshot_setup}
 """
         run_guest_ssh(
@@ -2420,8 +2575,11 @@ New-Item -ItemType Directory -Force -Path 'C:\\cua\\workspaces','C:\\cua\\cache\
 
 
 def sandbox_workspace_exists(name: str, profile: str, cwd: str) -> bool:
-    if profile == "linux":
-        match = re.match(r"^(/home/cua/workspaces/[0-9a-f]{16})(?:/|$)", cwd)
+    if is_unix(profile):
+        workspace_prefix = f"{guest_home(profile)}/workspaces"
+        match = re.match(
+            rf"^({re.escape(workspace_prefix)}/[0-9a-f]{{16}})(?:/|$)", cwd
+        )
         command = f"test -d {shlex.quote(match.group(1) if match else '')}/.git"
     else:
         match = re.match(
@@ -2444,12 +2602,13 @@ def sandbox_workspace_exists(name: str, profile: str, cwd: str) -> bool:
 
 
 def workspace_location(name: str, profile: str, cwd: str) -> tuple[str, str]:
-    if profile == "linux":
+    if is_unix(profile):
+        workspace_prefix = f"{guest_home(profile)}/workspaces"
         command = f"""set -eu
 root=$(git -C {shlex.quote(cwd)} rev-parse --show-toplevel)
-case "$root" in /home/cua/workspaces/*) ;; *) exit 1;; esac
+case "$root" in {shlex.quote(workspace_prefix)}/*) ;; *) exit 1;; esac
 printf '%s\\n' "$root"
-realpath --relative-to="$root" {shlex.quote(cwd)}
+case {shlex.quote(cwd)} in "$root") printf '.\\n' ;; "$root"/*) relative={shlex.quote(cwd)}; printf '%s\\n' "${{relative#"$root"/}}" ;; *) exit 1 ;; esac
 """
     else:
         command = rf"""$cwd = [IO.Path]::GetFullPath({powershell_literal(cwd)}).TrimEnd('\')
@@ -2471,13 +2630,13 @@ def execution_digest(execution_key: str) -> str:
 
 def execution_directory(name: str, profile: str, execution_id: str) -> str:
     root = (
-        f"/home/cua/.cua-pi/executions/{execution_id}"
-        if profile == "linux"
+        f"{guest_home(profile)}/.cua-pi/executions/{execution_id}"
+        if is_unix(profile)
         else rf"C:\Users\cua\.cua-pi\executions\{execution_id}"
     )
     command = (
         f"mkdir -p -- {shlex.quote(root)}"
-        if profile == "linux"
+        if is_unix(profile)
         else f"New-Item -ItemType Directory -Force {powershell_literal(root)} | Out-Null"
     )
     run_guest_ssh(name, profile, command, timeout=60)
@@ -2485,9 +2644,12 @@ def execution_directory(name: str, profile: str, execution_id: str) -> str:
 
 
 def cleanup_workspace_root(name: str, profile: str, root: str) -> None:
-    if profile == "linux":
-        if not re.fullmatch(r"/home/cua/workspaces/[0-9a-f]{16}", root):
-            raise RuntimeError("refusing to remove an invalid Linux workspace path")
+    if is_unix(profile):
+        pattern = rf"{re.escape(guest_home(profile))}/workspaces/[0-9a-f]{{16}}"
+        if not re.fullmatch(pattern, root):
+            raise RuntimeError(
+                f"refusing to remove an invalid {'macOS' if profile == 'macos' else 'Linux'} workspace path"
+            )
         command = f"rm -rf -- {shlex.quote(root)}"
     else:
         if not re.fullmatch(r"C:\\cua\\workspaces\\[0-9a-f]{16}", root, re.IGNORECASE):
@@ -2540,7 +2702,7 @@ def remote_workspace_numstat(
     before_tree: str,
     after_tree: str,
 ) -> tuple[int, int]:
-    if profile == "linux":
+    if is_unix(profile):
         command = (
             f"git -C {shlex.quote(root)} diff --numstat {before_tree} {after_tree} --"
         )
@@ -2811,8 +2973,8 @@ async def activate_execution(
     reference = identity_digest[:32]
     workspace_id = execution_id
     workspace_root = (
-        f"/home/cua/workspaces/{workspace_id}"
-        if profile == "linux"
+        f"{guest_home(profile)}/workspaces/{workspace_id}"
+        if is_unix(profile)
         else rf"C:\cua\workspaces\{workspace_id}"
     )
     try:
@@ -2874,8 +3036,14 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         if action == "workspace_diff_status":
             return workspace_diff_status(source, local_cwd)
         return sync_workspace_to_local(source, local_cwd)
-    if action in CLOUD_ACTIONS:
+    if uses_fleet(request):
         configure_fleet_auth()
+    if action == "register":
+        return register_external_macos(
+            str(request.get("name") or ""), str(request.get("address") or "")
+        )
+    if action == "unregister":
+        return unregister_external(str(request.get("name") or ""))
     if action == "create":
         return await create_one(
             str(request.get("os") or ""),
@@ -2920,7 +3088,7 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
             sandbox_generation,
         )
     raise ValueError(
-        "action must be list, create, ensure, delete, activate_execution, sync_workspace_to_local, cleanup_workspace, or workspace_diff_status"
+        "action must be list, create, ensure, delete, register, unregister, activate_execution, sync_workspace_to_local, cleanup_workspace, or workspace_diff_status"
     )
 
 
@@ -2933,7 +3101,7 @@ def main() -> None:
             raise TypeError("request must be a JSON object")
         action = str(request.get("action") or "")
         migrate_sdk_sandbox_records()
-        if action in CLOUD_ACTIONS and os.environ.get("CUA_CLOUD_WORKER") != "1":
+        if uses_fleet(request) and os.environ.get("CUA_CLOUD_WORKER") != "1":
             environment = {**os.environ, "CUA_CLOUD_WORKER": "1"}
             os.execvpe("uv", cloud_worker_command(request), environment)
 
@@ -2945,6 +3113,8 @@ def main() -> None:
             "create",
             "ensure",
             "delete",
+            "register",
+            "unregister",
             "activate_execution",
             "sync_workspace_to_local",
             "cleanup_workspace",

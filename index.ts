@@ -32,6 +32,7 @@ import { fileURLToPath } from "node:url";
 const extensionDir = dirname(fileURLToPath(import.meta.url));
 const backend = join(extensionDir, "backend.py");
 const windowsIdentity = join(homedir(), ".ssh", "cua_windows_ed25519");
+const macosIdentity = join(homedir(), ".ssh", "cua_macos_ed25519");
 const sandboxKnownHosts = join(homedir(), ".ssh", "cua_known_hosts");
 const protocolVersion = 3;
 const maxProtocolLine = 1024 * 1024;
@@ -73,11 +74,23 @@ function shouldUseControllerTool(
 }
 
 const resourceSchema = Type.Object({
-  action: StringEnum(["list", "create", "ensure", "delete"] as const),
+  action: StringEnum([
+    "list",
+    "create",
+    "ensure",
+    "delete",
+    "register",
+    "unregister",
+  ] as const),
   name: Type.Optional(
     Type.String({ description: "Managed sandbox name, such as linux-1" }),
   ),
-  os: Type.Optional(StringEnum(["linux", "windows"] as const)),
+  os: Type.Optional(StringEnum(["linux", "windows", "macos"] as const)),
+  address: Type.Optional(
+    Type.String({
+      description: "Pinned SSH host or IP for an external macOS host",
+    }),
+  ),
   cpu: Type.Optional(
     Type.Integer({
       minimum: 1,
@@ -106,12 +119,18 @@ const resourceSchema = Type.Object({
 });
 
 type ResourceInput = Static<typeof resourceSchema>;
-type SandboxOS = "linux" | "windows";
+type SandboxOS = "linux" | "windows" | "macos";
+
+function isSandboxOS(value: unknown): value is SandboxOS {
+  return value === "linux" || value === "windows" || value === "macos";
+}
+
 type SandboxResources = { cpu: number; memory_mb: number };
 type SandboxItem = {
   name: string;
   os: SandboxOS;
   pool: string;
+  kind?: "fleet" | "external";
   address?: string;
   generation?: string;
   online: boolean;
@@ -305,7 +324,11 @@ function sshArgs(
   target: Extract<ExecutionTarget, { kind: "sandbox" }>,
 ): string[] {
   return [
-    ...(target.os === "windows" ? ["-i", windowsIdentity] : []),
+    ...(target.os === "windows"
+      ? ["-i", windowsIdentity]
+      : target.os === "macos"
+        ? ["-i", macosIdentity]
+        : []),
     "-o",
     "BatchMode=yes",
     "-o",
@@ -322,7 +345,7 @@ function sshArgs(
     "LogLevel=ERROR",
     "-T",
     ...(target.os === "windows" ? ["-W", "127.0.0.1:43121"] : []),
-    `cua@${target.address}`,
+    `${target.os === "macos" ? "administrator" : "cua"}@${target.address}`,
   ];
 }
 
@@ -345,7 +368,7 @@ function runtimeAgentDir(
     throw new Error(`sandbox ${target.name} has no runtime generation`);
   return target.os === "windows"
     ? `C:\\Users\\cua\\.cua-pi\\runtimes\\${target.runtimeDigest}\\agent`
-    : `/home/cua/.cua-pi/runtimes/${target.runtimeDigest}/agent`;
+    : `${target.os === "macos" ? "/Users/administrator" : "/home/cua"}/.cua-pi/runtimes/${target.runtimeDigest}/agent`;
 }
 
 function hostCommand(
@@ -353,7 +376,12 @@ function hostCommand(
   manifest: string,
 ): string {
   const agentDir = runtimeAgentDir(target);
-  return `cd ${shellQuote(target.remoteCwd)} && exec node ${shellQuote(`${agentDir}/cua-tool-host.mjs`)} ${shellQuote(target.remoteCwd)} ${shellQuote(agentDir)} ${shellQuote(manifest)}`;
+  const environment =
+    target.os === "macos"
+      ? "PATH=/usr/local/bin:/usr/bin:/bin; export PATH; "
+      : "";
+  const node = target.os === "macos" ? "/usr/local/bin/node" : "node";
+  return `${environment}cd ${shellQuote(target.remoteCwd)} && exec ${node} ${shellQuote(`${agentDir}/cua-tool-host.mjs`)} ${shellQuote(target.remoteCwd)} ${shellQuote(agentDir)} ${shellQuote(manifest)}`;
 }
 
 function brokerStartupError(
@@ -433,7 +461,7 @@ class ToolBridge {
         "ssh",
         [
           ...sshArgs(this.target),
-          ...(this.target.os === "linux"
+          ...(this.target.os !== "windows"
             ? [hostCommand(this.target, manifest)]
             : []),
         ],
@@ -699,10 +727,7 @@ function requireSandbox(result: BackendResult): {
   name: string;
   os: SandboxOS;
 } {
-  if (
-    typeof result.name !== "string" ||
-    (result.os !== "linux" && result.os !== "windows")
-  ) {
+  if (typeof result.name !== "string" || !isSandboxOS(result.os)) {
     throw new Error("cua backend returned an invalid sandbox reference");
   }
   return { name: result.name, os: result.os };
@@ -733,7 +758,7 @@ function parseTarget(value: unknown): StoredExecutionTarget | undefined {
   if (
     data.kind !== "sandbox" ||
     typeof data.name !== "string" ||
-    (data.os !== "linux" && data.os !== "windows") ||
+    !isSandboxOS(data.os) ||
     typeof data.localCwd !== "string" ||
     typeof data.remoteCwd !== "string"
   )
@@ -772,7 +797,7 @@ function parseTargetIntent(value: unknown): ExecutionTargetIntent | undefined {
   } else if (
     destination.kind === "sandbox" &&
     typeof destination.name === "string" &&
-    (destination.os === "linux" || destination.os === "windows")
+    isSandboxOS(destination.os)
   ) {
     parsedDestination = {
       kind: "sandbox",
@@ -1133,7 +1158,9 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
   ): Promise<Destination | undefined> {
     if (!ctx.hasUI) return undefined;
     const listed = await runBackend({ action: "list" }, ctx.signal);
-    const online = (listed.sandboxes ?? []).filter((sandbox) => sandbox.online);
+    const available = (listed.sandboxes ?? []).filter(
+      (sandbox) => sandbox.online || sandbox.kind === "external",
+    );
     const actions: DestinationSearchOption[] = [
       ...(active?.kind === "sandbox"
         ? [
@@ -1145,11 +1172,11 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
             },
           ]
         : []),
-      ...(online.length > 0
+      ...(available.length > 0
         ? [
             {
               value: "connect",
-              label: `${active?.kind === "sandbox" ? "connect or reconnect to" : "connect to"} a sandbox (${online.length} available)`,
+              label: `${active?.kind === "sandbox" ? "connect or reconnect to" : "connect to"} a sandbox (${available.length} available)`,
             },
           ]
         : []),
@@ -1189,14 +1216,14 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
 
       const name = await searchDestinationOptions(
         ctx,
-        online.map((sandbox) => ({
+        available.map((sandbox) => ({
           value: sandbox.name,
           label: sandbox.name,
-          description: `${sandbox.os} • ${active?.kind === "sandbox" && sandbox.name === active.name ? "current; reconnect" : "reachable over Tailscale"}`,
+          description: `${sandbox.os} • ${active?.kind === "sandbox" && sandbox.name === active.name ? "current; reconnect" : sandbox.kind === "external" ? "registered external host" : "reachable over Tailscale"}`,
         })),
       );
       if (!name) continue;
-      const item = online.find((sandbox) => sandbox.name === name);
+      const item = available.find((sandbox) => sandbox.name === name);
       if (!item) throw new Error(`unknown or offline sandbox: ${name}`);
       return { kind: "sandbox", name: item.name, os: item.os };
     }
@@ -1638,18 +1665,29 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     name: "cua_sandbox",
     label: "CUA Sandbox",
     description:
-      "List, provision, repair, or delete managed Linux and Windows CUA sandboxes.",
-    promptSnippet: "Manage isolated Linux and Windows CUA sandbox resources",
+      "List, provision, repair, or delete Fleet sandboxes, or register an existing macOS host.",
+    promptSnippet:
+      "Manage Linux, Windows, and external macOS execution targets",
     promptGuidelines: [
       "Use cua_sandbox for sandbox resources; use /sandbox to choose where the current session executes tools.",
       "For custom resources, cua_sandbox create requires both cpu and memory_mb; omit both to use the OS defaults.",
       "Use a custom image only when the user explicitly provides a digest-pinned OCI reference.",
-      "Do not delete a CUA sandbox unless the user explicitly asks to delete it.",
+      "Register only an SSH host whose key is already pinned; registration never provisions or owns the external machine.",
+      "Do not delete or unregister a CUA sandbox unless the user explicitly asks.",
     ],
     parameters: resourceSchema,
     async execute(_id, input: ResourceInput, signal, onUpdate, ctx) {
-      if (input.action === "create" && !input.os)
-        throw new Error("create requires os");
+      if (
+        input.action === "create" &&
+        input.os !== "linux" &&
+        input.os !== "windows"
+      )
+        throw new Error("create requires os=linux or os=windows");
+      if (
+        input.action === "register" &&
+        (input.os !== "macos" || !input.name || !input.address)
+      )
+        throw new Error("register requires name, os=macos, and address");
       const hasResources =
         input.cpu !== undefined || input.memory_mb !== undefined;
       if (
@@ -1662,18 +1700,27 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         throw new Error("cpu and memory_mb are only valid for create");
       if (input.image !== undefined && input.action !== "create")
         throw new Error("image is only valid for create");
-      if (["ensure", "delete"].includes(input.action) && !input.name) {
+      if (input.address !== undefined && input.action !== "register")
+        throw new Error("address is only valid for register");
+      if (
+        ["ensure", "delete", "unregister"].includes(input.action) &&
+        !input.name
+      ) {
         throw new Error(`${input.action} requires name`);
       }
       if (
-        input.action === "delete" &&
+        (input.action === "delete" || input.action === "unregister") &&
         target.kind === "sandbox" &&
         input.name === target.name
       )
         throw new Error(
-          `move this session to local execution before deleting ${target.name}`,
+          `move this session to local execution before ${input.action === "delete" ? "deleting" : "unregistering"} ${target.name}`,
         );
-      if (input.action === "create" || input.action === "delete") {
+      if (
+        input.action === "create" ||
+        input.action === "delete" ||
+        input.action === "unregister"
+      ) {
         const createResources =
           input.cpu !== undefined && input.memory_mb !== undefined
             ? { cpu: input.cpu, memory_mb: input.memory_mb }
@@ -1682,10 +1729,14 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
           ? await ctx.ui.confirm(
               input.action === "create"
                 ? `create ${input.name || input.os} sandbox?`
-                : `delete ${input.name}?`,
+                : input.action === "delete"
+                  ? `delete ${input.name}?`
+                  : `unregister ${input.name}?`,
               input.action === "create"
                 ? creationDescription(createResources, input.image)
-                : "this permanently releases its fleet claim and filesystem.",
+                : input.action === "delete"
+                  ? "this permanently releases its fleet claim and filesystem."
+                  : "this removes only the controller record; it does not modify the external host.",
             )
           : input.confirm === true;
         if (!allowed)
@@ -1710,7 +1761,9 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
           ? formatList(result.sandboxes ?? [])
           : input.action === "delete"
             ? `deleted ${result.name}`
-            : `${result.name} (${result.os}) ${result.changed ? "configured" : "ready"}${result.address ? ` at ${result.address}` : ""}`;
+            : input.action === "unregister"
+              ? `unregistered ${result.name}`
+              : `${result.name} (${result.os}) ${result.changed ? "configured" : "ready"}${result.address ? ` at ${result.address}` : ""}`;
       return { content: [{ type: "text", text }], details: result };
     },
   });

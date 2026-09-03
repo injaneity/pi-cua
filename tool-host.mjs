@@ -15,7 +15,7 @@ if (process.platform === "win32") {
   );
   process.env.Path = `${nodeDirectory};${process.env.Path || ""}`;
 } else {
-  process.env.PATH = `/home/cua/.cargo/bin:${process.env.PATH || ""}`;
+  process.env.PATH = `${join(process.env.HOME || "/home/cua", ".cargo", "bin")}:/usr/local/bin:${process.env.PATH || ""}`;
 }
 
 const piRoot =

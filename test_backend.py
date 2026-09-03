@@ -75,6 +75,129 @@ class ControllerPrerequisiteTests(unittest.TestCase):
         keychain.assert_not_called()
 
 
+class ExternalMacTests(unittest.IsolatedAsyncioTestCase):
+    async def test_registers_a_pinned_external_mac_and_keeps_it_out_of_fleet(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            identity = root / "identity"
+            identity.touch()
+            known_hosts = root / "known_hosts"
+            known_hosts.write_text("mac.example.test ssh-ed25519 key\n")
+            status = {
+                "Peer": {
+                    "node": {
+                        "HostName": "mac-1",
+                        "StableID": "node-generation",
+                    }
+                }
+            }
+            with (
+                patch.object(backend, "SANDBOX_RECORD_DIR", root / "records"),
+                patch.object(backend, "MACOS_IDENTITY", identity),
+                patch.object(backend, "SANDBOX_KNOWN_HOSTS", known_hosts),
+                patch.object(backend, "local_tailscale_status", return_value=status),
+                patch.object(backend, "pi_version", return_value="0.84.4"),
+                patch.object(
+                    backend.subprocess,
+                    "run",
+                    return_value=subprocess.CompletedProcess([], 0, "pinned\n", ""),
+                ),
+                patch.object(
+                    backend,
+                    "run_guest_ssh",
+                    return_value=subprocess.CompletedProcess([], 0, "100.64.0.9\n", ""),
+                ),
+            ):
+                result = backend.register_external_macos("mac-1", "mac.example.test")
+                items = backend.managed_sandboxes()
+
+            self.assertEqual(result["os"], "macos")
+            self.assertEqual(
+                items,
+                [
+                    {
+                        "name": "mac-1",
+                        "os": "macos",
+                        "pool": "external",
+                        "kind": "external",
+                        "address": "mac.example.test",
+                        "generation": "node-generation",
+                    }
+                ],
+            )
+
+    async def test_external_ensure_uses_ssh_without_fleet(self) -> None:
+        item = {
+            "name": "mac-1",
+            "os": "macos",
+            "pool": "external",
+            "kind": "external",
+            "address": "mac.example.test",
+        }
+        with (
+            patch.object(backend, "managed_sandboxes", return_value=[item]),
+            patch.object(
+                backend,
+                "run_guest_ssh",
+                return_value=subprocess.CompletedProcess([], 0, "100.64.0.9\n", ""),
+            ) as run,
+            patch.object(backend, "local_tailscale_identity") as tailnet,
+        ):
+            result = await backend.ensure_one("mac-1")
+
+        self.assertFalse(result["changed"])
+        self.assertEqual(run.call_args.args[:2], ("mac.example.test", "macos"))
+        tailnet.assert_not_called()
+
+    async def test_external_ensure_does_not_load_fleet_credentials(self) -> None:
+        with (
+            patch.object(
+                backend,
+                "sandbox_record",
+                return_value={"kind": "external"},
+            ),
+            patch.object(
+                backend,
+                "ensure_one",
+                AsyncMock(return_value={"name": "mac-1", "os": "macos"}),
+            ),
+            patch.object(backend, "configure_fleet_auth") as configure,
+        ):
+            await backend.dispatch({"action": "ensure", "name": "mac-1"})
+
+        configure.assert_not_called()
+
+    async def test_external_host_cannot_be_deleted_as_a_fleet_claim(self) -> None:
+        with (
+            patch.object(
+                backend,
+                "managed_sandboxes",
+                return_value=[
+                    {
+                        "name": "mac-1",
+                        "os": "macos",
+                        "pool": "external",
+                        "kind": "external",
+                    }
+                ],
+            ),
+            self.assertRaisesRegex(ValueError, "unregister it"),
+        ):
+            await backend.delete_one("mac-1")
+
+    async def test_macos_uses_its_identity_user_and_home(self) -> None:
+        with patch.object(backend, "MACOS_IDENTITY", Path("/tmp/mac-key")):
+            options = backend.ssh_options("macos")
+        self.assertIn("/tmp/mac-key", options)
+        self.assertEqual(
+            backend.ssh_destination("mac.example.test", "macos"),
+            "administrator@mac.example.test",
+        )
+        self.assertEqual(backend.guest_home("macos"), "/Users/administrator")
+
+
 class ResourceCreationTests(unittest.IsolatedAsyncioTestCase):
     async def test_failed_create_releases_claim_record_and_custom_pool(self) -> None:
         sandbox = SimpleNamespace(delete=AsyncMock(side_effect=LookupError("gone")))
@@ -381,6 +504,18 @@ class TailscaleTests(unittest.TestCase):
 
 
 class WorkspaceTests(unittest.TestCase):
+    def test_macos_filter_check_uses_the_absolute_node_path(self) -> None:
+        with patch.object(
+            backend,
+            "run_guest_ssh",
+            return_value=subprocess.CompletedProcess([], 0, "", ""),
+        ) as run:
+            backend.reject_remote_workspace_filters(
+                "mac.example.test", "macos", "/Users/administrator/workspaces/id"
+            )
+
+        self.assertTrue(run.call_args.args[2].startswith("/usr/local/bin/node -e "))
+
     def repository(self, directory: str) -> Path:
         root = Path(directory)
         subprocess.run(["git", "init", "-q", root], check=True)
@@ -564,6 +699,22 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn('mv "$staging" "$runtime"', script)
         self.assertIn("tail -n +4", script)
         self.assertEqual(run.call_args.kwargs["timeout"], 600)
+
+    def test_macos_runtime_install_uses_the_external_user_home(self) -> None:
+        with (
+            patch.object(backend, "copy_guest_file"),
+            patch.object(
+                backend,
+                "run_guest_ssh",
+                return_value=subprocess.CompletedProcess([], 0, "", ""),
+            ) as run,
+        ):
+            backend.install_guest_runtime("mac-1", "macos", b"archive", "3" * 20)
+
+        script = run.call_args.args[2]
+        self.assertIn("/Users/administrator/.cua-pi/runtimes", script)
+        self.assertIn("PATH=/usr/local/bin:/usr/bin:/bin", script)
+        self.assertNotIn("config-files", script)
 
     def test_guest_bundle_contains_only_requested_tool_packages(self) -> None:
         files = backend.guest_runtime_files(("git:github.com/example/tool-package",))
