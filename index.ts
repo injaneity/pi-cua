@@ -177,6 +177,7 @@ type ExecutionTarget =
       reconciled: boolean;
     });
 type ExecutionTargetIntent = {
+  id: string;
   destination: Destination;
   source: StoredExecutionTarget;
 };
@@ -308,7 +309,7 @@ function sshArgs(
     "-o",
     "BatchMode=yes",
     "-o",
-    "StrictHostKeyChecking=accept-new",
+    "StrictHostKeyChecking=yes",
     "-o",
     `UserKnownHostsFile=${sandboxKnownHosts}`,
     "-o",
@@ -761,6 +762,7 @@ function parseTargetIntent(value: unknown): ExecutionTargetIntent | undefined {
   if (typeof value !== "object")
     throw new Error("saved sandbox connection intent is invalid");
   const data = value as Record<string, unknown>;
+  const id = typeof data.id === "string" && data.id ? data.id : "legacy";
   const destination = data.destination as Record<string, unknown> | undefined;
   if (!destination)
     throw new Error("saved sandbox connection intent is invalid");
@@ -782,7 +784,7 @@ function parseTargetIntent(value: unknown): ExecutionTargetIntent | undefined {
   }
   const source = parseTarget(data.source);
   if (!source) throw new Error("saved sandbox connection intent is invalid");
-  return { destination: parsedDestination, source };
+  return { id, destination: parsedDestination, source };
 }
 
 export default function cuaSandbox(pi: ExtensionAPI): void {
@@ -796,6 +798,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     | Readonly<{
         tools: readonly string[];
         packages: readonly string[];
+        files: readonly string[];
         definitions: readonly ToolWithSource[];
       }>
     | undefined;
@@ -931,15 +934,31 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     pi.appendEntry(executionTargetEntry, storedTarget(next));
   }
 
-  function saveConnectionIntent(destination: Destination): void {
-    pi.appendEntry(executionTargetIntentEntry, {
+  function saveConnectionIntent(
+    destination: Destination,
+  ): ExecutionTargetIntent {
+    const intent = {
+      id: crypto.randomUUID(),
       destination,
       source: storedTarget(target),
-    });
+    };
+    pi.appendEntry(executionTargetIntentEntry, intent);
+    return intent;
   }
 
-  function clearConnectionIntent(): void {
-    pi.appendEntry(executionTargetIntentEntry, null);
+  function ownsConnectionIntent(
+    ctx: UIContext,
+    intent: ExecutionTargetIntent | undefined,
+  ): intent is ExecutionTargetIntent {
+    return Boolean(intent && loadConnectionIntent(ctx)?.id === intent.id);
+  }
+
+  function clearConnectionIntent(
+    ctx: UIContext,
+    intent: ExecutionTargetIntent | undefined,
+  ): void {
+    if (ownsConnectionIntent(ctx, intent))
+      pi.appendEntry(executionTargetIntentEntry, null);
   }
 
   async function createSandbox(
@@ -1220,6 +1239,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
   function executionRoutes(): Readonly<{
     tools: readonly string[];
     packages: readonly string[];
+    files: readonly string[];
     definitions: readonly ToolWithSource[];
   }> {
     if (routeCatalog) return routeCatalog;
@@ -1227,6 +1247,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       .getAllTools()
       .filter((tool) => !localTools.has(tool.name));
     const packages = new Set<string>();
+    const files = new Set<string>();
     for (const tool of definitions) {
       if (
         tool.sourceInfo.origin === "package" &&
@@ -1238,10 +1259,16 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       ) {
         packages.add(immutablePackageSource(tool));
       }
+      if (
+        tool.sourceInfo.origin === "top-level" &&
+        tool.sourceInfo.scope === "user"
+      )
+        files.add(tool.sourceInfo.path);
     }
     routeCatalog = Object.freeze({
       tools: Object.freeze(definitions.map((tool) => tool.name)),
       packages: Object.freeze([...packages]),
+      files: Object.freeze([...files]),
       definitions: Object.freeze(definitions),
     });
     return routeCatalog;
@@ -1290,6 +1317,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       source_cwd: resume?.localCwd ?? ctx.cwd,
       execution_id: executionId,
       tool_packages: routes.packages,
+      tool_files: routes.files,
       force_reconcile: !resume || forceReconcile,
       sandbox_generation: resume?.sandboxGeneration,
       source:
@@ -1475,10 +1503,13 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
 
   function installProxies(nextBridge: ToolBridge): void {
     const active = pi.getActiveTools();
-    for (const info of executionRoutes().definitions) {
+    const definitions = executionRoutes().definitions.map((info) => {
       const remote = nextBridge.definition(info.name);
       if (!remote)
         throw new Error(`remote tool metadata missing: ${info.name}`);
+      return { info, remote };
+    });
+    for (const { info, remote } of definitions) {
       pi.registerTool({
         ...remote,
         async execute(id, input, signal, onUpdate, toolCtx) {
@@ -1634,6 +1665,14 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       if (["ensure", "delete"].includes(input.action) && !input.name) {
         throw new Error(`${input.action} requires name`);
       }
+      if (
+        input.action === "delete" &&
+        target.kind === "sandbox" &&
+        input.name === target.name
+      )
+        throw new Error(
+          `move this session to local execution before deleting ${target.name}`,
+        );
       if (input.action === "create" || input.action === "delete") {
         const createResources =
           input.cpu !== undefined && input.memory_mb !== undefined
@@ -1679,11 +1718,12 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
   pi.registerCommand("sandbox", {
     description: "Choose where this local Pi session executes tools",
     handler: async (args, ctx) => {
+      let intent: ExecutionTargetIntent | undefined;
       try {
         await ctx.waitForIdle();
         const destination = await destinationFromArgument(args, ctx);
         if (!destination) return;
-        saveConnectionIntent(destination);
+        intent = saveConnectionIntent(destination);
         if (destination.kind === "local") {
           const source = target.kind === "sandbox" ? target : undefined;
           if (source?.workspaceState) {
@@ -1703,9 +1743,10 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
             });
           }
           const local: ExecutionTarget = { kind: "local" };
+          if (!ownsConnectionIntent(ctx, intent)) return;
           await activate(local, ctx);
           if (source) await cleanupTarget(source, ctx, ctx.signal);
-          clearConnectionIntent();
+          clearConnectionIntent(ctx, intent);
           await ctx.reload();
           return;
         }
@@ -1718,13 +1759,14 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
             ? { inheritExecution: false, resume: source }
             : undefined,
         );
+        if (!ownsConnectionIntent(ctx, intent)) return;
         await activate(prepared, ctx);
-        clearConnectionIntent();
+        clearConnectionIntent(ctx, intent);
         if (source && !reconnecting)
           await cleanupTarget(source, ctx, ctx.signal);
       } catch (error) {
         if (runtimeClosed) return;
-        clearConnectionIntent();
+        clearConnectionIntent(ctx, intent);
         ctx.ui.notify(
           error instanceof Error ? error.message : String(error),
           "error",
@@ -1750,8 +1792,9 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     if (!event) return;
     let intendedTarget:
       StoredExecutionTarget | ExecutionTarget | Destination | undefined;
+    let intent: ExecutionTargetIntent | undefined;
     try {
-      const intent = loadConnectionIntent(ctx);
+      intent = loadConnectionIntent(ctx);
       if (intent) {
         intendedTarget = intent.destination;
         let source: Extract<ExecutionTarget, { kind: "sandbox" }> | undefined;
@@ -1776,19 +1819,21 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
               ),
             );
           }
+          if (!ownsConnectionIntent(ctx, intent)) return;
           await activate({ kind: "local" }, ctx);
           if (source) await cleanupTarget(source, ctx);
-          clearConnectionIntent();
+          clearConnectionIntent(ctx, intent);
           return;
         }
         if (source?.name === intent.destination.name) {
-          clearConnectionIntent();
+          clearConnectionIntent(ctx, intent);
           return;
         }
         const prepared = await materializeTarget(intent.destination, ctx);
         intendedTarget = prepared;
+        if (!ownsConnectionIntent(ctx, intent)) return;
         await activate(prepared, ctx);
-        clearConnectionIntent();
+        clearConnectionIntent(ctx, intent);
         return;
       }
       const current = loadSessionTarget(ctx);
@@ -1813,7 +1858,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       await activate({ kind: "local" }, ctx);
     } catch (error) {
       if (runtimeClosed) return;
-      clearConnectionIntent();
+      clearConnectionIntent(ctx, intent);
       placementError =
         error instanceof Error ? error : new Error(String(error));
       if (intendedTarget?.kind === "sandbox") {
@@ -1838,6 +1883,18 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
 
   pi.on("agent_settled", () => {
     void refreshWorkspaceDiff();
+  });
+
+  pi.on("tool_call", (event) => {
+    if (
+      target.kind === "sandbox" &&
+      !localTools.has(event.toolName) &&
+      !executionRoutes().tools.includes(event.toolName)
+    )
+      return {
+        block: true,
+        reason: `${event.toolName} was registered after sandbox activation; run /reload to rebuild the sandbox tool set`,
+      };
   });
 
   pi.on("before_agent_start", async (event, ctx) => {

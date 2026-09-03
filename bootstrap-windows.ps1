@@ -161,8 +161,16 @@ Subsystem sftp sftp-server.exe
 AllowUsers cua
 '@
 Set-Content -Encoding ascii -Path 'C:\ProgramData\ssh\sshd_config' -Value $sshdConfig
+Stop-Service -Name sshd -Force -ErrorAction SilentlyContinue
+Remove-Item -Force -ErrorAction SilentlyContinue 'C:\ProgramData\ssh\ssh_host_*'
+$hostKey = 'C:\ProgramData\ssh\ssh_host_ed25519_key'
+& "$env:WINDIR\System32\OpenSSH\ssh-keygen.exe" -q -t ed25519 -N '""' -f $hostKey
+if ($LASTEXITCODE -ne 0) { throw 'OpenSSH host key generation failed' }
+$bootstrapSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+Invoke-Icacls @($hostKey, '/setowner', '*S-1-5-18')
+Invoke-Icacls @($hostKey, '/inheritance:r', '/grant:r', 'SYSTEM:F', 'Administrators:F', '/remove:g', "*$bootstrapSid")
 Set-Service -Name sshd -StartupType Automatic
-Restart-Service -Name sshd
+Start-Service -Name sshd
 Write-Output '::phase sshd-ready'
 if (-not (Get-NetFirewallRule -Name 'CUA-OpenSSH-Tailnet' -ErrorAction SilentlyContinue)) {
   New-NetFirewallRule -Name 'CUA-OpenSSH-Tailnet' -DisplayName 'CUA OpenSSH over Tailscale' -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 -RemoteAddress '100.64.0.0/10' | Out-Null

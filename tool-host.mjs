@@ -123,6 +123,7 @@ export async function createToolHost({ cwd, agentDir, encodedManifest }) {
 
     const controllers = new Map();
     const children = new Map();
+    const inflight = new Set();
     const write = (message) => {
       if (output.writable) output.write(`${JSON.stringify(message)}\n`);
     };
@@ -207,22 +208,27 @@ export async function createToolHost({ cwd, agentDir, encodedManifest }) {
         });
       child.stdout.on("data", update);
       child.stderr.on("data", update);
-      child.on("error", (error) => {
-        if (timer) clearTimeout(timer);
-        controllers.delete(request.id);
-        children.delete(request.id);
-        write({ type: "error", id: request.id, error: error.message });
-      });
-      child.on("close", (code) => {
-        if (timer) clearTimeout(timer);
-        controllers.delete(request.id);
-        children.delete(request.id);
-        write({
-          type: "bash_result",
-          id: request.id,
-          exitCode: code,
-          timedOut,
-          aborted: controller.signal.aborted,
+      return new Promise((resolve) => {
+        let spawnError;
+        child.on("error", (error) => {
+          spawnError = error;
+        });
+        child.on("close", (code) => {
+          if (timer) clearTimeout(timer);
+          controllers.delete(request.id);
+          children.delete(request.id);
+          if (spawnError) {
+            write({ type: "error", id: request.id, error: spawnError.message });
+          } else {
+            write({
+              type: "bash_result",
+              id: request.id,
+              exitCode: code,
+              timedOut,
+              aborted: controller.signal.aborted,
+            });
+          }
+          resolve();
         });
       });
       controller.signal.addEventListener("abort", () => killChildTree(child), {
@@ -257,7 +263,9 @@ export async function createToolHost({ cwd, agentDir, encodedManifest }) {
         typeof request.id === "string" &&
         typeof request.tool === "string"
       ) {
-        void execute(request);
+        const operation = execute(request);
+        inflight.add(operation);
+        void operation.finally(() => inflight.delete(operation));
         return;
       }
       if (
@@ -267,7 +275,9 @@ export async function createToolHost({ cwd, agentDir, encodedManifest }) {
         (request.timeout === undefined ||
           (typeof request.timeout === "number" && request.timeout > 0))
       ) {
-        bash(request);
+        const operation = bash(request);
+        inflight.add(operation);
+        void operation.finally(() => inflight.delete(operation));
         return;
       }
       if (request.type === "cancel" && typeof request.id === "string") {
@@ -334,6 +344,7 @@ export async function createToolHost({ cwd, agentDir, encodedManifest }) {
     onData(Buffer.alloc(0));
     input.resume?.();
     await closed;
+    await Promise.allSettled([...inflight]);
     if (activeDetach === detach) activeDetach = undefined;
     return { disposeRequested };
   }

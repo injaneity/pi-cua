@@ -144,6 +144,30 @@ class ResourceCreationTests(unittest.IsolatedAsyncioTestCase):
             PINNED_IMAGE, os_type="linux", kind="vm"
         )
 
+    async def test_delete_removes_the_last_custom_pool(self) -> None:
+        resources = backend.sandbox_resources("linux", 16, 64 * 1024)
+        pool = AsyncMock()
+        sdk = SimpleNamespace(Sandbox=AsyncMock(), Pool=AsyncMock())
+        sdk.Pool.get.return_value = pool
+        with (
+            patch.dict("sys.modules", {"cua_sandbox": sdk}),
+            patch.object(
+                backend,
+                "managed_sandboxes",
+                return_value=[
+                    {"name": "linux-1", "os": "linux", "pool": resources.pool}
+                ],
+            ),
+            patch.object(backend, "restore_cua_state"),
+            patch.object(backend, "remove_sandbox_record") as remove,
+        ):
+            result = await backend.delete_one("linux-1")
+
+        self.assertTrue(result["deleted"])
+        sdk.Pool.get.assert_awaited_once_with(resources.pool)
+        pool.delete.assert_awaited_once()
+        remove.assert_called_once_with("linux-1")
+
     async def test_dispatch_passes_resources_to_create(self) -> None:
         create = AsyncMock(return_value={"name": "linux-1"})
         with (
@@ -464,6 +488,36 @@ class WorkspaceTests(unittest.TestCase):
         self.assertNotIn("models.json", files)
         self.assertNotIn("settings.json", files)
 
+    def test_remote_config_copies_only_declared_regular_tool_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            pi_dir = Path(directory) / ".pi" / "agent"
+            extensions = pi_dir / "extensions"
+            extensions.mkdir(parents=True)
+            declared = extensions / "declared.ts"
+            undeclared = extensions / "undeclared.ts"
+            declared.write_text("declared")
+            undeclared.write_text("undeclared")
+            with patch.object(backend, "PI_DIR", pi_dir):
+                files = backend.remote_pi_files((str(declared),))
+
+        self.assertEqual(files["extensions/declared.ts"], b"declared")
+        self.assertNotIn("extensions/undeclared.ts", files)
+
+    def test_remote_config_rejects_symlinked_tool_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            pi_dir = Path(directory) / ".pi" / "agent"
+            extensions = pi_dir / "extensions"
+            extensions.mkdir(parents=True)
+            secret = Path(directory) / "secret"
+            secret.write_text("secret")
+            linked = extensions / "linked.ts"
+            linked.symlink_to(secret)
+            with (
+                patch.object(backend, "PI_DIR", pi_dir),
+                self.assertRaisesRegex(ValueError, "outside"),
+            ):
+                backend.remote_pi_files((str(linked),))
+
     def test_windows_runtime_install_publishes_one_generation(self) -> None:
         with (
             patch.object(backend, "copy_guest_file") as copy,
@@ -487,6 +541,7 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn("pi.cmd' update --extensions --no-approve", script)
         self.assertLess(script.index("update --extensions"), script.index("complete"))
         self.assertLess(script.index("complete"), script.index("Move-Item -Force"))
+        self.assertIn("Select-Object -Skip 3", script)
         self.assertEqual(run.call_args.kwargs["timeout"], 600)
 
     def test_linux_runtime_install_publishes_after_packages(self) -> None:
@@ -504,6 +559,7 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn("pi update --extensions --no-approve", script)
         self.assertLess(script.index("update --extensions"), script.index("complete"))
         self.assertIn('mv "$staging" "$runtime"', script)
+        self.assertIn("tail -n +4", script)
         self.assertEqual(run.call_args.kwargs["timeout"], 600)
 
     def test_guest_bundle_contains_only_requested_tool_packages(self) -> None:
@@ -618,6 +674,18 @@ class WorkspaceTests(unittest.TestCase):
             backend.apply_workspace_patch(root, local_patch, merged_tree)
 
             self.assertEqual(path.read_text(), "sandbox\nsecond\nlocal\n")
+
+    def test_workspace_apply_rejects_a_changed_local_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.repository(directory)
+            (root / "tracked.txt").write_text("before\n")
+            subprocess.run(["git", "-C", root, "add", "."], check=True)
+            subprocess.run(["git", "-C", root, "commit", "-qm", "initial"], check=True)
+            _, before = backend.workspace_tree(root)
+            (root / "tracked.txt").write_text("changed during sync\n")
+
+            with self.assertRaisesRegex(RuntimeError, "changed while"):
+                backend.apply_workspace_patch(root, b"", before, before_tree=before)
 
     def test_workspace_merge_rejects_conflicts_without_changing_local_files(
         self,
@@ -919,6 +987,25 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
                 full_preflight.assert_not_called()
                 prepare.assert_not_called()
                 self.assertIn(execution_id, run.call_args.args[2])
+
+    async def test_non_git_runtime_install_requires_free_disk(self) -> None:
+        preflight = backend.GuestRuntimePreflight("100.64.0.2", False, 1024)
+        with (
+            patch.object(
+                backend,
+                "managed_sandboxes",
+                return_value=[{"name": "linux-1", "os": "linux"}],
+            ),
+            patch.object(backend, "inspect_workspace", return_value=None),
+            patch.object(backend, "guest_runtime_preflight", return_value=preflight),
+            patch.object(backend, "install_guest_runtime") as install,
+            self.assertRaisesRegex(RuntimeError, "requires 1 GiB free"),
+        ):
+            await backend.activate_execution(
+                "linux-1", "/not-a-repository", "session-1"
+            )
+
+        install.assert_not_called()
 
     def test_non_git_execution_ids_do_not_share_a_directory(self) -> None:
         with patch.object(
@@ -1336,6 +1423,14 @@ class WindowsDesktopBrokerTests(unittest.TestCase):
 
         self.assertIn("Windows NT\\Reliability", script)
         self.assertIn("-Name ShutdownReasonOn -Value 0", script)
+
+    def test_bootstrap_regenerates_windows_ssh_host_keys(self) -> None:
+        script = backend.bootstrap_template("windows")
+
+        self.assertIn("ssh_host_*", script)
+        self.assertIn('ssh-keygen.exe" -q -t ed25519', script)
+        self.assertIn("'/remove:g', \"*$bootstrapSid\"", script)
+        self.assertLess(script.index("ssh-keygen.exe"), script.index("Start-Service"))
 
     def test_bootstrap_registers_an_interactive_logon_task(self) -> None:
         script = backend.bootstrap_template("windows")

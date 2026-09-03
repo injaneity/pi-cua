@@ -236,8 +236,10 @@ def bootstrap_digest(profile: str) -> str:
     return digest.hexdigest()[:20]
 
 
-def guest_runtime_files(packages: tuple[str, ...] = ()) -> dict[str, bytes]:
-    files = remote_pi_files()
+def guest_runtime_files(
+    packages: tuple[str, ...] = (), tool_files: tuple[str, ...] = ()
+) -> dict[str, bytes]:
+    files = remote_pi_files(tool_files)
     files["cua-runtime.json"] = b'{"packageInstall":"production-without-peer-copies"}\n'
     files["settings.json"] = (
         json.dumps({"packages": list(packages)}, indent=2).encode() + b"\n"
@@ -830,24 +832,22 @@ def next_name(profile: str) -> str:
     raise RuntimeError(f"no free {profile} name")
 
 
-def remote_pi_files() -> dict[str, bytes]:
+def remote_pi_files(tool_files: tuple[str, ...] = ()) -> dict[str, bytes]:
     files = {"cua-tool-host.mjs": (EXTENSION_DIR / "tool-host.mjs").read_bytes()}
-    extensions = PI_DIR / "extensions"
-    if extensions.exists():
-        for source in extensions.rglob("*"):
-            parts = source.relative_to(PI_DIR).parts
-            if (
-                not source.is_file()
-                or any(
-                    "cua-sandbox" in part or "report-papercut" in part for part in parts
-                )
-                or any(
-                    part in {"node_modules", ".git", "__pycache__"} for part in parts
-                )
-            ):
-                continue
-            remote = PurePosixPath(*parts).as_posix()
-            files[remote] = source.read_bytes()
+    extensions = (PI_DIR / "extensions").resolve()
+    for value in tool_files:
+        source = Path(value)
+        resolved = source.resolve()
+        if (
+            source.is_symlink()
+            or not resolved.is_file()
+            or not resolved.is_relative_to(extensions)
+        ):
+            raise ValueError(
+                f"tool file is outside the user extension directory: {value}"
+            )
+        relative = resolved.relative_to(PI_DIR.resolve())
+        files[PurePosixPath(*relative.parts).as_posix()] = resolved.read_bytes()
     return files
 
 
@@ -858,7 +858,19 @@ async def upload_linux_config(sb: Any, tailnet: str) -> None:
     )
     result = await sb.shell.run("chmod 600 /tmp/cua-tailscale-auth-key", timeout=30)
     if result.returncode != 0:
+        await sb.shell.run("rm -f /tmp/cua-tailscale-auth-key", timeout=20)
         raise RuntimeError(result.stderr or "failed to secure bootstrap credentials")
+
+
+async def cleanup_bootstrap_inputs(sb: Any, command: str, phase: str) -> None:
+    try:
+        result = await sb.shell.run(command, timeout=20)
+        if result.returncode != 0:
+            raise RuntimeError(
+                result.stderr or f"credential cleanup exited {result.returncode}"
+            )
+    except (RuntimeError, TimeoutError) as error:
+        progress(phase, "credential cleanup failed", error=error_text(error))
 
 
 async def bootstrap_linux(sb: Any, name: str, tailnet: str) -> str:
@@ -875,9 +887,16 @@ async def bootstrap_linux(sb: Any, name: str, tailnet: str) -> str:
     # The Fleet exec gateway drops any single shell.run after ~30 seconds, so
     # the long bootstrap must run detached in the guest and be polled with
     # short commands — same contract as run_windows_background_job.
-    code, output = await run_linux_background_job(
-        sb, script, f"bootstrap.{name}.linux", 1200
-    )
+    try:
+        code, output = await run_linux_background_job(
+            sb, script, f"bootstrap.{name}.linux", 1200
+        )
+    finally:
+        await cleanup_bootstrap_inputs(
+            sb,
+            "rm -f /tmp/cua-tailscale-auth-key",
+            f"bootstrap.{name}.cleanup",
+        )
     if code != 0:
         raise RuntimeError((output or "linux bootstrap failed").strip())
     lines = output.strip().splitlines()
@@ -1069,33 +1088,44 @@ async def bootstrap_windows(sb: Any, name: str, tailnet: str) -> str:
             ".pi/agent/cua-tool-broker.mjs",
             (EXTENSION_DIR / "tool-broker.mjs").read_bytes(),
         )
-    await upload_windows_file(
-        sb, r"C:\Windows\Temp\cua-pi-agent.zip", archive.getvalue()
-    )
-    await upload_windows_file(
-        sb, r"C:\Windows\Temp\cua-authorized-key.pub", WINDOWS_PUBLIC_KEY.read_bytes()
-    )
-    await upload_windows_file(
-        sb,
-        r"C:\Windows\Temp\cua-tailscale-auth-key",
-        tailscale_auth_key(tailnet).encode(),
-    )
-    script = (
-        bootstrap_template("windows")
-        .replace("__HOSTNAME__", name)
-        .replace("__BOOTSTRAP_VERSION__", bootstrap_digest("windows"))
-        .replace("__PI_VERSION__", pi_version())
-    )
-    await upload_windows_file(
-        sb, r"C:\Windows\Temp\cua-bootstrap.ps1", script.encode("utf-8-sig")
-    )
-    progress(f"bootstrap.{name}.upload", "Windows bootstrap inputs uploaded")
-    code, output = await run_windows_background_job(
-        sb,
-        r"C:\Windows\Temp\cua-bootstrap.ps1",
-        f"bootstrap.{name}.windows",
-        1800,
-    )
+    try:
+        await upload_windows_file(
+            sb, r"C:\Windows\Temp\cua-pi-agent.zip", archive.getvalue()
+        )
+        await upload_windows_file(
+            sb,
+            r"C:\Windows\Temp\cua-authorized-key.pub",
+            WINDOWS_PUBLIC_KEY.read_bytes(),
+        )
+        await upload_windows_file(
+            sb,
+            r"C:\Windows\Temp\cua-tailscale-auth-key",
+            tailscale_auth_key(tailnet).encode(),
+        )
+        script = (
+            bootstrap_template("windows")
+            .replace("__HOSTNAME__", name)
+            .replace("__BOOTSTRAP_VERSION__", bootstrap_digest("windows"))
+            .replace("__PI_VERSION__", pi_version())
+        )
+        await upload_windows_file(
+            sb, r"C:\Windows\Temp\cua-bootstrap.ps1", script.encode("utf-8-sig")
+        )
+        progress(f"bootstrap.{name}.upload", "Windows bootstrap inputs uploaded")
+        code, output = await run_windows_background_job(
+            sb,
+            r"C:\Windows\Temp\cua-bootstrap.ps1",
+            f"bootstrap.{name}.windows",
+            1800,
+        )
+    finally:
+        await cleanup_bootstrap_inputs(
+            sb,
+            'powershell.exe -NoProfile -Command "Remove-Item -Force -ErrorAction SilentlyContinue '
+            "'C:\\Windows\\Temp\\cua-pi-agent.zip','C:\\Windows\\Temp\\cua-authorized-key.pub',"
+            "'C:\\Windows\\Temp\\cua-tailscale-auth-key','C:\\Windows\\Temp\\cua-bootstrap.ps1'; exit 0\"",
+            f"bootstrap.{name}.cleanup",
+        )
     if code != 0:
         raise RuntimeError(output or f"windows bootstrap exited {code}")
     address = await healthy(sb, "windows")
@@ -1358,12 +1388,26 @@ async def delete_one(name: str) -> dict[str, Any]:
     states = {item["name"]: item for item in managed_sandboxes()}
     if name not in states:
         raise ValueError(f"unknown managed sandbox: {name}")
-    from cua_sandbox import Sandbox
+    from cua_sandbox import Pool, Sandbox
 
     # Release by persisted claim reference. Connecting first would make deletion
     # depend on the guest computer service being healthy.
     restore_cua_state(name)
-    await Sandbox.delete(name)
+    try:
+        await Sandbox.delete(name)
+    except LookupError:
+        pass
+    pool_name = states[name]["pool"]
+    if (
+        CUSTOM_POOL_PATTERN.fullmatch(pool_name)
+        and pool_reference_count(pool_name) == 1
+    ):
+        try:
+            pool = await Pool.get(pool_name)
+        except LookupError:
+            pool = None
+        if pool is not None:
+            await pool.delete()
     remove_sandbox_record(name)
     return {"name": name, "deleted": True}
 
@@ -1473,6 +1517,14 @@ def require_sandbox_source(value: object) -> SandboxWorkspaceSource:
     if "state" not in source:
         raise TypeError("source has no Git workspace state")
     return cast(SandboxWorkspaceSource, source)
+
+
+def require_tool_files(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list) or any(
+        not isinstance(path, str) or not path for path in value
+    ):
+        raise TypeError("tool_files must contain file paths")
+    return tuple(dict.fromkeys(value))
 
 
 def require_tool_packages(value: object) -> tuple[str, ...]:
@@ -1722,7 +1774,11 @@ def merge_workspace_patch(
     return workspace_patch(root, local_tree, merged_tree), merged_tree
 
 
-def apply_workspace_patch(root: Path, patch: bytes, expected_tree: str) -> None:
+def apply_workspace_patch(
+    root: Path, patch: bytes, expected_tree: str, before_tree: str | None = None
+) -> None:
+    if before_tree is not None and workspace_tree(root)[1] != before_tree:
+        raise RuntimeError("local workspace changed while sandbox sync was running")
     command = ["git", "-C", str(root), "apply", "--binary", "--whitespace=nowarn"]
     if patch:
         subprocess.run(command, input=patch, check=True, timeout=300)
@@ -1831,7 +1887,7 @@ def ssh_options(profile: str) -> list[str]:
         "-o",
         "BatchMode=yes",
         "-o",
-        "StrictHostKeyChecking=accept-new",
+        "StrictHostKeyChecking=yes",
         "-o",
         f"UserKnownHostsFile={SANDBOX_KNOWN_HOSTS}",
         "-o",
@@ -1854,6 +1910,7 @@ class GuestPreflight:
 class GuestRuntimePreflight:
     address: str
     runtime_available: bool
+    free_bytes: int = 1024**3
 
 
 def windows_broker_ready(name: str) -> bool:
@@ -1889,8 +1946,9 @@ def guest_runtime_preflight(
         complete = shlex.quote(f"/home/cua/.cua-pi/runtimes/{runtime_digest}/complete")
         command = f"""set -u
 address=$({guest_health_command(profile)}) || exit 20
+free_bytes=$(( $(df -Pk /home/cua | awk 'NR == 2 {{ print $4 }}') * 1024 ))
 if [ -f {complete} ]; then ready=1; else ready=0; fi
-printf '%s|%s\n' "$address" "$ready"
+printf '%s|%s|%s\n' "$address" "$free_bytes" "$ready"
 """
     else:
         complete = powershell_literal(
@@ -1898,8 +1956,9 @@ printf '%s|%s\n' "$address" "$ready"
         )
         script = (
             windows_ssh_health_script()
+            + "$free = [IO.DriveInfo]::new('C:\\').AvailableFreeSpace\n"
             + f'$ready = if (Test-Path {complete}) {{ "1" }} else {{ "0" }}\n'
-            + '"healthy|$ready"\n'
+            + '"healthy|$free|$ready"\n'
         )
         command = powershell_encoded_command(script)
     try:
@@ -1914,17 +1973,18 @@ printf '%s|%s\n' "$address" "$ready"
         return None
     fields = next(
         (
-            candidate.split("|", 1)
+            candidate.split("|")
             for candidate in reversed(result.stdout.strip().splitlines())
             if "|" in candidate
         ),
         [],
     )
-    if len(fields) != 2:
+    if len(fields) != 3 or not fields[1].isdigit() or fields[2] not in {"0", "1"}:
         return None
     return GuestRuntimePreflight(
         address=name if profile == "windows" else fields[0],
-        runtime_available=fields[1] == "1",
+        free_bytes=int(fields[1]),
+        runtime_available=fields[2] == "1",
     )
 
 
@@ -2178,6 +2238,7 @@ npm_config_omit=dev npm_config_legacy_peer_deps=true PI_CODING_AGENT_DIR="$stagi
 printf '%s\n' {shlex.quote(digest)} > "$staging/complete"
 rm -rf "$runtime"
 mv "$staging" "$runtime"
+find "$runtimes" -mindepth 1 -maxdepth 1 -type d -regextype posix-extended -regex '.*/[0-9a-f]{{20}}' -printf '%T@ %p\n' | sort -rn | tail -n +4 | cut -d' ' -f2- | xargs -r rm -rf --
 if [ -f /home/cua/.cua-pi/config-files ]; then
   while IFS= read -r path; do
     case "$path" in .pi/agent/cua-tool-broker.mjs) ;; .pi/agent/*) rm -f -- "/home/cua/$path" ;; esac
@@ -2205,6 +2266,7 @@ if ($LASTEXITCODE -ne 0) {{ throw "Pi package synchronization failed with exit $
 Set-Content -NoNewline -Path (Join-Path $staging 'complete') -Value {powershell_literal(digest)}
 Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $runtime
 Move-Item -Force $staging $runtime
+Get-ChildItem -Directory $runtimes | Where-Object Name -Match '^[0-9a-f]{20}$' | Sort-Object LastWriteTime -Descending | Select-Object -Skip 3 | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 $legacyManifest = 'C:\Users\cua\.cua-pi\config-files'
 if (Test-Path $legacyManifest) {{
   Get-Content $legacyManifest | ForEach-Object {{
@@ -2589,7 +2651,9 @@ def sync_workspace_to_local(
         f"applying {len(patch_to_apply) / 1048576:.1f} MiB of sandbox changes",
     )
     try:
-        apply_workspace_patch(local_root, patch_to_apply, final_tree)
+        apply_workspace_patch(
+            local_root, patch_to_apply, final_tree, before_tree=local_tree
+        )
     except subprocess.CalledProcessError as error:
         raise RuntimeError(
             "sandbox changes do not apply cleanly to the local workspace"
@@ -2604,6 +2668,7 @@ async def activate_execution(
     source: SandboxWorkspaceSource | None = None,
     resume: SandboxResumeSource | None = None,
     tool_packages: tuple[str, ...] = (),
+    tool_files: tuple[str, ...] = (),
     force_reconcile: bool = True,
     sandbox_generation: str | None = None,
 ) -> dict[str, Any]:
@@ -2620,7 +2685,7 @@ async def activate_execution(
     )
     identity_digest = execution_digest(execution_key)
     execution_id = identity_digest[:16]
-    config_files = guest_runtime_files(tool_packages)
+    config_files = guest_runtime_files(tool_packages, tool_files)
     guest_digest = runtime_digest(config_files)
     candidate = states[name].get("address") or name
     current_generation = states[name].get("generation")
@@ -2652,6 +2717,11 @@ async def activate_execution(
         runtime = guest_runtime_preflight(candidate, profile, guest_digest)
         if runtime is None:
             raise SandboxRepairRequired(f"sandbox repair required: {name}")
+        if not runtime.runtime_available and runtime.free_bytes < 1024**3:
+            raise RuntimeError(
+                "runtime setup requires 1 GiB free; "
+                f"only {runtime.free_bytes // 1048576} MiB is available"
+            )
         if not runtime.runtime_available:
             install_guest_runtime(
                 runtime.address,
@@ -2827,6 +2897,7 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
             require_sandbox_source(source_value) if source_value is not None else None
         )
         tool_packages = require_tool_packages(request.get("tool_packages", []))
+        tool_files = require_tool_files(request.get("tool_files", []))
         resume_value = request.get("resume")
         resume = (
             require_resume_source(resume_value) if resume_value is not None else None
@@ -2844,6 +2915,7 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
             source,
             resume,
             tool_packages,
+            tool_files,
             force_reconcile,
             sandbox_generation,
         )
