@@ -8,6 +8,7 @@ import subprocess
 import tarfile
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -363,6 +364,90 @@ class ManagedSandboxTests(unittest.TestCase):
                 ),
             ):
                 backend.migrate_sdk_sandbox_records()
+
+    def test_multiple_resource_locks_are_unique_and_ordered(self) -> None:
+        entered = []
+
+        @contextmanager
+        def record_lock(path: Path):
+            entered.append(path)
+            yield
+
+        first = Path("z.lock")
+        second = Path("a.lock")
+        with (
+            patch.object(backend, "operation_lock", side_effect=record_lock),
+            backend.operation_locks([first, second, first]),
+        ):
+            pass
+
+        self.assertEqual(entered, [second, first])
+
+    def test_unrelated_activations_use_disjoint_sandbox_locks(self) -> None:
+        records = [
+            {"name": "linux-1", "address": "100.64.0.1"},
+            {"name": "windows-1", "address": "100.64.0.2"},
+        ]
+        with patch.object(backend, "managed_sandboxes", return_value=records):
+            linux = set(
+                backend.request_lock_paths(
+                    {"action": "activate_execution", "name": "linux-1"}
+                )
+            )
+            windows = set(
+                backend.request_lock_paths(
+                    {"action": "activate_execution", "name": "windows-1"}
+                )
+            )
+
+        self.assertEqual(len(linux), 1)
+        self.assertEqual(len(windows), 1)
+        self.assertTrue(linux.isdisjoint(windows))
+        self.assertNotIn(backend.CONTROLLER_LOCK, linux | windows)
+
+    def test_transfer_locks_its_source_and_destination_without_alias_drift(
+        self,
+    ) -> None:
+        records = [
+            {"name": "linux-1", "address": "100.64.0.1"},
+            {"name": "windows-1", "address": "100.64.0.2"},
+        ]
+        with patch.object(backend, "managed_sandboxes", return_value=records):
+            locks = set(
+                backend.request_lock_paths(
+                    {
+                        "action": "activate_execution",
+                        "name": "windows-1",
+                        "source": {"address": "100.64.0.1"},
+                    }
+                )
+            )
+            source = set(
+                backend.request_lock_paths(
+                    {
+                        "action": "cleanup_workspace",
+                        "source": {"address": "100.64.0.1"},
+                    }
+                )
+            )
+
+        self.assertEqual(len(locks), 2)
+        self.assertEqual(len(source), 1)
+        self.assertTrue(source < locks)
+
+    def test_lifecycle_uses_controller_and_target_locks(self) -> None:
+        records = [{"name": "linux-1", "address": "100.64.0.1"}]
+        with patch.object(backend, "managed_sandboxes", return_value=records):
+            ensure = set(
+                backend.request_lock_paths({"action": "ensure", "name": "linux-1"})
+            )
+            delete = set(
+                backend.request_lock_paths({"action": "delete", "name": "linux-1"})
+            )
+
+        self.assertEqual(len(ensure), 2)
+        self.assertIn(backend.CONTROLLER_LOCK, ensure)
+        self.assertEqual(delete, ensure)
 
     def test_controller_record_is_the_only_runtime_index(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

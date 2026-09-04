@@ -28,7 +28,7 @@ import time
 import uuid
 import zipfile
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -267,6 +267,65 @@ def operation_lock(path: Path) -> Iterator[None]:
             yield
         finally:
             fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
+@contextmanager
+def operation_locks(paths: list[Path]) -> Iterator[None]:
+    with ExitStack() as stack:
+        for path in sorted(set(paths)):
+            stack.enter_context(operation_lock(path))
+        yield
+
+
+def resource_lock(kind: str, value: str) -> Path:
+    digest = hashlib.sha256(f"{kind}\0{value}".encode()).hexdigest()[:20]
+    return CONTROLLER_DIR / f"{kind}-{digest}.lock"
+
+
+def request_lock_paths(request: dict[str, Any]) -> list[Path]:
+    action = request.get("action")
+    paths = []
+    if action in {"create", "ensure", "delete", "register", "unregister"}:
+        paths.append(CONTROLLER_LOCK)
+
+    resources = []
+    name = request.get("name")
+    if (
+        action
+        in {
+            "create",
+            "ensure",
+            "delete",
+            "register",
+            "unregister",
+            "activate_execution",
+        }
+        and isinstance(name, str)
+        and name
+    ):
+        resources.append(name)
+    source = request.get("source")
+    if action in {
+        "activate_execution",
+        "sync_workspace_to_local",
+        "cleanup_workspace",
+    } and isinstance(source, dict):
+        address = source.get("address")
+        if isinstance(address, str) and address:
+            resources.append(address)
+
+    records = managed_sandboxes() if resources else []
+    for value in resources:
+        canonical = next(
+            (
+                str(item["name"])
+                for item in records
+                if value in {item.get("name"), item.get("address")}
+            ),
+            value,
+        )
+        paths.append(resource_lock("sandbox", canonical))
+    return paths
 
 
 @dataclass(frozen=True)
@@ -3117,19 +3176,11 @@ def main() -> None:
         quiet_request = action in {"list", "workspace_diff_status"}
         if not quiet_request:
             progress("request", "accepted", action=action, name=request.get("name"))
-        if action in {
-            "create",
-            "ensure",
-            "delete",
-            "register",
-            "unregister",
-            "activate_execution",
-            "sync_workspace_to_local",
-            "cleanup_workspace",
-        }:
-            progress("lock", "waiting for controller mutation lock")
-            with operation_lock(CONTROLLER_LOCK):
-                progress("lock", "acquired controller mutation lock")
+        locks = request_lock_paths(request)
+        if locks:
+            progress("lock", "waiting for operation slot")
+            with operation_locks(locks):
+                progress("lock", "acquired operation slot")
                 result = asyncio.run(dispatch(request))
         else:
             result = asyncio.run(dispatch(request))
