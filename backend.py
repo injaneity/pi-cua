@@ -14,6 +14,7 @@ import base64
 import fcntl
 import hashlib
 import io
+import ipaddress
 import json
 import os
 import re
@@ -285,7 +286,7 @@ def resource_lock(kind: str, value: str) -> Path:
 def request_lock_paths(request: dict[str, Any]) -> list[Path]:
     action = request.get("action")
     paths = []
-    if action in {"create", "ensure", "delete", "register", "unregister"}:
+    if action in {"create", "ensure", "delete"}:
         paths.append(CONTROLLER_LOCK)
 
     resources = []
@@ -296,8 +297,6 @@ def request_lock_paths(request: dict[str, Any]) -> list[Path]:
             "create",
             "ensure",
             "delete",
-            "register",
-            "unregister",
             "activate_execution",
         }
         and isinstance(name, str)
@@ -416,8 +415,15 @@ def uses_fleet(request: dict[str, Any]) -> bool:
     if action not in {"ensure", "delete"}:
         return False
     name = request.get("name")
-    record = sandbox_record(name) if isinstance(name, str) else None
-    return record is None or record.get("kind") != "external"
+    if not isinstance(name, str):
+        return True
+    record = sandbox_record(name)
+    if record is not None:
+        return record.get("kind") != "external"
+    target = next(
+        (item for item in tailnet_sandboxes() if item.get("name") == name), None
+    )
+    return target is None
 
 
 def write_sandbox_record(record: dict[str, Any]) -> None:
@@ -689,8 +695,66 @@ def configure_fleet_auth() -> None:
     )
 
 
+def tailscale_ipv4(values: object) -> str | None:
+    if not isinstance(values, list):
+        return None
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        try:
+            address = ipaddress.ip_address(value)
+        except ValueError:
+            continue
+        if address.version == 4:
+            return value
+    return None
+
+
+def tailnet_sandboxes() -> list[dict[str, Any]]:
+    status = local_tailscale_status() or {}
+    tailnet = (status.get("CurrentTailnet") or {}).get("Name")
+    peers = (status.get("Peer") or {}).values()
+    sandboxes: dict[str, tuple[tuple[bool, str], dict[str, Any]]] = {}
+    for peer in peers:
+        if not isinstance(peer, dict) or "tag:cua-sandbox" not in (
+            peer.get("Tags") or []
+        ):
+            continue
+        if str(peer.get("OS") or "").lower() != "macos":
+            continue
+        name = str(peer.get("HostName") or "").lower()
+        if not NAME_PATTERN.fullmatch(name):
+            continue
+        address = tailscale_ipv4(peer.get("TailscaleIPs"))
+        generation = peer.get("StableID") or peer.get("ID")
+        if not address or not isinstance(generation, str) or not generation:
+            continue
+        item = {
+            "name": name,
+            "os": "macos",
+            "pool": "external",
+            "kind": "external",
+            "discovered": True,
+            "address": address,
+            "generation": generation,
+            **({"tailnet": tailnet} if isinstance(tailnet, str) else {}),
+        }
+        rank = (peer.get("Online") is True, str(peer.get("Created") or ""))
+        if name not in sandboxes or rank > sandboxes[name][0]:
+            sandboxes[name] = (rank, item)
+    return [item for _, item in sandboxes.values()]
+
+
 def managed_sandboxes() -> list[dict[str, Any]]:
-    return controller_sandboxes()
+    records = controller_sandboxes()
+    names = {item["name"] for item in records}
+    return sorted(
+        [
+            *records,
+            *(item for item in tailnet_sandboxes() if item["name"] not in names),
+        ],
+        key=lambda item: item["name"],
+    )
 
 
 async def guest_tailscale_identity(sb: Any, profile: str) -> tuple[str, str, list[str]]:
@@ -1339,86 +1403,11 @@ async def complete_tailscale_enrollment(
     )
 
 
-def register_external_macos(name: str, address: str) -> dict[str, Any]:
-    validate_name(name)
-    if sandbox_record(name) is not None:
-        raise ValueError(f"managed sandbox already exists: {name}")
-    if not re.fullmatch(r"[A-Za-z0-9._:-]+", address):
-        raise ValueError("external address must be a host or IP")
-    if not MACOS_IDENTITY.is_file():
-        raise RuntimeError(f"macOS SSH identity is missing: {MACOS_IDENTITY}")
-    known = subprocess.run(
-        ["ssh-keygen", "-F", address, "-f", str(SANDBOX_KNOWN_HOSTS)],
-        capture_output=True,
-        text=True,
-        timeout=10,
-        check=False,
-    )
-    if known.returncode != 0 or not known.stdout.strip():
-        raise RuntimeError(f"SSH host key is not pinned for external host: {address}")
-    status = local_tailscale_status() or {}
-    peer = next(
-        (
-            item
-            for item in (status.get("Peer") or {}).values()
-            if isinstance(item, dict)
-            and (
-                str(item.get("HostName") or "").lower() == name.lower()
-                or str(item.get("DNSName") or "").lower().startswith(f"{name.lower()}.")
-            )
-        ),
-        None,
-    )
-    generation = (
-        peer.get("StableID") or peer.get("ID") if isinstance(peer, dict) else None
-    )
-    if not isinstance(generation, str) or not generation:
-        raise RuntimeError(f"external host is not a Tailscale peer named {name}")
-    record = {
-        "name": name,
-        "os": "macos",
-        "pool": "external",
-        "kind": "external",
-        "addresses": [address],
-        "sshUser": "administrator",
-        "updatedAt": datetime.now(timezone.utc).isoformat(),
-        **({"deviceId": generation} if isinstance(generation, str) else {}),
-    }
-    write_sandbox_record(record)
-    try:
-        result = run_guest_ssh(
-            address,
-            "macos",
-            guest_health_command("macos"),
-            timeout=30,
-            report=False,
-        )
-        health = guest_health_address(result, name)
-    except Exception:
-        remove_sandbox_record(name)
-        raise
-    return {
-        "name": name,
-        "os": "macos",
-        "address": address,
-        "changed": True,
-        "health": health,
-    }
-
-
 def guest_health_address(result: subprocess.CompletedProcess[str], name: str) -> str:
     lines = result.stdout.strip().splitlines()
     if not lines:
         raise RuntimeError(f"external host returned no Tailscale address: {name}")
     return lines[-1]
-
-
-def unregister_external(name: str) -> dict[str, Any]:
-    record = sandbox_record(name)
-    if record is None or record.get("kind") != "external":
-        raise ValueError(f"unknown external sandbox: {name}")
-    remove_sandbox_record(name)
-    return {"name": name, "removed": True}
 
 
 async def ensure_one(name: str) -> dict[str, Any]:
@@ -1428,6 +1417,8 @@ async def ensure_one(name: str) -> dict[str, Any]:
     profile = states[name]["os"]
     if states[name].get("kind") == "external":
         address = str(states[name].get("address") or "")
+        if states[name].get("discovered") is True:
+            pin_verified_ssh_host_key(address)
         result = run_guest_ssh(
             address,
             profile,
@@ -1587,7 +1578,7 @@ async def delete_one(name: str) -> dict[str, Any]:
         raise ValueError(f"unknown managed sandbox: {name}")
     if states[name].get("kind") == "external":
         raise ValueError(
-            f"{name} is an external host; unregister it instead of deleting it"
+            f"{name} is an external Tailscale peer; remove tag:cua-sandbox instead of deleting it"
         )
     from cua_sandbox import Pool, Sandbox
 
@@ -2905,6 +2896,8 @@ async def activate_execution(
     if name not in states:
         raise ValueError(f"unknown managed sandbox: {name}")
     profile = states[name]["os"]
+    if states[name].get("discovered") is True:
+        pin_verified_ssh_host_key(str(states[name].get("address") or ""))
     if source and resume:
         raise ValueError("activate_execution cannot transfer and resume simultaneously")
     if resume and resume["os"] != profile:
@@ -3105,12 +3098,6 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         return sync_workspace_to_local(source, local_cwd)
     if uses_fleet(request):
         configure_fleet_auth()
-    if action == "register":
-        return register_external_macos(
-            str(request.get("name") or ""), str(request.get("address") or "")
-        )
-    if action == "unregister":
-        return unregister_external(str(request.get("name") or ""))
     if action == "create":
         return await create_one(
             str(request.get("os") or ""),
@@ -3155,7 +3142,7 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
             sandbox_generation,
         )
     raise ValueError(
-        "action must be list, create, ensure, delete, register, unregister, activate_execution, sync_workspace_to_local, cleanup_workspace, or workspace_diff_status"
+        "action must be list, create, ensure, delete, activate_execution, sync_workspace_to_local, cleanup_workspace, or workspace_diff_status"
     )
 
 

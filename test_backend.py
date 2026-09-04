@@ -77,56 +77,92 @@ class ControllerPrerequisiteTests(unittest.TestCase):
 
 
 class ExternalMacTests(unittest.IsolatedAsyncioTestCase):
-    async def test_registers_a_pinned_external_mac_and_keeps_it_out_of_fleet(
+    async def test_discovers_tagged_macos_peers_without_controller_records(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            identity = root / "identity"
-            identity.touch()
-            known_hosts = root / "known_hosts"
-            known_hosts.write_text("mac.example.test ssh-ed25519 key\n")
-            status = {
-                "Peer": {
-                    "node": {
-                        "HostName": "mac-1",
-                        "StableID": "node-generation",
-                    }
-                }
-            }
-            with (
-                patch.object(backend, "SANDBOX_RECORD_DIR", root / "records"),
-                patch.object(backend, "MACOS_IDENTITY", identity),
-                patch.object(backend, "SANDBOX_KNOWN_HOSTS", known_hosts),
-                patch.object(backend, "local_tailscale_status", return_value=status),
-                patch.object(backend, "pi_version", return_value="0.84.4"),
-                patch.object(
-                    backend.subprocess,
-                    "run",
-                    return_value=subprocess.CompletedProcess([], 0, "pinned\n", ""),
-                ),
-                patch.object(
-                    backend,
-                    "run_guest_ssh",
-                    return_value=subprocess.CompletedProcess([], 0, "100.64.0.9\n", ""),
-                ),
-            ):
-                result = backend.register_external_macos("mac-1", "mac.example.test")
-                items = backend.managed_sandboxes()
+        status = {
+            "CurrentTailnet": {"Name": "example.test"},
+            "Peer": {
+                "mac": {
+                    "HostName": "mac-studio",
+                    "OS": "macOS",
+                    "Tags": ["tag:cua-sandbox"],
+                    "TailscaleIPs": ["100.64.0.9", "fd7a:115c:a1e0::9"],
+                    "StableID": "node-generation",
+                    "Online": True,
+                    "Created": "2026-01-02T00:00:00Z",
+                },
+                "old-mac": {
+                    "HostName": "mac-studio",
+                    "OS": "macOS",
+                    "Tags": ["tag:cua-sandbox"],
+                    "TailscaleIPs": ["100.64.0.8"],
+                    "StableID": "old-generation",
+                    "Online": True,
+                    "Created": "2026-01-01T00:00:00Z",
+                },
+                "personal": {
+                    "HostName": "personal-mac",
+                    "OS": "macOS",
+                    "TailscaleIPs": ["100.64.0.10"],
+                    "StableID": "personal-node",
+                },
+                "linux": {
+                    "HostName": "external-linux",
+                    "OS": "linux",
+                    "Tags": ["tag:cua-sandbox"],
+                    "TailscaleIPs": ["100.64.0.11"],
+                    "StableID": "linux-node",
+                },
+            },
+        }
+        with (
+            patch.object(backend, "controller_sandboxes", return_value=[]),
+            patch.object(backend, "local_tailscale_status", return_value=status),
+        ):
+            items = backend.managed_sandboxes()
 
-            self.assertEqual(result["os"], "macos")
-            self.assertEqual(
-                items,
-                [
-                    {
-                        "name": "mac-1",
-                        "os": "macos",
-                        "pool": "external",
-                        "kind": "external",
-                        "address": "mac.example.test",
-                        "generation": "node-generation",
-                    }
-                ],
+        self.assertEqual(
+            items,
+            [
+                {
+                    "name": "mac-studio",
+                    "os": "macos",
+                    "pool": "external",
+                    "kind": "external",
+                    "discovered": True,
+                    "address": "100.64.0.9",
+                    "generation": "node-generation",
+                    "tailnet": "example.test",
+                }
+            ],
+        )
+
+    async def test_controller_record_overrides_a_discovered_peer(self) -> None:
+        record = {
+            "name": "mac-studio",
+            "os": "macos",
+            "pool": "external",
+            "kind": "external",
+            "address": "mac.example.test",
+        }
+        peer = {**record, "address": "100.64.0.9", "discovered": True}
+        with (
+            patch.object(backend, "controller_sandboxes", return_value=[record]),
+            patch.object(backend, "tailnet_sandboxes", return_value=[peer]),
+        ):
+            self.assertEqual(backend.managed_sandboxes(), [record])
+
+    async def test_discovered_external_ensure_does_not_load_fleet_credentials(
+        self,
+    ) -> None:
+        peer = {"name": "mac-studio", "kind": "external", "discovered": True}
+        with (
+            patch.object(backend, "sandbox_record", return_value=None),
+            patch.object(backend, "tailnet_sandboxes", return_value=[peer]),
+        ):
+            self.assertFalse(
+                backend.uses_fleet({"action": "ensure", "name": "mac-studio"})
             )
 
     async def test_external_ensure_uses_ssh_without_fleet(self) -> None:
@@ -152,6 +188,30 @@ class ExternalMacTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["changed"])
         self.assertEqual(run.call_args.args[:2], ("mac.example.test", "macos"))
         tailnet.assert_not_called()
+
+    async def test_discovered_external_ensure_pins_the_verified_peer(self) -> None:
+        item = {
+            "name": "mac-studio",
+            "os": "macos",
+            "pool": "external",
+            "kind": "external",
+            "discovered": True,
+            "address": "100.64.0.9",
+        }
+        with (
+            patch.object(backend, "managed_sandboxes", return_value=[item]),
+            patch.object(backend, "pin_verified_ssh_host_key") as pin,
+            patch.object(
+                backend,
+                "run_guest_ssh",
+                return_value=subprocess.CompletedProcess([], 0, "100.64.0.9\n", ""),
+            ),
+            patch.object(backend, "pi_version", return_value="0.84.4"),
+        ):
+            result = await backend.ensure_one("mac-studio")
+
+        self.assertFalse(result["changed"])
+        pin.assert_called_once_with("100.64.0.9")
 
     async def test_external_ensure_does_not_load_fleet_credentials(self) -> None:
         with (
@@ -185,7 +245,7 @@ class ExternalMacTests(unittest.IsolatedAsyncioTestCase):
                     }
                 ],
             ),
-            self.assertRaisesRegex(ValueError, "unregister it"),
+            self.assertRaisesRegex(ValueError, "remove tag:cua-sandbox"),
         ):
             await backend.delete_one("mac-1")
 
@@ -335,6 +395,7 @@ class ManagedSandboxTests(unittest.TestCase):
                 patch.object(
                     backend, "SANDBOX_RECORD_DIR", controller_dir / "sandboxes"
                 ),
+                patch.object(backend, "tailnet_sandboxes", return_value=[]),
             ):
                 backend.migrate_sdk_sandbox_records()
                 backend.migrate_sdk_sandbox_records()
@@ -472,6 +533,7 @@ class ManagedSandboxTests(unittest.TestCase):
                 patch.object(
                     backend, "controller_sandboxes", return_value=[controller]
                 ),
+                patch.object(backend, "tailnet_sandboxes", return_value=[]),
             ):
                 self.assertEqual(backend.managed_sandboxes(), [controller])
 

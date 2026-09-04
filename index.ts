@@ -74,23 +74,11 @@ function shouldUseControllerTool(
 }
 
 const resourceSchema = Type.Object({
-  action: StringEnum([
-    "list",
-    "create",
-    "ensure",
-    "delete",
-    "register",
-    "unregister",
-  ] as const),
+  action: StringEnum(["list", "create", "ensure", "delete"] as const),
   name: Type.Optional(
     Type.String({ description: "Managed sandbox name, such as linux-1" }),
   ),
-  os: Type.Optional(StringEnum(["linux", "windows", "macos"] as const)),
-  address: Type.Optional(
-    Type.String({
-      description: "Pinned SSH host or IP for an external macOS host",
-    }),
-  ),
+  os: Type.Optional(StringEnum(["linux", "windows"] as const)),
   cpu: Type.Optional(
     Type.Integer({
       minimum: 1,
@@ -131,6 +119,7 @@ type SandboxItem = {
   os: SandboxOS;
   pool: string;
   kind?: "fleet" | "external";
+  discovered?: boolean;
   address?: string;
   generation?: string;
   online: boolean;
@@ -1159,7 +1148,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     if (!ctx.hasUI) return undefined;
     const listed = await runBackend({ action: "list" }, ctx.signal);
     const available = (listed.sandboxes ?? []).filter(
-      (sandbox) => sandbox.online || sandbox.kind === "external",
+      (sandbox) => sandbox.online,
     );
     const actions: DestinationSearchOption[] = [
       ...(active?.kind === "sandbox"
@@ -1219,7 +1208,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         available.map((sandbox) => ({
           value: sandbox.name,
           label: sandbox.name,
-          description: `${sandbox.os} • ${active?.kind === "sandbox" && sandbox.name === active.name ? "current; reconnect" : sandbox.kind === "external" ? "registered external host" : "reachable over Tailscale"}`,
+          description: `${sandbox.os} • ${active?.kind === "sandbox" && sandbox.name === active.name ? "current; reconnect" : sandbox.discovered ? "tagged Tailscale host" : sandbox.kind === "external" ? "registered external host" : "reachable over Tailscale"}`,
         })),
       );
       if (!name) continue;
@@ -1665,15 +1654,14 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     name: "cua_sandbox",
     label: "CUA Sandbox",
     description:
-      "List, provision, repair, or delete Fleet sandboxes, or register an existing macOS host.",
-    promptSnippet:
-      "Manage Linux, Windows, and external macOS execution targets",
+      "List tagged Tailscale hosts or provision, repair, and delete Fleet sandboxes.",
+    promptSnippet: "Manage Linux, Windows, and tagged macOS execution targets",
     promptGuidelines: [
       "Use cua_sandbox for sandbox resources; use /sandbox to choose where the current session executes tools.",
       "For custom resources, cua_sandbox create requires both cpu and memory_mb; omit both to use the OS defaults.",
       "Use a custom image only when the user explicitly provides a digest-pinned OCI reference.",
-      "Register only an SSH host whose key is already pinned; registration never provisions or owns the external machine.",
-      "Do not delete or unregister a CUA sandbox unless the user explicitly asks.",
+      "Tagged macOS peers are discovered from Tailscale and never acquire Fleet deletion semantics.",
+      "Do not delete a CUA sandbox unless the user explicitly asks.",
     ],
     parameters: resourceSchema,
     async execute(_id, input: ResourceInput, signal, onUpdate, ctx) {
@@ -1683,11 +1671,6 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         input.os !== "windows"
       )
         throw new Error("create requires os=linux or os=windows");
-      if (
-        input.action === "register" &&
-        (input.os !== "macos" || !input.name || !input.address)
-      )
-        throw new Error("register requires name, os=macos, and address");
       const hasResources =
         input.cpu !== undefined || input.memory_mb !== undefined;
       if (
@@ -1700,27 +1683,18 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         throw new Error("cpu and memory_mb are only valid for create");
       if (input.image !== undefined && input.action !== "create")
         throw new Error("image is only valid for create");
-      if (input.address !== undefined && input.action !== "register")
-        throw new Error("address is only valid for register");
-      if (
-        ["ensure", "delete", "unregister"].includes(input.action) &&
-        !input.name
-      ) {
+      if (["ensure", "delete"].includes(input.action) && !input.name) {
         throw new Error(`${input.action} requires name`);
       }
       if (
-        (input.action === "delete" || input.action === "unregister") &&
+        input.action === "delete" &&
         target.kind === "sandbox" &&
         input.name === target.name
       )
         throw new Error(
-          `move this session to local execution before ${input.action === "delete" ? "deleting" : "unregistering"} ${target.name}`,
+          `move this session to local execution before deleting ${target.name}`,
         );
-      if (
-        input.action === "create" ||
-        input.action === "delete" ||
-        input.action === "unregister"
-      ) {
+      if (input.action === "create" || input.action === "delete") {
         const createResources =
           input.cpu !== undefined && input.memory_mb !== undefined
             ? { cpu: input.cpu, memory_mb: input.memory_mb }
@@ -1729,14 +1703,10 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
           ? await ctx.ui.confirm(
               input.action === "create"
                 ? `create ${input.name || input.os} sandbox?`
-                : input.action === "delete"
-                  ? `delete ${input.name}?`
-                  : `unregister ${input.name}?`,
+                : `delete ${input.name}?`,
               input.action === "create"
                 ? creationDescription(createResources, input.image)
-                : input.action === "delete"
-                  ? "this permanently releases its fleet claim and filesystem."
-                  : "this removes only the controller record; it does not modify the external host.",
+                : "this permanently releases its fleet claim and filesystem.",
             )
           : input.confirm === true;
         if (!allowed)
@@ -1761,9 +1731,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
           ? formatList(result.sandboxes ?? [])
           : input.action === "delete"
             ? `deleted ${result.name}`
-            : input.action === "unregister"
-              ? `unregistered ${result.name}`
-              : `${result.name} (${result.os}) ${result.changed ? "configured" : "ready"}${result.address ? ` at ${result.address}` : ""}`;
+            : `${result.name} (${result.os}) ${result.changed ? "configured" : "ready"}${result.address ? ` at ${result.address}` : ""}`;
       return { content: [{ type: "text", text }], details: result };
     },
   });
