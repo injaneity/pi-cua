@@ -806,6 +806,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
   let placementError: Error | undefined;
   let bridge: ToolBridge | undefined;
   let reconnectPromise: Promise<ToolBridge> | undefined;
+  let sandboxInventoryRefresh: Promise<void> | undefined;
   let workspaceDiffGeneration = 0;
   let runtimeClosed = false;
   let routeCatalog:
@@ -895,6 +896,26 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       });
     });
   }
+
+  async function listSandboxes(signal?: AbortSignal): Promise<BackendResult> {
+    const result = await runBackend({ action: "list" }, signal);
+    pi.events.emit("cua:sandboxes-changed", result);
+    return result;
+  }
+
+  function refreshSandboxInventory(): Promise<void> {
+    sandboxInventoryRefresh ??= listSandboxes()
+      .then(() => undefined)
+      .catch(() => undefined)
+      .finally(() => {
+        sandboxInventoryRefresh = undefined;
+      });
+    return sandboxInventoryRefresh;
+  }
+
+  pi.events.on("cua:sandboxes-requested", () => {
+    void refreshSandboxInventory();
+  });
 
   function loadSessionTarget(
     ctx: UIContext,
@@ -1011,7 +1032,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
           "extension runtime was replaced during sandbox creation",
         );
       const sandbox = requireSandbox(result);
-      pi.events.emit("cua:sandboxes-changed", result);
+      void refreshSandboxInventory();
       pi.events.emit("cua:execution-target-changed", {
         kind: "sandbox",
         ...sandbox,
@@ -1146,7 +1167,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     active?: ExecutionTarget,
   ): Promise<Destination | undefined> {
     if (!ctx.hasUI) return undefined;
-    const listed = await runBackend({ action: "list" }, ctx.signal);
+    const listed = await listSandboxes(ctx.signal);
     const available = (listed.sandboxes ?? []).filter(
       (sandbox) => sandbox.online,
     );
@@ -1244,7 +1265,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     }
     if (/^(?:new\s+)?(?:linux|windows)(?:\s|$)/.test(value))
       throw new Error("usage: /sandbox <linux|windows> [cpu memory_mb]");
-    const listed = await runBackend({ action: "list" }, ctx.signal);
+    const listed = await listSandboxes(ctx.signal);
     const item = (listed.sandboxes ?? []).find(
       (candidate) => candidate.name === value,
     );
@@ -1381,7 +1402,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         throw new Error(
           "extension runtime was replaced during sandbox connection",
         );
-      pi.events.emit("cua:sandboxes-changed", result);
+      void refreshSandboxInventory();
       return {
         ...destination,
         address: result.address,
@@ -1723,9 +1744,11 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         ],
         details: { action: input.action },
       });
-      const result = await runBackend(input, signal);
-      if (input.action !== "list")
-        pi.events.emit("cua:sandboxes-changed", result);
+      const result =
+        input.action === "list"
+          ? await listSandboxes(signal)
+          : await runBackend(input, signal);
+      if (input.action !== "list") void refreshSandboxInventory();
       const text =
         input.action === "list"
           ? formatList(result.sandboxes ?? [])
