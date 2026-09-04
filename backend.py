@@ -1322,7 +1322,7 @@ def powershell_encoded_command(script: str) -> str:
 
 def guest_health_command(profile: str) -> str:
     if profile == "macos":
-        return f'PATH=/usr/local/bin:/usr/bin:/bin; export PATH; test "$(node --version)" = v22.20.0 && test "$(pi --version)" = {shlex.quote(pi_version())} && command -v git >/dev/null && test "$(uname -s)" = Darwin && tailscale ip -4 | head -n 1'
+        return 'PATH=/usr/local/bin:/usr/bin:/bin; export PATH; set -e; test "$(node --version)" = v22.20.0; command -v git >/dev/null; test "$(uname -s)" = Darwin; address="$(tailscale ip -4 | head -n 1)"; test -n "$address"; printf "%s\\n" "$address"'
     expected_digest = bootstrap_digest(profile)
     if profile == "linux":
         return f'test "$(cat /home/cua/.cua-pi/bootstrap-version 2>/dev/null)" = {shlex.quote(expected_digest)} && command -v pi >/dev/null && tailscale ip -4 | head -n 1'
@@ -1406,7 +1406,7 @@ async def complete_tailscale_enrollment(
 def guest_health_address(result: subprocess.CompletedProcess[str], name: str) -> str:
     lines = result.stdout.strip().splitlines()
     if not lines:
-        raise RuntimeError(f"external host returned no Tailscale address: {name}")
+        raise RuntimeError(f"external host failed its health check: {name}")
     return lines[-1]
 
 

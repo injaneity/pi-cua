@@ -165,6 +165,19 @@ class ExternalMacTests(unittest.IsolatedAsyncioTestCase):
                 backend.uses_fleet({"action": "ensure", "name": "mac-studio"})
             )
 
+    def test_macos_health_uses_the_isolated_runtime_contract(self) -> None:
+        command = backend.guest_health_command("macos")
+        self.assertNotIn("pi --version", command)
+        self.assertIn("node --version", command)
+        self.assertIn("tailscale ip -4", command)
+
+    def test_empty_external_health_output_reports_the_failed_check(self) -> None:
+        result = subprocess.CompletedProcess([], 0, "", "")
+        with self.assertRaisesRegex(
+            RuntimeError, "external host failed its health check"
+        ):
+            backend.guest_health_address(result, "mac-studio")
+
     async def test_external_ensure_uses_ssh_without_fleet(self) -> None:
         item = {
             "name": "mac-1",
