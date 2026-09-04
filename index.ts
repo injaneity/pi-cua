@@ -38,7 +38,6 @@ const protocolVersion = 3;
 const maxProtocolLine = 1024 * 1024;
 const windowsBrokerTask = "CuaPiDesktopToolBroker";
 const executionTargetEntry = "cua-execution-target";
-const executionTargetHandoffEntry = "cua-execution-target-handoff";
 const executionTargetIntentEntry = "cua-execution-target-intent";
 const localTools = new Set(["cua_sandbox", "report_papercut"]);
 
@@ -54,7 +53,7 @@ function latestCustomEntryData(
   return undefined;
 }
 
-function shouldHandoffExecutionTarget(reason: string): boolean {
+function createsSession(reason: string): boolean {
   return reason === "new" || reason === "fork";
 }
 
@@ -944,13 +943,13 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     );
   }
 
-  function loadHandoffTarget(
+  function loadParentTarget(
     previousSessionFile?: string,
   ): StoredExecutionTarget | undefined {
     if (!previousSessionFile) return undefined;
     const previous = SessionManager.open(previousSessionFile);
     return parseTarget(
-      latestCustomEntryData(previous.getEntries(), executionTargetHandoffEntry),
+      latestCustomEntryData(previous.getEntries(), executionTargetEntry),
     );
   }
 
@@ -1352,6 +1351,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       inheritExecution?: boolean;
       resume?: Extract<StoredExecutionTarget, { kind: "sandbox" }>;
       forceReconcile?: boolean;
+      source?: Extract<ExecutionTarget, { kind: "sandbox" }>;
     } = {},
   ): Promise<Extract<ExecutionTarget, { kind: "sandbox" }>> {
     const { inheritExecution = true, resume, forceReconcile = false } = options;
@@ -1366,14 +1366,15 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     const request = {
       action: "activate_execution",
       name: destination.name,
-      source_cwd: resume?.localCwd ?? ctx.cwd,
+      source_cwd: resume?.localCwd ?? options.source?.localCwd ?? ctx.cwd,
       execution_id: executionId,
       tool_packages: routes.packages,
       tool_files: routes.files,
       force_reconcile: !resume || forceReconcile,
       sandbox_generation: resume?.sandboxGeneration ?? destination.generation,
-      source:
-        !resume && inheritExecution && target.kind === "sandbox"
+      source: options.source?.workspaceState
+        ? workspaceSource(options.source)
+        : !resume && inheritExecution && target.kind === "sandbox"
           ? workspaceSource(target)
           : undefined,
       resume: resume
@@ -1853,6 +1854,32 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       StoredExecutionTarget | ExecutionTarget | Destination | undefined;
     let intent: ExecutionTargetIntent | undefined;
     try {
+      if (createsSession(event.reason)) {
+        const parent = loadParentTarget(event.previousSessionFile);
+        saveTarget({ kind: "local" });
+        pi.appendEntry(executionTargetIntentEntry, null);
+        if (parent?.kind !== "sandbox") {
+          await activate({ kind: "local" }, ctx, { persist: false });
+          return;
+        }
+        intendedTarget = parent;
+        const source = await resumeTarget(parent, ctx);
+        if (source.kind !== "sandbox")
+          throw new Error("parent sandbox could not be restored");
+        const prepared = await materializeTarget(
+          {
+            kind: "sandbox",
+            name: source.name,
+            os: source.os,
+            generation: source.sandboxGeneration,
+          },
+          ctx,
+          { inheritExecution: false, source },
+        );
+        intendedTarget = prepared;
+        await activate(prepared, ctx);
+        return;
+      }
       intent = loadConnectionIntent(ctx);
       if (intent) {
         intendedTarget = intent.destination;
@@ -1902,16 +1929,6 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         intendedTarget = resumed;
         if (resumed !== current) saveTarget(resumed);
         await activate(resumed, ctx, { persist: false });
-        return;
-      }
-      const inherited = shouldHandoffExecutionTarget(event.reason)
-        ? loadHandoffTarget(event.previousSessionFile)
-        : undefined;
-      if (inherited) {
-        const prepared = await resumeTarget(inherited, ctx);
-        intendedTarget = prepared;
-        saveTarget(prepared);
-        await activate(prepared, ctx, { persist: false });
         return;
       }
       await activate({ kind: "local" }, ctx);
@@ -1987,51 +2004,10 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     return { operations };
   });
 
-  pi.on("session_shutdown", async (event, ctx) => {
+  pi.on("session_shutdown", () => {
     runtimeClosed = true;
     workspaceDiffGeneration += 1;
-    const source = target.kind === "sandbox" ? target : undefined;
-    let disposeBridge = false;
-    try {
-      if (source && shouldHandoffExecutionTarget(event.reason)) {
-        pi.appendEntry(executionTargetHandoffEntry, storedTarget(source));
-        const local: ExecutionTarget = { kind: "local" };
-        saveTarget(local);
-        target = local;
-      } else if (source && event.reason !== "reload") {
-        if (source.workspaceState) {
-          reportTargetProgress(
-            source,
-            ctx,
-            "workspace.local.sync",
-            "syncing workspace before exit",
-          );
-        }
-        await syncTargetToLocal(source, undefined, (status) =>
-          reportTargetProgress(source, ctx, status.phase, status.message),
-        );
-        const local: ExecutionTarget = { kind: "local" };
-        saveTarget(local);
-        target = local;
-        if (source.workspaceState) {
-          reportTargetProgress(
-            source,
-            ctx,
-            "workspace.local.cleanup",
-            "removing synced sandbox workspace",
-          );
-        }
-        await cleanupTarget(source, ctx);
-        disposeBridge = true;
-      }
-    } catch (error) {
-      ctx.ui.notify(
-        `sandbox shutdown retained ${source?.name ?? "workspace"}: ${error instanceof Error ? error.message : String(error)}`,
-        "error",
-      );
-    } finally {
-      bridge?.close(disposeBridge);
-      bridge = undefined;
-    }
+    bridge?.close();
+    bridge = undefined;
   });
 }
