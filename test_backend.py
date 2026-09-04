@@ -1434,6 +1434,37 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         discover.assert_not_called()
         preflight.assert_not_called()
 
+    async def test_external_sandbox_generation_cannot_move_to_another_device(
+        self,
+    ) -> None:
+        with (
+            patch.object(
+                backend,
+                "managed_sandboxes",
+                return_value=[
+                    {
+                        "name": "mac-studio",
+                        "os": "macos",
+                        "address": "100.64.0.9",
+                        "generation": "node-2",
+                        "discovered": True,
+                    }
+                ],
+            ),
+            patch.object(backend, "pin_verified_ssh_host_key") as pin,
+            patch.object(backend, "guest_runtime_preflight") as preflight,
+            self.assertRaisesRegex(RuntimeError, "external sandbox identity changed"),
+        ):
+            await backend.activate_execution(
+                "mac-studio",
+                "/local",
+                "session-1",
+                sandbox_generation="node-1",
+            )
+
+        pin.assert_not_called()
+        preflight.assert_not_called()
+
     async def test_replacement_generation_bypasses_the_matching_generation_resume(
         self,
     ) -> None:

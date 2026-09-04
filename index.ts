@@ -164,7 +164,8 @@ class BackendError extends Error {
 }
 
 type Destination =
-  { kind: "local" } | { kind: "sandbox"; name: string; os: SandboxOS };
+  | { kind: "local" }
+  | { kind: "sandbox"; name: string; os: SandboxOS; generation?: string };
 type StoredExecutionTarget =
   | { kind: "local" }
   | {
@@ -792,6 +793,10 @@ function parseTargetIntent(value: unknown): ExecutionTargetIntent | undefined {
       kind: "sandbox",
       name: destination.name,
       os: destination.os,
+      generation:
+        typeof destination.generation === "string" && destination.generation
+          ? destination.generation
+          : undefined,
     };
   } else {
     throw new Error("saved sandbox connection intent is invalid");
@@ -1235,7 +1240,12 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       if (!name) continue;
       const item = available.find((sandbox) => sandbox.name === name);
       if (!item) throw new Error(`unknown or offline sandbox: ${name}`);
-      return { kind: "sandbox", name: item.name, os: item.os };
+      return {
+        kind: "sandbox",
+        name: item.name,
+        os: item.os,
+        generation: item.generation,
+      };
     }
   }
 
@@ -1270,7 +1280,12 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       (candidate) => candidate.name === value,
     );
     if (!item) throw new Error(`unknown managed sandbox: ${value}`);
-    return { kind: "sandbox", name: item.name, os: item.os };
+    return {
+      kind: "sandbox",
+      name: item.name,
+      os: item.os,
+      generation: item.generation,
+    };
   }
 
   function executionRoutes(): Readonly<{
@@ -1356,7 +1371,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       tool_packages: routes.packages,
       tool_files: routes.files,
       force_reconcile: !resume || forceReconcile,
-      sandbox_generation: resume?.sandboxGeneration,
+      sandbox_generation: resume?.sandboxGeneration ?? destination.generation,
       source:
         !resume && inheritExecution && target.kind === "sandbox"
           ? workspaceSource(target)

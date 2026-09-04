@@ -2895,9 +2895,17 @@ async def activate_execution(
     states = {item["name"]: item for item in managed_sandboxes()}
     if name not in states:
         raise ValueError(f"unknown managed sandbox: {name}")
-    profile = states[name]["os"]
-    if states[name].get("discovered") is True:
-        pin_verified_ssh_host_key(str(states[name].get("address") or ""))
+    state = states[name]
+    current_generation = state.get("generation")
+    if (
+        state.get("discovered") is True
+        and sandbox_generation
+        and sandbox_generation != current_generation
+    ):
+        raise RuntimeError(f"external sandbox identity changed: {name}")
+    profile = state["os"]
+    if state.get("discovered") is True:
+        pin_verified_ssh_host_key(str(state.get("address") or ""))
     if source and resume:
         raise ValueError("activate_execution cannot transfer and resume simultaneously")
     if resume and resume["os"] != profile:
@@ -2909,8 +2917,7 @@ async def activate_execution(
     execution_id = identity_digest[:16]
     config_files = guest_runtime_files(tool_packages, tool_files)
     guest_digest = runtime_digest(config_files)
-    candidate = states[name].get("address") or name
-    current_generation = states[name].get("generation")
+    candidate = state.get("address") or name
     if (
         resume
         and not force_reconcile
