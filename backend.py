@@ -34,7 +34,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, NotRequired, TypedDict, cast
 from urllib.error import HTTPError
-from urllib.parse import quote, urlencode
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 
@@ -594,11 +594,11 @@ def local_tailscale_identity() -> str:
     return tailnet
 
 
-def tailscale_auth_key(tailnet: str) -> str:
-    """Mint a durable, one-use enrollment key for the controller's exact tailnet."""
+def tailscale_auth_key() -> str:
+    """Mint a durable, one-use enrollment key in the OAuth client's tailnet."""
     response = tailscale_api(
         "POST",
-        f"/tailnet/{quote(tailnet, safe='')}/keys",
+        "/tailnet/-/keys",
         payload={
             "capabilities": {
                 "devices": {
@@ -881,10 +881,10 @@ def remote_pi_files(tool_files: tuple[str, ...] = ()) -> dict[str, bytes]:
     return files
 
 
-async def upload_linux_config(sb: Any, tailnet: str) -> None:
+async def upload_linux_config(sb: Any) -> None:
     await sb.files.write_text(
         "/tmp/cua-tailscale-auth-key",
-        tailscale_auth_key(tailnet),
+        tailscale_auth_key(),
     )
     result = await sb.shell.run("chmod 600 /tmp/cua-tailscale-auth-key", timeout=30)
     if result.returncode != 0:
@@ -903,11 +903,9 @@ async def cleanup_bootstrap_inputs(sb: Any, command: str, phase: str) -> None:
         progress(phase, "credential cleanup failed", error=error_text(error))
 
 
-async def bootstrap_linux(sb: Any, name: str, tailnet: str) -> str:
+async def bootstrap_linux(sb: Any, name: str) -> str:
     progress(f"bootstrap.{name}.upload", "uploading Linux bootstrap inputs")
-    await wait_for_step(
-        upload_linux_config(sb, tailnet), f"bootstrap.{name}.upload", 180
-    )
+    await wait_for_step(upload_linux_config(sb), f"bootstrap.{name}.upload", 180)
     script = (
         bootstrap_template("linux")
         .replace("__HOSTNAME__", name)
@@ -1109,7 +1107,7 @@ async def run_windows_background_job(
     return await poll_background_job(sb, poll, final_cleanup, phase, timeout, "Windows")
 
 
-async def bootstrap_windows(sb: Any, name: str, tailnet: str) -> str:
+async def bootstrap_windows(sb: Any, name: str) -> str:
     progress(f"bootstrap.{name}.upload", "building Windows bootstrap inputs")
     ensure_windows_identity()
     archive = io.BytesIO()
@@ -1130,7 +1128,7 @@ async def bootstrap_windows(sb: Any, name: str, tailnet: str) -> str:
         await upload_windows_file(
             sb,
             r"C:\Windows\Temp\cua-tailscale-auth-key",
-            tailscale_auth_key(tailnet).encode(),
+            tailscale_auth_key().encode(),
         )
         script = (
             bootstrap_template("windows")
@@ -1219,6 +1217,14 @@ async def healthy(sb: Any, profile: str) -> str | None:
         return None
     lines = result.stdout.strip().splitlines() if result.returncode == 0 else []
     return lines[-1] if lines else None
+
+
+async def guest_enrollment_matches(sb: Any, profile: str, tailnet: str) -> bool:
+    try:
+        guest_tailnet, _, guest_tags = await guest_tailscale_identity(sb, profile)
+    except (RuntimeError, TimeoutError):
+        return False
+    return guest_tailnet == tailnet and "tag:cua-sandbox" in guest_tags
 
 
 async def connect_sandbox(name: str, attempts: int = 3) -> Any:
@@ -1383,12 +1389,14 @@ async def ensure_one(name: str) -> dict[str, Any]:
     sb = await connect_sandbox(name)
     try:
         address = await healthy(sb, profile)
-        changed = address is None
+        changed = address is None or not await guest_enrollment_matches(
+            sb, profile, tailnet
+        )
         if changed:
             address = await (
-                bootstrap_linux(sb, name, tailnet)
+                bootstrap_linux(sb, name)
                 if profile == "linux"
-                else bootstrap_windows(sb, name, tailnet)
+                else bootstrap_windows(sb, name)
             )
         await complete_tailscale_enrollment(sb, profile, name, address, tailnet)
         return {
@@ -1499,9 +1507,9 @@ async def create_one(
     sb = await connect_sandbox(name)
     try:
         address = await (
-            bootstrap_linux(sb, name, tailnet)
+            bootstrap_linux(sb, name)
             if profile == "linux"
-            else bootstrap_windows(sb, name, tailnet)
+            else bootstrap_windows(sb, name)
         )
         await complete_tailscale_enrollment(sb, profile, name, address, tailnet)
         return {

@@ -420,21 +420,90 @@ class ManagedSandboxTests(unittest.TestCase):
 
 
 class TailscaleTests(unittest.TestCase):
-    def test_enrollment_key_is_one_use_and_scoped_to_exact_tailnet(self) -> None:
+    def test_enrollment_key_is_one_use_and_uses_the_oauth_tailnet(self) -> None:
         with patch.object(
             backend, "tailscale_api", return_value={"key": "tskey-auth-test"}
         ) as request:
-            key = backend.tailscale_auth_key("user@example.com")
+            key = backend.tailscale_auth_key()
 
         self.assertEqual(key, "tskey-auth-test")
         _, path = request.call_args.args
         create = request.call_args.kwargs["payload"]["capabilities"]["devices"][
             "create"
         ]
-        self.assertEqual(path, "/tailnet/user%40example.com/keys")
+        self.assertEqual(path, "/tailnet/-/keys")
         self.assertTrue(create["ephemeral"])
         self.assertFalse(create["reusable"])
         self.assertEqual(create["tags"], ["tag:cua-sandbox"])
+
+    def test_enrollment_match_requires_the_current_tailnet_and_tag(self) -> None:
+        with patch.object(
+            backend,
+            "guest_tailscale_identity",
+            AsyncMock(return_value=("old.example", "linux-1", ["tag:cua-sandbox"])),
+        ):
+            self.assertFalse(
+                asyncio.run(
+                    backend.guest_enrollment_matches(
+                        object(), "linux", "current.example"
+                    )
+                )
+            )
+
+        with patch.object(
+            backend,
+            "guest_tailscale_identity",
+            AsyncMock(return_value=("current.example", "linux-1", ["tag:cua-sandbox"])),
+        ):
+            self.assertTrue(
+                asyncio.run(
+                    backend.guest_enrollment_matches(
+                        object(), "linux", "current.example"
+                    )
+                )
+            )
+
+    def test_ensure_repairs_a_healthy_guest_in_the_wrong_tailnet(self) -> None:
+        sandbox = object()
+        item = {"name": "linux-1", "os": "linux", "pool": "cua-pi-linux"}
+        with (
+            patch.object(backend, "managed_sandboxes", return_value=[item]),
+            patch.object(
+                backend, "local_tailscale_identity", return_value="current.example"
+            ),
+            patch.object(backend, "restore_cua_state"),
+            patch.object(backend, "connect_sandbox", AsyncMock(return_value=sandbox)),
+            patch.object(backend, "healthy", AsyncMock(return_value="100.64.0.1")),
+            patch.object(
+                backend, "guest_enrollment_matches", AsyncMock(return_value=False)
+            ),
+            patch.object(
+                backend, "bootstrap_linux", AsyncMock(return_value="100.64.0.2")
+            ) as bootstrap,
+            patch.object(
+                backend, "complete_tailscale_enrollment", AsyncMock()
+            ) as complete,
+            patch.object(backend, "disconnect_safely", AsyncMock()) as disconnect,
+        ):
+            result = asyncio.run(backend.ensure_one("linux-1"))
+
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["address"], "100.64.0.2")
+        bootstrap.assert_awaited_once_with(sandbox, "linux-1")
+        complete.assert_awaited_once_with(
+            sandbox, "linux", "linux-1", "100.64.0.2", "current.example"
+        )
+        disconnect.assert_awaited_once_with(sandbox)
+
+    def test_bootstrap_forces_reauthentication(self) -> None:
+        self.assertIn(
+            "tailscale up --reset --force-reauth",
+            backend.bootstrap_template("linux"),
+        )
+        self.assertIn(
+            "tailscale up --reset --force-reauth",
+            backend.bootstrap_template("windows"),
+        )
 
     def test_reachability_accepts_a_derp_route(self) -> None:
         process = subprocess.CompletedProcess(

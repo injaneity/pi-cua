@@ -45,7 +45,7 @@ $SUDO rm -f /home/cua/.pi/agent/auth.json /home/cua/.pi/agent/models.json /home/
 $SUDO mkdir -p /home/cua/.pi/agent /home/cua/projects
 $SUDO chown -R cua:cua /home/cua/.pi /home/cua/projects
 TS_AUTH_KEY="$(cat /tmp/cua-tailscale-auth-key)"
-$SUDO tailscale up --reset \
+$SUDO tailscale up --reset --force-reauth \
   --auth-key="${TS_AUTH_KEY}" \
   --advertise-tags=tag:cua-sandbox \
   --hostname="__HOSTNAME__" \

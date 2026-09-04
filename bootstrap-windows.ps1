@@ -176,7 +176,7 @@ if (-not (Get-NetFirewallRule -Name 'CUA-OpenSSH-Tailnet' -ErrorAction SilentlyC
   New-NetFirewallRule -Name 'CUA-OpenSSH-Tailnet' -DisplayName 'CUA OpenSSH over Tailscale' -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 -RemoteAddress '100.64.0.0/10' | Out-Null
 }
 $tailscaleAuthKey = (Get-Content -Raw 'C:\Windows\Temp\cua-tailscale-auth-key').Trim()
-& $tailscale up --reset "--auth-key=$tailscaleAuthKey" '--advertise-tags=tag:cua-sandbox' '--hostname=__HOSTNAME__'
+& $tailscale up --reset --force-reauth "--auth-key=$tailscaleAuthKey" '--advertise-tags=tag:cua-sandbox' '--hostname=__HOSTNAME__'
 if ($LASTEXITCODE -ne 0) { throw 'tailscale up failed' }
 Write-Output '::phase tailscale-up'
 $tailscaleAuthKey = $null
