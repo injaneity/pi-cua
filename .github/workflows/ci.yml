@@ -22,6 +22,6 @@ jobs:
       - run: uvx ruff check backend.py test_backend.py
       - run: uvx vulture backend.py --min-confidence 90
       - run: python3 -m unittest -q test_backend.py
-      - run: node --test test-tool-broker.mjs test-session-lifecycle.mjs test-subagents.mjs
-      - run: npx prettier --check index.ts subagents.ts tool-host.mjs tool-broker.mjs test-tool-broker.mjs test-session-lifecycle.mjs test-subagents.mjs README.md
+      - run: node --test test-tool-broker.mjs test-session-lifecycle.mjs
+      - run: npx prettier --check index.ts tool-host.mjs tool-broker.mjs test-tool-broker.mjs test-session-lifecycle.mjs README.md
       - run: npx tsc --noEmit --target ES2023 --module NodeNext --moduleResolution NodeNext --strict --skipLibCheck --types node index.ts

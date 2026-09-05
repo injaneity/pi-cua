@@ -42,22 +42,6 @@ Lock acquisition is bounded to 30 seconds per lock. Controller backend processes
 
 Runtime staging must successfully create and dispose a tool host with the base coding tools before publishing its completion marker. Actual connection still validates the complete requested tool manifest and, on Windows, the interactive broker. This installation check is not a GUI permission or desktop-readiness certification.
 
-## sandbox subagents
-
-`cua_subagent` always runs on the controller, including when the parent executes in a sandbox. `spawn` requires an existing online `sandbox` name and a `task` brief. It returns immediately with a task id. Use `list`, `status`, `wait`, and `cancel` to manage that parent's tasks; the last three require `id`.
-
-```json
-{
-  "action": "spawn",
-  "sandbox": "mac-studio",
-  "task": "Inspect the Lume setup and report what is missing. Do not modify the machine."
-}
-```
-
-Children use the parent's model and thinking level but receive only the supplied task brief, not its conversation. Each child runs a controller-side Pi SDK session with remote tools, a distinct execution id, and an isolated workspace. Git state is copied during task preparation; do not edit the source while that snapshot is being captured. Non-Git directories are not copied. Child workspaces and transcripts are retained; results include their paths and are not automatically merged. Child sessions load no controller extensions, skills, or prompt templates. Provider authentication comes from the controller's normal SDK configuration; runtime-only custom provider registrations are not inherited.
-
-Limits are four active children and one child per sandbox per parent. These limits do not coordinate separate parent Pi processes or isolate a shared GUI desktop: do not schedule overlapping GUI tasks on the same desktop. Shutdown, reload, and thread switching cancel live children before replacing the controller runtime. Task records persist under `~/.pi/agent/cua-subagents/<parent-session-id>/`; unfinished records after a process crash report `interrupted`, never replay. Cancelling a wait leaves the child running. This first version supports sandbox destinations only, not local child execution, recursive delegation, or automatic patch acceptance.
-
 ## execution path
 
 1. the extension starts one backend process and reads progress and the final result from its jsonl stream; healthy setup uses the controller's existing Python, while provisioning and repair re-exec under the isolated Fleet sdk runtime;
