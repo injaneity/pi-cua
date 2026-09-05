@@ -21,6 +21,11 @@ if [ ! -f "$pi_package" ] || ! grep -q '"version": "__PI_VERSION__"' "$pi_packag
   $SUDO rm -rf /usr/local/lib/node_modules/@earendil-works/pi-coding-agent /usr/local/lib/node_modules/@earendil-works/.pi-coding-agent-*
   $SUDO npm install -g --prefix /usr/local --ignore-scripts @earendil-works/pi-coding-agent@__PI_VERSION__
 fi
+server_package=/usr/local/lib/node_modules/@earendil-works/pi-server/package.json
+if [ ! -f "$server_package" ] || ! grep -q '"version": "__PI_VERSION__"' "$server_package"; then
+  $SUDO npm install -g --prefix /usr/local --ignore-scripts @earendil-works/pi-server@__PI_VERSION__
+fi
+node --input-type=module -e 'await import("/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/dist/index.js")'
 if ! /home/cua/.cargo/bin/cargo --version 2>/dev/null | grep -q 'cargo 1.88.0'; then
   curl -fsSL https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init -o /tmp/rustup-init
   printf '%s  %s\n' '20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c' /tmp/rustup-init | sha256sum -c -

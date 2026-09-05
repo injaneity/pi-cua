@@ -58,16 +58,20 @@ New-Item -ItemType Directory -Force -Path $npmPrefix | Out-Null
 & $npm config set prefix $npmPrefix
 $piPackage = "$npmPrefix\node_modules\@earendil-works\pi-coding-agent\package.json"
 $piVersion = if (Test-Path $piPackage) { (Get-Content -Raw $piPackage | ConvertFrom-Json).version } else { '' }
-if ($piVersion -ne '__PI_VERSION__') {
+$serverPackage = "$npmPrefix\node_modules\@earendil-works\pi-server\package.json"
+$serverVersion = if (Test-Path $serverPackage) { (Get-Content -Raw $serverPackage | ConvertFrom-Json).version } else { '' }
+if ($piVersion -ne '__PI_VERSION__' -or $serverVersion -ne '__PI_VERSION__') {
   Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "$npmPrefix\node_modules\@earendil-works\pi-coding-agent"
   $npmStdout = 'C:\Windows\Temp\cua-npm.stdout.log'
   $npmStderr = 'C:\Windows\Temp\cua-npm.stderr.log'
-  $npmProcess = Start-Process -FilePath $npm -ArgumentList 'install','-g','--ignore-scripts','@earendil-works/pi-coding-agent@__PI_VERSION__' -Wait -PassThru -NoNewWindow -RedirectStandardOutput $npmStdout -RedirectStandardError $npmStderr
+  $npmProcess = Start-Process -FilePath $npm -ArgumentList 'install','-g','--ignore-scripts','@earendil-works/pi-coding-agent@__PI_VERSION__','@earendil-works/pi-server@__PI_VERSION__' -Wait -PassThru -NoNewWindow -RedirectStandardOutput $npmStdout -RedirectStandardError $npmStderr
   Get-Content -ErrorAction SilentlyContinue $npmStdout
   Get-Content -ErrorAction SilentlyContinue $npmStderr
   Remove-Item -Force -ErrorAction SilentlyContinue $npmStdout,$npmStderr
   if ($npmProcess.ExitCode -ne 0) { throw "Pi npm installation failed with exit $($npmProcess.ExitCode)" }
 }
+'await import("file:///C:/ProgramData/npm/node_modules/@earendil-works/pi-coding-agent/dist/index.js")' | & "$nodeRoot\node.exe" --input-type=module
+if ($LASTEXITCODE -ne 0) { throw 'Pi SDK import failed' }
 Write-Output '::phase npm-complete'
 Add-MachinePath $npmPrefix
 $tailscale = 'C:\Program Files\Tailscale\tailscale.exe'

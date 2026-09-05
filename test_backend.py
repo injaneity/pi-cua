@@ -165,6 +165,15 @@ class ExternalMacTests(unittest.IsolatedAsyncioTestCase):
                 backend.uses_fleet({"action": "ensure", "name": "mac-studio"})
             )
 
+    def test_bootstrap_installs_sdk_server_and_checks_the_sdk_import(self) -> None:
+        root = Path(backend.__file__).parent
+        for filename in ("bootstrap-linux.sh", "bootstrap-windows.ps1"):
+            with self.subTest(filename=filename):
+                script = (root / filename).read_text()
+                self.assertIn("@earendil-works/pi-server@__PI_VERSION__", script)
+                self.assertIn("pi-coding-agent/dist/index.js", script)
+                self.assertIn("--input-type=module", script)
+
     def test_macos_health_uses_the_isolated_runtime_contract(self) -> None:
         command = backend.guest_health_command("macos")
         self.assertNotIn("pi --version", command)
