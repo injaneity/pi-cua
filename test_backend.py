@@ -142,6 +142,29 @@ class FailureBoundaryTests(unittest.IsolatedAsyncioTestCase):
                     connect.return_value, "test", reenroll=False
                 )
 
+    def test_windows_repair_survives_nested_powershell_exit_normalization(self) -> None:
+        for code in (1, 2, 3):
+            for reason in ("bootstrap", "pi"):
+                with self.subTest(code=code, reason=reason):
+                    result = subprocess.CompletedProcess(
+                        [], code, f"CUA_REPAIR_REQUIRED:{reason}\r\n", "ssh warning"
+                    )
+                    self.assertFalse(
+                        backend.preflight_succeeded(result, "test", "windows")
+                    )
+
+    def test_unmarked_windows_errors_do_not_trigger_repair(self) -> None:
+        for code in (1, 2, 3, 255):
+            with (
+                self.subTest(code=code),
+                self.assertRaisesRegex(RuntimeError, f"exit {code}"),
+            ):
+                backend.preflight_succeeded(
+                    subprocess.CompletedProcess([], code, "", "failure"),
+                    "test",
+                    "windows",
+                )
+
     def test_transport_failure_is_not_repairable(self) -> None:
         for profile in ("linux", "windows", "macos"):
             with (

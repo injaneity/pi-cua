@@ -1316,7 +1316,7 @@ def windows_broker_health_script(require_task: bool = False) -> str:
 
 
 def windows_install_health_script() -> str:
-    return rf"if((gc -ea 0 C:\ProgramData\cua-pi\bootstrap-version)-ne'{bootstrap_digest('windows')}'){{exit 2}};if(!(gi -ea 0 C:\ProgramData\npm\pi.cmd)){{exit 3}};"
+    return rf"$ProgressPreference='SilentlyContinue';if((gc -ea 0 C:\ProgramData\cua-pi\bootstrap-version)-ne'{bootstrap_digest('windows')}'){{Write-Output 'CUA_REPAIR_REQUIRED:bootstrap';exit 2}};if(!(gi -ea 0 C:\ProgramData\npm\pi.cmd)){{Write-Output 'CUA_REPAIR_REQUIRED:pi';exit 3}};"
 
 
 def windows_machine_health_script() -> str:
@@ -2142,8 +2142,13 @@ def windows_broker_ready(name: str) -> bool:
 def preflight_succeeded(
     result: subprocess.CompletedProcess[str], name: str, profile: str
 ) -> bool:
-    repair_codes = {2, 3} if profile == "windows" else {20}
-    if result.returncode in repair_codes:
+    if profile == "windows":
+        if result.returncode in {1, 2, 3} and result.stdout.strip() in {
+            "CUA_REPAIR_REQUIRED:bootstrap",
+            "CUA_REPAIR_REQUIRED:pi",
+        }:
+            return False
+    elif result.returncode == 20:
         return False
     if result.returncode != 0:
         raise RuntimeError(
