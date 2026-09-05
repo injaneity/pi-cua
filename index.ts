@@ -2,6 +2,8 @@ import {
   type AgentToolResult,
   type BashOperations,
   createReadTool,
+  createAgentSession,
+  DefaultResourceLoader,
   type ExtensionAPI,
   type ReadToolInput,
   type ExtensionCommandContext,
@@ -9,6 +11,7 @@ import {
   SessionManager,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
+import { Subagents } from "./subagents.js";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
   Editor,
@@ -39,7 +42,7 @@ const maxProtocolLine = 1024 * 1024;
 const windowsBrokerTask = "CuaPiDesktopToolBroker";
 const executionTargetEntry = "cua-execution-target";
 const executionTargetIntentEntry = "cua-execution-target-intent";
-const localTools = new Set(["cua_sandbox", "report_papercut"]);
+const localTools = new Set(["cua_sandbox", "cua_subagent", "report_papercut"]);
 
 function latestCustomEntryData(
   entries: Array<{ type: string; customType?: string; data?: unknown }>,
@@ -811,6 +814,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
   let bridge: ToolBridge | undefined;
   let reconnectPromise: Promise<ToolBridge> | undefined;
   let sandboxInventoryRefresh: Promise<void> | undefined;
+  let subagents: Subagents | undefined;
   let workspaceDiffGeneration = 0;
   let runtimeClosed = false;
   let routeCatalog:
@@ -1352,17 +1356,20 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       resume?: Extract<StoredExecutionTarget, { kind: "sandbox" }>;
       forceReconcile?: boolean;
       source?: Extract<ExecutionTarget, { kind: "sandbox" }>;
+      executionId?: string;
+      onStatus?: (status: BackendResult) => void;
     } = {},
   ): Promise<Extract<ExecutionTarget, { kind: "sandbox" }>> {
     const { inheritExecution = true, resume, forceReconcile = false } = options;
     const routes = executionRoutes();
     const executionId =
+      options.executionId ??
       resume?.executionId ??
       (inheritExecution && target.kind === "sandbox"
         ? target.executionId
         : undefined) ??
       ctx.sessionManager.getSessionId();
-    reportTargetProgress(destination, ctx);
+    if (!options.onStatus) reportTargetProgress(destination, ctx);
     const request = {
       action: "activate_execution",
       name: destination.name,
@@ -1385,8 +1392,10 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
           }
         : undefined,
     };
-    const onStatus = (status: BackendResult) =>
-      reportTargetProgress(destination, ctx, status.phase, status.message);
+    const onStatus =
+      options.onStatus ??
+      ((status: BackendResult) =>
+        reportTargetProgress(destination, ctx, status.phase, status.message));
     try {
       let result: BackendResult;
       try {
@@ -1431,7 +1440,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         reconciled: result.reconciled,
       };
     } catch (error) {
-      if (!runtimeClosed) {
+      if (!runtimeClosed && !options.onStatus) {
         ctx.ui.setStatus("cua-session", undefined);
         pi.events.emit("cua:execution-target-changed", target);
       }
@@ -1775,6 +1784,165 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     },
   });
 
+  pi.registerTool({
+    name: "cua_subagent",
+    label: "Sandbox Subagent",
+    description:
+      "Spawn an independent child agent on an existing online sandbox, or list, inspect, wait for, and cancel this thread's tasks. Runs on the controller regardless of the parent's sandbox. Changes remain in the child's workspace and are never merged automatically. Shutdown cancels children; interrupted tasks are never replayed. One child per sandbox per parent, four total; this does not isolate a shared GUI desktop.",
+    parameters: Type.Object({
+      action: StringEnum([
+        "spawn",
+        "list",
+        "status",
+        "wait",
+        "cancel",
+      ] as const),
+      sandbox: Type.Optional(Type.String()),
+      task: Type.Optional(Type.String({ maxLength: 32000 })),
+      id: Type.Optional(Type.String()),
+    }),
+    async execute(_id, input, signal, _onUpdate, ctx) {
+      if (runtimeClosed) throw new Error("extension runtime is closed");
+      subagents ??= new Subagents(
+        join(
+          homedir(),
+          ".pi",
+          "agent",
+          "cua-subagents",
+          ctx.sessionManager.getSessionId(),
+        ),
+      );
+      const manager = subagents;
+      const response = (value: unknown) => ({
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(value).slice(0, 48000),
+          },
+        ],
+        details: value,
+      });
+      if (input.action === "list") return response(manager.list());
+      if (input.action !== "spawn") {
+        if (!input.id) throw new Error("task id is required");
+        if (input.action === "wait")
+          return response(await manager.wait(input.id, signal));
+        if (input.action === "cancel")
+          return response(manager.cancel(input.id));
+        return response(manager.get(input.id));
+      }
+      if (!input.sandbox || !input.task?.trim())
+        throw new Error("sandbox and task are required");
+      if (!ctx.model)
+        throw new Error("select a model before spawning a subagent");
+      const listed = await listSandboxes(signal);
+      const destination = listed.sandboxes?.find(
+        (item) => item.name === input.sandbox && item.online,
+      );
+      if (!destination) throw new Error("sandbox is unknown or offline");
+      const source = target.kind === "sandbox" ? { ...target } : undefined;
+      const model = ctx.model;
+      const thinkingLevel = pi.getThinkingLevel();
+      const routes = executionRoutes();
+      const prompt = input.task;
+      const task = manager.spawn(destination.name, async (abort, update) => {
+        const sessionManager = SessionManager.create(ctx.cwd);
+        const childId = sessionManager.getSessionId();
+        let childBridge: ToolBridge | undefined;
+        let session:
+          Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
+        const cancel = () => {
+          childBridge?.close(true);
+          void session?.abort();
+        };
+        abort.addEventListener("abort", cancel, { once: true });
+        try {
+          const prepared = await materializeTarget(
+            {
+              kind: "sandbox",
+              name: destination.name,
+              os: destination.os,
+              generation: destination.generation,
+            },
+            { ...ctx, signal: abort },
+            {
+              inheritExecution: false,
+              source,
+              executionId: childId,
+              onStatus: (value) =>
+                update({ message: value.message ?? value.phase }),
+            },
+          );
+          abort.throwIfAborted();
+          update({ workspace: prepared.remoteCwd });
+          childBridge = new ToolBridge(prepared, [...routes.tools]);
+          await childBridge.connect();
+          abort.throwIfAborted();
+          const connected = childBridge;
+          const customTools = routes.tools.map((name) => {
+            const definition = connected.definition(name);
+            if (!definition)
+              throw new Error(`remote tool metadata missing: ${name}`);
+            return {
+              ...definition,
+              execute: (id, args, toolSignal, onUpdate) =>
+                connected.execute(name, id, args, toolSignal, onUpdate),
+            } satisfies ToolDefinition;
+          });
+          const loader = new DefaultResourceLoader({
+            cwd: ctx.cwd,
+            agentDir: join(homedir(), ".pi", "agent"),
+            noExtensions: true,
+            noSkills: true,
+            noPromptTemplates: true,
+            noThemes: true,
+            appendSystemPromptOverride: (current) => [
+              ...current,
+              `All tools execute in ${prepared.os} in an isolated child workspace. Use relative paths. Do not spawn other agents. Report changes, validation, and remaining gaps. Do not merge changes into the parent workspace.`,
+            ],
+          });
+          await loader.reload();
+          abort.throwIfAborted();
+          ({ session } = await createAgentSession({
+            cwd: ctx.cwd,
+            model,
+            thinkingLevel,
+            sessionManager,
+            resourceLoader: loader,
+            tools: [...routes.tools],
+            customTools,
+          }));
+          sessionManager.appendCustomEntry(
+            executionTargetEntry,
+            storedTarget(prepared),
+          );
+          update({
+            sessionFile: sessionManager.getSessionFile(),
+            message: "running",
+          });
+          abort.throwIfAborted();
+          await session.prompt(prompt, { expandPromptTemplates: false });
+          const last = [...session.messages]
+            .reverse()
+            .find((message) => message.role === "assistant");
+          if (!last || last.role !== "assistant")
+            throw new Error("subagent returned no assistant result");
+          if (last.stopReason === "error" || last.stopReason === "aborted")
+            throw new Error(last.errorMessage || last.stopReason);
+          return last.content
+            .filter((part) => part.type === "text")
+            .map((part) => part.text)
+            .join("\n");
+        } finally {
+          abort.removeEventListener("abort", cancel);
+          session?.dispose();
+          childBridge?.close(true);
+        }
+      });
+      return response(task);
+    },
+  });
+
   pi.registerCommand("sandbox", {
     description: "Choose where this local Pi session executes tools",
     handler: async (args, ctx) => {
@@ -2004,7 +2172,8 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     return { operations };
   });
 
-  pi.on("session_shutdown", () => {
+  pi.on("session_shutdown", async () => {
+    await subagents?.close();
     runtimeClosed = true;
     workspaceDiffGeneration += 1;
     bridge?.close();

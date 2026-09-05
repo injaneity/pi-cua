@@ -68,8 +68,8 @@ for (const os of ["linux", "windows", "macos"]) {
           os,
           generation: source.sandboxGeneration,
         },
-        { cwd: "/local", sessionManager: { getSessionId: () => "child" } },
-        { inheritExecution: false, source },
+        { cwd: "/local", sessionManager: { getSessionId: () => "parent" } },
+        { inheritExecution: false, source, executionId: "child" },
       );
       assert.equal(requests[0].execution_id, "child");
       assert.equal(requests[0].resume, undefined);
@@ -94,20 +94,38 @@ const parent = {
 };
 
 for (const reason of ["resume", "new", "fork", "reload", "quit"]) {
-  test(`${reason} shutdown only disconnects, preserving thread and workspace`, () => {
+  test(`${reason} shutdown only disconnects, preserving thread and workspace`, async () => {
     const closes = [];
     const scope = {
       runtimeClosed: false,
+      subagents: undefined,
       workspaceDiffGeneration: 0,
       bridge: { close: (...args) => closes.push(args) },
     };
-    handler("session_shutdown", scope)({ reason }, {});
+    await handler("session_shutdown", scope)({ reason }, {});
     assert.equal(scope.runtimeClosed, true);
     assert.equal(scope.workspaceDiffGeneration, 1);
     assert.equal(scope.bridge, undefined);
     assert.deepEqual(closes, [[]]);
   });
 }
+
+test("shutdown waits for children before closing the parent connection", async () => {
+  const order = [];
+  const scope = {
+    runtimeClosed: false,
+    workspaceDiffGeneration: 0,
+    subagents: {
+      close: async () => {
+        await Promise.resolve();
+        order.push("children");
+      },
+    },
+    bridge: { close: () => order.push("parent") },
+  };
+  await handler("session_shutdown", scope)();
+  assert.deepEqual(order, ["children", "parent"]);
+});
 
 function startup(reason, current = parent) {
   const saved = [];
