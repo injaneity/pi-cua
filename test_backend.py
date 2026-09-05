@@ -76,6 +76,121 @@ class ControllerPrerequisiteTests(unittest.TestCase):
         keychain.assert_not_called()
 
 
+class FailureBoundaryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancelled_health_never_starts_repair(self) -> None:
+        for profile in ("linux", "windows"):
+            with (
+                self.subTest(profile=profile),
+                patch.object(
+                    backend,
+                    "managed_sandboxes",
+                    return_value=[{"name": "test", "os": profile}],
+                ),
+                patch.object(
+                    backend, "local_tailscale_identity", return_value="example.test"
+                ),
+                patch.object(backend, "restore_cua_state"),
+                patch.object(
+                    backend, "connect_sandbox", AsyncMock(return_value=object())
+                ),
+                patch.object(
+                    backend,
+                    "healthy",
+                    AsyncMock(side_effect=backend.OperationCancelled("cancelled")),
+                ),
+                patch.object(backend, "bootstrap_linux", AsyncMock()) as linux,
+                patch.object(backend, "bootstrap_windows", AsyncMock()) as windows,
+                patch.object(backend, "disconnect_safely", AsyncMock()),
+                self.assertRaises(backend.OperationCancelled),
+            ):
+                try:
+                    await backend.ensure_one("test")
+                finally:
+                    linux.assert_not_awaited()
+                    windows.assert_not_awaited()
+
+    async def test_install_repair_preserves_valid_enrollment(self) -> None:
+        for profile in ("linux", "windows"):
+            with (
+                self.subTest(profile=profile),
+                patch.object(
+                    backend,
+                    "managed_sandboxes",
+                    return_value=[{"name": "test", "os": profile}],
+                ),
+                patch.object(
+                    backend, "local_tailscale_identity", return_value="example.test"
+                ),
+                patch.object(backend, "restore_cua_state"),
+                patch.object(
+                    backend, "connect_sandbox", AsyncMock(return_value=object())
+                ) as connect,
+                patch.object(backend, "healthy", AsyncMock(return_value=None)),
+                patch.object(
+                    backend, "guest_enrollment_matches", AsyncMock(return_value=True)
+                ),
+                patch.object(
+                    backend,
+                    "bootstrap_" + profile,
+                    AsyncMock(return_value="100.64.0.1"),
+                ) as bootstrap,
+                patch.object(backend, "complete_tailscale_enrollment", AsyncMock()),
+                patch.object(backend, "disconnect_safely", AsyncMock()),
+            ):
+                await backend.ensure_one("test")
+                bootstrap.assert_awaited_once_with(
+                    connect.return_value, "test", reenroll=False
+                )
+
+    def test_transport_failure_is_not_repairable(self) -> None:
+        for profile in ("linux", "windows", "macos"):
+            with (
+                self.subTest(profile=profile),
+                self.assertRaisesRegex(RuntimeError, "Permission denied"),
+            ):
+                backend.preflight_succeeded(
+                    subprocess.CompletedProcess([], 255, "", "Permission denied"),
+                    "test",
+                    profile,
+                )
+
+    def test_runtime_validation_precedes_publication_on_every_platform(self) -> None:
+        for profile in ("linux", "windows", "macos"):
+            with (
+                self.subTest(profile=profile),
+                patch.object(backend, "copy_guest_file"),
+                patch.object(backend, "run_guest_ssh") as run,
+            ):
+                backend.install_guest_runtime("test", profile, b"archive", "a" * 20)
+                command = run.call_args.args[2]
+                self.assertIn("createToolHost", command)
+                self.assertLess(
+                    command.index("createToolHost"), command.index("complete")
+                )
+                self.assertLess(
+                    command.index("createToolHost"),
+                    command.index('rm -rf "$runtime"')
+                    if profile != "windows"
+                    else command.index(
+                        "Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $runtime"
+                    ),
+                )
+
+    def test_cancellation_cannot_be_caught_as_an_ordinary_failure(self) -> None:
+        self.assertFalse(issubclass(backend.OperationCancelled, Exception))
+
+    def test_lock_wait_has_a_deadline(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(backend, "CONTROLLER_DIR", Path(directory)),
+            patch.object(backend.fcntl, "flock", side_effect=BlockingIOError),
+            patch.object(backend.time, "monotonic", side_effect=[0, 31]),
+            self.assertRaisesRegex(TimeoutError, "operation lock timed out"),
+            backend.operation_lock(Path(directory) / "busy.lock"),
+        ):
+            self.fail("acquired a busy lock")
+
+
 class ExternalMacTests(unittest.IsolatedAsyncioTestCase):
     async def test_discovers_tagged_macos_peers_without_controller_records(
         self,
@@ -658,7 +773,7 @@ class TailscaleTests(unittest.TestCase):
 
         self.assertTrue(result["changed"])
         self.assertEqual(result["address"], "100.64.0.2")
-        bootstrap.assert_awaited_once_with(sandbox, "linux-1")
+        bootstrap.assert_awaited_once_with(sandbox, "linux-1", reenroll=True)
         complete.assert_awaited_once_with(
             sandbox, "linux", "linux-1", "100.64.0.2", "current.example"
         )

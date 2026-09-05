@@ -64,7 +64,7 @@ CONTROLLER_LOCK = CONTROLLER_DIR / "controller.lock"
 CURRENT_PHASE = "startup"
 
 
-class OperationCancelled(RuntimeError):
+class OperationCancelled(BaseException):
     pass
 
 
@@ -243,7 +243,9 @@ def guest_runtime_files(
     packages: tuple[str, ...] = (), tool_files: tuple[str, ...] = ()
 ) -> dict[str, bytes]:
     files = remote_pi_files(tool_files)
-    files["cua-runtime.json"] = b'{"packageInstall":"production-without-peer-copies"}\n'
+    files["cua-runtime.json"] = (
+        b'{"packageInstall":"production-without-peer-copies","validation":"tool-host-v1"}\n'
+    )
     files["settings.json"] = (
         json.dumps({"packages": list(packages)}, indent=2).encode() + b"\n"
     )
@@ -263,7 +265,17 @@ def operation_lock(path: Path) -> Iterator[None]:
     """Serialize one class of mutations across Pi processes and parallel tools."""
     CONTROLLER_DIR.mkdir(parents=True, exist_ok=True)
     with path.open("a+") as lock_file:
-        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        deadline = time.monotonic() + 30
+        while True:
+            try:
+                fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"operation lock timed out after 30 seconds: {path.name}"
+                    )
+                time.sleep(0.1)
         try:
             yield
         finally:
@@ -1026,11 +1038,13 @@ async def cleanup_bootstrap_inputs(sb: Any, command: str, phase: str) -> None:
         progress(phase, "credential cleanup failed", error=error_text(error))
 
 
-async def bootstrap_linux(sb: Any, name: str) -> str:
+async def bootstrap_linux(sb: Any, name: str, *, reenroll: bool = True) -> str:
     progress(f"bootstrap.{name}.upload", "uploading Linux bootstrap inputs")
-    await wait_for_step(upload_linux_config(sb), f"bootstrap.{name}.upload", 180)
+    if reenroll:
+        await wait_for_step(upload_linux_config(sb), f"bootstrap.{name}.upload", 180)
     script = (
         bootstrap_template("linux")
+        .replace("__REENROLL__", "1" if reenroll else "0")
         .replace("__HOSTNAME__", name)
         .replace("__BOOTSTRAP_VERSION__", bootstrap_digest("linux"))
         .replace("__PI_VERSION__", pi_version())
@@ -1230,7 +1244,7 @@ async def run_windows_background_job(
     return await poll_background_job(sb, poll, final_cleanup, phase, timeout, "Windows")
 
 
-async def bootstrap_windows(sb: Any, name: str) -> str:
+async def bootstrap_windows(sb: Any, name: str, *, reenroll: bool = True) -> str:
     progress(f"bootstrap.{name}.upload", "building Windows bootstrap inputs")
     ensure_windows_identity()
     archive = io.BytesIO()
@@ -1248,13 +1262,15 @@ async def bootstrap_windows(sb: Any, name: str) -> str:
             r"C:\Windows\Temp\cua-authorized-key.pub",
             WINDOWS_PUBLIC_KEY.read_bytes(),
         )
-        await upload_windows_file(
-            sb,
-            r"C:\Windows\Temp\cua-tailscale-auth-key",
-            tailscale_auth_key().encode(),
-        )
+        if reenroll:
+            await upload_windows_file(
+                sb,
+                r"C:\Windows\Temp\cua-tailscale-auth-key",
+                tailscale_auth_key().encode(),
+            )
         script = (
             bootstrap_template("windows")
+            .replace("__REENROLL__", "$true" if reenroll else "$false")
             .replace("__HOSTNAME__", name)
             .replace("__BOOTSTRAP_VERSION__", bootstrap_digest("windows"))
             .replace("__PI_VERSION__", pi_version())
@@ -1333,51 +1349,24 @@ def guest_health_command(profile: str) -> str:
 
 
 async def healthy(sb: Any, profile: str) -> str | None:
-    try:
-        command = guest_health_command(profile)
-        result = await sb.shell.run(command, timeout=30)
-    except (RuntimeError, TimeoutError):
-        return None
+    command = guest_health_command(profile)
+    result = await sb.shell.run(command, timeout=30)
     lines = result.stdout.strip().splitlines() if result.returncode == 0 else []
     return lines[-1] if lines else None
 
 
 async def guest_enrollment_matches(sb: Any, profile: str, tailnet: str) -> bool:
-    try:
-        guest_tailnet, _, guest_tags = await guest_tailscale_identity(sb, profile)
-    except (RuntimeError, TimeoutError):
-        return False
+    guest_tailnet, _, guest_tags = await guest_tailscale_identity(sb, profile)
     return guest_tailnet == tailnet and "tag:cua-sandbox" in guest_tags
 
 
-async def connect_sandbox(name: str, attempts: int = 3) -> Any:
+async def connect_sandbox(name: str) -> Any:
     from cua_sandbox import Sandbox
 
-    failures: list[str] = []
-    for attempt in range(1, attempts + 1):
-        try:
-            return await wait_for_step(
-                Sandbox._create(
-                    name=name,
-                    ephemeral=False,
-                    request_timeout=1900,
-                ),
-                f"connect.{name}.attempt-{attempt}",
-                60,
-            )
-        except RuntimeError as error:
-            failures.append(error_text(error))
-            if attempt == attempts:
-                break
-            delay = attempt * 5
-            progress(
-                f"connect.{name}",
-                f"retrying after {delay} seconds",
-                failure=failures[-1],
-            )
-            await asyncio.sleep(delay)
-    raise RuntimeError(
-        f"could not connect to {name} after {attempts} attempts: {'; '.join(failures)}"
+    return await wait_for_step(
+        Sandbox._create(name=name, ephemeral=False, request_timeout=60),
+        f"connect.{name}",
+        60,
     )
 
 
@@ -1438,15 +1427,16 @@ async def ensure_one(name: str) -> dict[str, Any]:
     restore_cua_state(name)
     sb = await connect_sandbox(name)
     try:
+        progress("sandbox.health", "checking machine prerequisites")
         address = await healthy(sb, profile)
-        changed = address is None or not await guest_enrollment_matches(
-            sb, profile, tailnet
-        )
+        progress("tailscale.enrollment", "checking enrollment before repair")
+        enrolled = await guest_enrollment_matches(sb, profile, tailnet)
+        changed = address is None or not enrolled
         if changed:
             address = await (
-                bootstrap_linux(sb, name)
+                bootstrap_linux(sb, name, reenroll=not enrolled)
                 if profile == "linux"
-                else bootstrap_windows(sb, name)
+                else bootstrap_windows(sb, name, reenroll=not enrolled)
             )
         await complete_tailscale_enrollment(sb, profile, name, address, tailnet)
         return {
@@ -2132,13 +2122,35 @@ def windows_broker_ready(name: str) -> bool:
             timeout=15,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError(
+            f"Windows broker transport failed on {name}: {error}"
+        ) from error
+    if result.returncode != 0:
+        if "connect failed: Connection refused" in result.stderr:
+            return False
+        raise RuntimeError(
+            f"Windows broker SSH failed on {name}: {result.stderr.strip()}"
+        )
     try:
         response = json.loads(result.stdout.strip())
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"invalid Windows broker response from {name}") from error
+    return response == {"type": "broker_ready"}
+
+
+def preflight_succeeded(
+    result: subprocess.CompletedProcess[str], name: str, profile: str
+) -> bool:
+    repair_codes = {2, 3} if profile == "windows" else {20}
+    if result.returncode in repair_codes:
         return False
-    return result.returncode == 0 and response == {"type": "broker_ready"}
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"preflight on {name} failed with exit {result.returncode}: "
+            f"{(result.stderr or result.stdout).strip()}"
+        )
+    return profile != "windows" or windows_broker_ready(name)
 
 
 def guest_runtime_preflight(
@@ -2164,15 +2176,10 @@ printf '%s|%s|%s\n' "$address" "$free_bytes" "$ready"
             + '"healthy|$free|$ready"\n'
         )
         command = powershell_encoded_command(script)
-    try:
-        result = run_guest_ssh(
-            name, profile, command, timeout=30, check=False, report=False
-        )
-    except (OSError, RuntimeError):
-        return None
-    if result.returncode != 0 or (
-        profile == "windows" and not windows_broker_ready(name)
-    ):
+    result = run_guest_ssh(
+        name, profile, command, timeout=30, check=False, report=False
+    )
+    if not preflight_succeeded(result, name, profile):
         return None
     fields = next(
         (
@@ -2183,7 +2190,7 @@ printf '%s|%s|%s\n' "$address" "$free_bytes" "$ready"
         [],
     )
     if len(fields) != 3 or not fields[1].isdigit() or fields[2] not in {"0", "1"}:
-        return None
+        raise RuntimeError(f"invalid runtime preflight response from {name}")
     return GuestRuntimePreflight(
         address=name if profile in {"windows", "macos"} else fields[0],
         free_bytes=int(fields[1]),
@@ -2235,15 +2242,10 @@ Write-Output "healthy|$free|$config|$repository"
 """
         )
         command = powershell_encoded_command(script)
-    try:
-        result = run_guest_ssh(
-            name, profile, command, timeout=60, check=False, report=False
-        )
-    except (OSError, RuntimeError):
-        return None
-    if result.returncode != 0 or (
-        profile == "windows" and not windows_broker_ready(name)
-    ):
+    result = run_guest_ssh(
+        name, profile, command, timeout=60, check=False, report=False
+    )
+    if not preflight_succeeded(result, name, profile):
         return None
     fields = next(
         (
@@ -2254,7 +2256,7 @@ Write-Output "healthy|$free|$config|$repository"
         [],
     )
     if len(fields) != 4 or not fields[1].isdigit() or fields[3] not in {"0", "1"}:
-        return None
+        raise RuntimeError(f"invalid workspace preflight response from {name}")
     return GuestPreflight(
         address=name if profile in {"windows", "macos"} else fields[0],
         free_bytes=int(fields[1]),
@@ -2427,6 +2429,18 @@ def guest_runtime_archive(files: dict[str, bytes]) -> bytes:
 
 
 def install_guest_runtime(name: str, profile: str, content: bytes, digest: str) -> None:
+    manifest = base64.b64encode(
+        json.dumps(
+            {"tools": ["read", "bash", "edit", "write"], "runtimeDigest": digest}
+        ).encode()
+    ).decode()
+    validation = (
+        'import {pathToFileURL} from "node:url"; '
+        'const agentDir = process.env.CUA_RUNTIME_STAGE + "/agent"; '
+        'const {createToolHost} = await import(pathToFileURL(agentDir + "/cua-tool-host.mjs")); '
+        f"const host = await createToolHost({{cwd: agentDir, agentDir, encodedManifest: {json.dumps(manifest)}}}); "
+        "await host.dispose();"
+    )
     if is_unix(profile):
         home = guest_home(profile)
         archive_path = f"/tmp/cua-pi-runtime-{digest}.tgz"
@@ -2452,6 +2466,7 @@ rm -rf "$staging"
 mkdir -p "$staging"
 tar -xzf {shlex.quote(archive_path)} -C "$staging"
 npm_config_cache="$staging/.npm-cache" npm_config_omit=dev npm_config_legacy_peer_deps=true PI_CODING_AGENT_DIR="$staging/agent" pi update --extensions --no-approve
+CUA_RUNTIME_STAGE="$staging" node --input-type=module -e {shlex.quote(validation)}
 printf '%s\n' {shlex.quote(digest)} > "$staging/complete"
 rm -rf "$runtime"
 mv "$staging" "$runtime"
@@ -2475,6 +2490,9 @@ $env:npm_config_omit = 'dev'
 $env:npm_config_legacy_peer_deps = 'true'
 & 'C:\ProgramData\npm\pi.cmd' update --extensions --no-approve
 if ($LASTEXITCODE -ne 0) {{ throw "Pi package synchronization failed with exit $LASTEXITCODE" }}
+$env:CUA_RUNTIME_STAGE = $staging
+{powershell_literal(validation)} | node --input-type=module
+if ($LASTEXITCODE -ne 0) {{ throw "staged tool-host validation failed with exit $LASTEXITCODE" }}
 Set-Content -NoNewline -Path (Join-Path $staging 'complete') -Value {powershell_literal(digest)}
 Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $runtime
 Move-Item -Force $staging $runtime
@@ -3181,7 +3199,7 @@ def main() -> None:
         if not quiet_request:
             progress("complete", "operation succeeded")
         print(json.dumps({"ok": True, **result}, separators=(",", ":")))
-    except Exception as error:  # noqa: BLE001 - process boundary returns all failures as JSON
+    except (Exception, OperationCancelled) as error:  # noqa: BLE001 - process boundary returns all failures as JSON
         cancelled = isinstance(error, OperationCancelled)
         progress(
             CURRENT_PHASE,

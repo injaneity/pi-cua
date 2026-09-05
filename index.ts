@@ -843,13 +843,38 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       let stderr = "";
       let result: BackendResult | undefined;
       let settled = false;
+      let failure: Error | undefined;
+      let killTimer: ReturnType<typeof setTimeout> | undefined;
+      const deadlineTimer = setTimeout(
+        () => {
+          failure = new Error(
+            "sandbox operation exceeded its 45 minute deadline",
+          );
+          onAbort();
+        },
+        45 * 60 * 1000,
+      );
       const finish = (callback: () => void) => {
         if (settled) return;
         settled = true;
+        clearTimeout(deadlineTimer);
+        if (killTimer) clearTimeout(killTimer);
         signal?.removeEventListener("abort", onAbort);
         callback();
       };
       const onAbort = () => {
+        if (killTimer || settled) return;
+        killTimer = setTimeout(() => {
+          try {
+            if (child.pid) process.kill(-child.pid, "SIGKILL");
+          } catch {}
+          finish(() =>
+            reject(
+              failure ??
+                new Error("sandbox cancellation exceeded its cleanup deadline"),
+            ),
+          );
+        }, 5000);
         if (child.pid) {
           try {
             process.kill(-child.pid, "SIGTERM");
@@ -873,7 +898,12 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
             stderr = `${stderr}\ninvalid backend output: ${line}`.slice(-8_000);
           }
         }
-        if (stdout.length > 1024 * 1024) onAbort();
+        if (stdout.length > 1024 * 1024) {
+          failure = new Error(
+            "sandbox backend output exceeded its protocol limit",
+          );
+          onAbort();
+        }
       };
       signal?.addEventListener("abort", onAbort, { once: true });
       child.stdout.on("data", (chunk: Buffer) => {
@@ -888,8 +918,8 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         stdout += decoder.end();
         if (stdout && !stdout.endsWith("\n")) stdout += "\n";
         consume();
-        if (signal?.aborted) {
-          finish(() => reject(new Error("operation cancelled")));
+        if (failure || signal?.aborted) {
+          finish(() => reject(failure ?? new Error("operation cancelled")));
           return;
         }
         if (code === 0 && result?.ok) {
@@ -1361,6 +1391,10 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     } = {},
   ): Promise<Extract<ExecutionTarget, { kind: "sandbox" }>> {
     const { inheritExecution = true, resume, forceReconcile = false } = options;
+    const deadline = AbortSignal.timeout(10 * 60 * 1000);
+    const signal = ctx.signal
+      ? AbortSignal.any([ctx.signal, deadline])
+      : deadline;
     const routes = executionRoutes();
     const executionId =
       options.executionId ??
@@ -1399,7 +1433,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     try {
       let result: BackendResult;
       try {
-        result = await runBackend(request, ctx.signal, onStatus);
+        result = await runBackend(request, signal, onStatus);
       } catch (error) {
         if (
           !(error instanceof BackendError) ||
@@ -1408,10 +1442,10 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
           throw error;
         await runBackend(
           { action: "ensure", name: destination.name },
-          ctx.signal,
+          signal,
           onStatus,
         );
-        result = await runBackend(request, ctx.signal, onStatus);
+        result = await runBackend(request, signal, onStatus);
       }
       if (
         typeof result.remote_cwd !== "string" ||

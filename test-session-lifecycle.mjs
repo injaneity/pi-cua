@@ -2,6 +2,9 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
+import { StringDecoder } from "node:string_decoder";
 import ts from "typescript";
 
 const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
@@ -30,6 +33,7 @@ function handler(event, scope) {
   const code = ts.transpileModule(`(${callback})`, {
     compilerOptions: { target: ts.ScriptTarget.ES2023 },
   }).outputText;
+  scope.AbortSignal = AbortSignal;
   return vm.runInNewContext(code, scope);
 }
 
@@ -126,6 +130,46 @@ test("shutdown waits for children before closing the parent connection", async (
   await handler("session_shutdown", scope)();
   assert.deepEqual(order, ["children", "parent"]);
 });
+
+for (const mode of ["cancel", "deadline"]) {
+  test(`backend ${mode} escalates when the process ignores termination`, async () => {
+    const child = Object.assign(new EventEmitter(), {
+      pid: 123,
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      kill() {},
+    });
+    const timers = [];
+    const kills = [];
+    const scope = {
+      backend: "/backend.py",
+      spawn: () => child,
+      StringDecoder,
+      process: { env: {}, kill: (pid, signal) => kills.push([pid, signal]) },
+      setTimeout: (callback, delay) => {
+        const timer = { callback, delay };
+        timers.push(timer);
+        return timer;
+      },
+      clearTimeout() {},
+    };
+    const controller = new AbortController();
+    const pending = handler("runBackend", scope)(
+      { action: "ensure" },
+      controller.signal,
+    );
+    const rejected = assert.rejects(pending, /deadline/);
+    if (mode === "cancel") controller.abort();
+    else timers[0].callback();
+    assert.equal(timers[1].delay, 5000);
+    timers[1].callback();
+    await rejected;
+    assert.deepEqual(kills, [
+      [-123, "SIGTERM"],
+      [-123, "SIGKILL"],
+    ]);
+  });
+}
 
 function startup(reason, current = parent) {
   const saved = [];

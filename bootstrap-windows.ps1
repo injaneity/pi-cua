@@ -179,11 +179,13 @@ Write-Output '::phase sshd-ready'
 if (-not (Get-NetFirewallRule -Name 'CUA-OpenSSH-Tailnet' -ErrorAction SilentlyContinue)) {
   New-NetFirewallRule -Name 'CUA-OpenSSH-Tailnet' -DisplayName 'CUA OpenSSH over Tailscale' -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 -RemoteAddress '100.64.0.0/10' | Out-Null
 }
+if (__REENROLL__) {
 $tailscaleAuthKey = (Get-Content -Raw 'C:\Windows\Temp\cua-tailscale-auth-key').Trim()
 & $tailscale up --reset --force-reauth "--auth-key=$tailscaleAuthKey" '--advertise-tags=tag:cua-sandbox' '--hostname=__HOSTNAME__'
 if ($LASTEXITCODE -ne 0) { throw 'tailscale up failed' }
 Write-Output '::phase tailscale-up'
 $tailscaleAuthKey = $null
+}
 New-Item -ItemType Directory -Force -Path 'C:\ProgramData\cua-pi' | Out-Null
 Set-Content -Encoding ascii -Path 'C:\ProgramData\cua-pi\bootstrap-version' -Value '__BOOTSTRAP_VERSION__'
 Remove-Item -Force -ErrorAction SilentlyContinue 'C:\Windows\Temp\cua-pi-agent.zip','C:\Windows\Temp\cua-authorized-key.pub','C:\Windows\Temp\cua-tailscale-auth-key','C:\Windows\Temp\cua-bootstrap.ps1'

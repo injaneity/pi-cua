@@ -32,6 +32,16 @@ custom images are available through the structured `cua_sandbox` create action's
 
 `cua_sandbox` and `report_papercut` are local control-plane tools. every other registered tool is proxied by name, except that `read` handles Pi's controller-local `pi-clipboard-*` image paths locally so pasted screenshots remain visible. ordinary file reads stay remote. sandbox activation fails if the remote pi sdk host does not expose a required tool; calls never fall back to local execution. tools registered after activation are blocked until `/reload` rebuilds the routed tool set, and the active sandbox cannot be deleted until the session returns to local execution.
 
+## failure and repair boundaries
+
+Cancellation is a control-flow exception, not an unhealthy result. Health, enrollment, transport, and retry handlers must let it escape. Setup preserves SSH errors and invalid protocol responses instead of converting them into automatic repair requests. Fleet connection has one application-level attempt; a known missing prerequisite or refused Windows broker connection may request repair, but authentication failures and timeouts do not.
+
+A machine repair checks enrollment separately. If the tailnet and admission tag already match, bootstrap does not mint an auth key or force reauthentication. This preserves device identity during Pi or prerequisite updates. A failed enrollment inspection stops with its error rather than guessing that reauthentication is safe. Machine prerequisites still share a bootstrap script; they are not yet independently installed runtime components.
+
+Lock acquisition is bounded to 30 seconds per lock. Controller backend processes have a 45-minute deadline; execution materialization and its repair attempt share a 10-minute abort signal. Cancellation allows five seconds for cleanup, then terminates the local backend process group. Forced termination does not prove a detached guest job stopped: retained claims and incomplete staging directories may require inspection before another attempt.
+
+Runtime staging must successfully create and dispose a tool host with the base coding tools before publishing its completion marker. Actual connection still validates the complete requested tool manifest and, on Windows, the interactive broker. This installation check is not a GUI permission or desktop-readiness certification.
+
 ## sandbox subagents
 
 `cua_subagent` always runs on the controller, including when the parent executes in a sandbox. `spawn` requires an existing online `sandbox` name and a `task` brief. It returns immediately with a task id. Use `list`, `status`, `wait`, and `cancel` to manage that parent's tasks; the last three require `id`.

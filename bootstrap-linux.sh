@@ -49,6 +49,7 @@ $SUDO systemctl enable --now tailscaled
 $SUDO rm -f /home/cua/.pi/agent/auth.json /home/cua/.pi/agent/models.json /home/cua/.pi/agent/APPEND_SYSTEM.md
 $SUDO mkdir -p /home/cua/.pi/agent /home/cua/projects
 $SUDO chown -R cua:cua /home/cua/.pi /home/cua/projects
+if [ "__REENROLL__" = 1 ]; then
 TS_AUTH_KEY="$(cat /tmp/cua-tailscale-auth-key)"
 $SUDO tailscale up --reset --force-reauth \
   --auth-key="${TS_AUTH_KEY}" \
@@ -56,6 +57,7 @@ $SUDO tailscale up --reset --force-reauth \
   --hostname="__HOSTNAME__" \
   --ssh
 unset TS_AUTH_KEY
+fi
 $SUDO install -d -o cua -g cua /home/cua/.cua-pi
 printf '%s\n' '__BOOTSTRAP_VERSION__' | $SUDO tee /home/cua/.cua-pi/bootstrap-version >/dev/null
 $SUDO chown cua:cua /home/cua/.cua-pi/bootstrap-version
