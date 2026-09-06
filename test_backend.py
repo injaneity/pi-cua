@@ -76,6 +76,27 @@ class ControllerPrerequisiteTests(unittest.TestCase):
         keychain.assert_not_called()
 
 
+class InventoryVisibilityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_missing_tailnet_peers_remain_visible(self) -> None:
+        records = [
+            {"name": "linux-1", "os": "linux", "address": "100.64.0.1"},
+            {"name": "windows-1", "os": "windows", "address": "100.64.0.2"},
+        ]
+        with (
+            patch.object(backend, "managed_sandboxes", return_value=records),
+            patch.object(
+                backend,
+                "online_tailscale_hosts",
+                return_value={"linux-1", "100.64.0.99"},
+            ),
+        ):
+            result = await backend.dispatch({"action": "list"})
+        self.assertEqual(len(result["sandboxes"]), 2)
+        for item in result["sandboxes"]:
+            self.assertFalse(item["online"])
+            self.assertIn("inspect", item["unavailable_reason"])
+
+
 class FailureBoundaryTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancelled_health_never_starts_repair(self) -> None:
         for profile in ("linux", "windows"):
@@ -1613,7 +1634,7 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch.object(backend, "pin_verified_ssh_host_key") as pin,
             patch.object(backend, "guest_runtime_preflight") as preflight,
-            self.assertRaisesRegex(RuntimeError, "external sandbox identity changed"),
+            self.assertRaisesRegex(RuntimeError, "sandbox identity changed"),
         ):
             await backend.activate_execution(
                 "mac-studio",
@@ -1625,7 +1646,7 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         pin.assert_not_called()
         preflight.assert_not_called()
 
-    async def test_replacement_generation_bypasses_the_matching_generation_resume(
+    async def test_replacement_generation_blocks_automatic_resume(
         self,
     ) -> None:
         resume = backend.SandboxResumeSource(os="linux", remoteCwd="/home/cua")
@@ -1651,8 +1672,9 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
                 "run_guest_ssh",
                 return_value=subprocess.CompletedProcess([], 0, "", ""),
             ),
+            self.assertRaisesRegex(RuntimeError, "sandbox identity changed"),
         ):
-            result = await backend.activate_execution(
+            await backend.activate_execution(
                 "linux-1",
                 "/local",
                 "session-1",
@@ -1661,9 +1683,7 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
                 sandbox_generation="node-1",
             )
 
-        self.assertTrue(result["reconciled"])
-        self.assertEqual(result["sandbox_generation"], "node-2")
-        check.assert_called_once()
+        check.assert_not_called()
 
     async def test_activate_execution_resumes_without_git_state(self) -> None:
         resume = backend.SandboxResumeSource(

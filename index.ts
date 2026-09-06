@@ -122,6 +122,7 @@ type SandboxItem = {
   address?: string;
   generation?: string;
   online: boolean;
+  unavailable_reason?: string;
 };
 type WorkspaceState = {
   version: 1;
@@ -707,7 +708,7 @@ function formatList(items: SandboxItem[]): string {
   return items
     .map(
       (item) =>
-        `${item.name}\t${item.os}\t${item.online ? "online" : "offline"}`,
+        `${item.name}\t${item.os}\t${item.online ? "online" : (item.unavailable_reason ?? "unavailable")}`,
     )
     .join("\n");
 }
@@ -1202,9 +1203,8 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
   ): Promise<Destination | undefined> {
     if (!ctx.hasUI) return undefined;
     const listed = await listSandboxes(ctx.signal);
-    const available = (listed.sandboxes ?? []).filter(
-      (sandbox) => sandbox.online,
-    );
+    const sandboxes = listed.sandboxes ?? [];
+    const available = sandboxes.filter((sandbox) => sandbox.online);
     const actions: DestinationSearchOption[] = [
       ...(active?.kind === "sandbox"
         ? [
@@ -1216,11 +1216,11 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
             },
           ]
         : []),
-      ...(available.length > 0
+      ...(sandboxes.length > 0
         ? [
             {
               value: "connect",
-              label: `${active?.kind === "sandbox" ? "connect or reconnect to" : "connect to"} a sandbox (${available.length} available)`,
+              label: `${active?.kind === "sandbox" ? "connect or reconnect to" : "connect to"} a sandbox (${available.length} available, ${sandboxes.length - available.length} unavailable)`,
             },
           ]
         : []),
@@ -1260,15 +1260,19 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
 
       const name = await searchDestinationOptions(
         ctx,
-        available.map((sandbox) => ({
+        sandboxes.map((sandbox) => ({
           value: sandbox.name,
           label: sandbox.name,
-          description: `${sandbox.os} • ${active?.kind === "sandbox" && sandbox.name === active.name ? "current; reconnect" : sandbox.discovered ? "tagged Tailscale host" : sandbox.kind === "external" ? "registered external host" : "reachable over Tailscale"}`,
+          description: `${sandbox.os} • ${!sandbox.online ? (sandbox.unavailable_reason ?? "unavailable; inspect before repair") : active?.kind === "sandbox" && sandbox.name === active.name ? "current; reconnect" : sandbox.discovered ? "tagged Tailscale host" : sandbox.kind === "external" ? "registered external host" : "reachable over Tailscale"}`,
         })),
       );
       if (!name) continue;
-      const item = available.find((sandbox) => sandbox.name === name);
-      if (!item) throw new Error(`unknown or offline sandbox: ${name}`);
+      const item = sandboxes.find((sandbox) => sandbox.name === name);
+      if (!item) throw new Error(`unknown sandbox: ${name}`);
+      if (!item.online)
+        throw new Error(
+          `${name}: ${item.unavailable_reason ?? "unavailable; inspect before repair"}`,
+        );
       return {
         kind: "sandbox",
         name: item.name,
@@ -1309,6 +1313,10 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       (candidate) => candidate.name === value,
     );
     if (!item) throw new Error(`unknown managed sandbox: ${value}`);
+    if (!item.online)
+      throw new Error(
+        `${value}: ${item.unavailable_reason ?? "unavailable; inspect before repair"}`,
+      );
     return {
       kind: "sandbox",
       name: item.name,

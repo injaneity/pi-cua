@@ -32,6 +32,12 @@ custom images are available through the structured `cua_sandbox` create action's
 
 `cua_sandbox` and `report_papercut` are local control-plane tools. every other registered tool is proxied by name, except that `read` handles Pi's controller-local `pi-clipboard-*` image paths locally so pasted screenshots remain visible. ordinary file reads stay remote. sandbox activation fails if the remote pi sdk host does not expose a required tool; calls never fall back to local execution. tools registered after activation are blocked until `/reload` rebuilds the routed tool set, and the active sandbox cannot be deleted until the session returns to local execution.
 
+## unavailable or replaced machines
+
+The picker retains known unavailable machines and explains that their saved target is not online in the local Tailscale view. Selecting one stops with an error; it does not silently create a replacement. A peer with the same hostname cannot make a different saved address appear online.
+
+Saved device generations are checked for Fleet and external hosts alike. An identity mismatch blocks resume before guest preparation. A persistent Fleet claim is not proof that the VM disk survived: inspect the provider binding and original workspace before accepting a replacement. This extension cannot guarantee provider disk durability or recover uncommitted files from a lost guest disk. It does not automatically repair missing hosts or reset saved thread placement to conceal a loss.
+
 ## failure and repair boundaries
 
 Cancellation is a control-flow exception, not an unhealthy result. Health, enrollment, transport, and retry handlers must let it escape. Setup preserves SSH errors and invalid protocol responses instead of converting them into automatic repair requests. Fleet connection has one application-level attempt; a known missing prerequisite or refused Windows broker connection may request repair, but authentication failures and timeouts do not.

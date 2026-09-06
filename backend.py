@@ -2920,12 +2920,12 @@ async def activate_execution(
         raise ValueError(f"unknown managed sandbox: {name}")
     state = states[name]
     current_generation = state.get("generation")
-    if (
-        state.get("discovered") is True
-        and sandbox_generation
-        and sandbox_generation != current_generation
-    ):
-        raise RuntimeError(f"external sandbox identity changed: {name}")
+    if sandbox_generation and sandbox_generation != current_generation:
+        raise RuntimeError(
+            f"sandbox identity changed: {name}; expected {sandbox_generation}, "
+            f"found {current_generation or 'unknown'}. Execution stopped; "
+            "inspect the original workspace before accepting a replacement"
+        )
     profile = state["os"]
     if state.get("discovered") is True:
         pin_verified_ssh_host_key(str(state.get("address") or ""))
@@ -3107,14 +3107,22 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
     action = request.get("action")
     if action == "list":
         online = online_tailscale_hosts()
-        items = [
-            {
-                **item,
-                "online": item["name"].lower() in online
-                or str(item.get("address") or "").lower() in online,
-            }
-            for item in managed_sandboxes()
-        ]
+        items = []
+        for item in managed_sandboxes():
+            reachable = str(item.get("address") or item["name"]).lower() in online
+            items.append(
+                {
+                    **item,
+                    "online": reachable,
+                    **(
+                        {
+                            "unavailable_reason": "saved target is not online in the local Tailscale view; inspect the existing machine and workspace before repair"
+                        }
+                        if not reachable
+                        else {}
+                    ),
+                }
+            )
         return {"sandboxes": items}
     if action == "cleanup_workspace":
         return cleanup_sandbox_workspace(require_sandbox_source(request.get("source")))

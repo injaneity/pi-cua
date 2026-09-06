@@ -85,6 +85,34 @@ for (const os of ["linux", "windows", "macos"]) {
   }
 }
 
+test("picker retains unavailable sandboxes and refuses execution", async () => {
+  const menus = [];
+  const scope = {
+    listSandboxes: async () => ({
+      sandboxes: [
+        {
+          name: "linux-1",
+          os: "linux",
+          online: false,
+          unavailable_reason: "inspect the existing workspace",
+        },
+        { name: "mac-studio", os: "macos", online: true },
+      ],
+    }),
+    searchDestinationOptions: async (_ctx, options) => {
+      menus.push(options);
+      return menus.length === 1 ? "connect" : "linux-1";
+    },
+  };
+  await assert.rejects(
+    handler("pickDestination", scope)({ hasUI: true }),
+    /inspect the existing workspace/,
+  );
+  assert.equal(menus[1].length, 2);
+  assert.equal(menus[1][0].value, "linux-1");
+  assert.match(menus[1][0].description, /inspect/);
+});
+
 const parent = {
   kind: "sandbox",
   name: "mac-studio",
