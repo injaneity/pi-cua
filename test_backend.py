@@ -2226,6 +2226,7 @@ class ResumePreflightTests(unittest.TestCase):
         ):
             with (
                 patch.object(backend, "run_guest_ssh", return_value=result),
+                patch.object(backend, "bootstrap_digest", return_value="b" * 20),
                 self.assertRaises(RuntimeError),
             ):
                 backend.guest_runtime_preflight("host", "linux", "a" * 20)
