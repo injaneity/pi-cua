@@ -2124,7 +2124,6 @@ class WindowsDesktopBrokerTests(unittest.TestCase):
                     [], 0, "healthy|1073741824|1|1\n", ""
                 ),
             ) as run,
-            patch.object(backend, "windows_broker_ready", return_value=True) as broker,
         ):
             result = backend.guest_preflight(
                 "100.64.0.2",
@@ -2144,25 +2143,10 @@ class WindowsDesktopBrokerTests(unittest.TestCase):
         self.assertTrue(script.startswith(health))
         self.assertNotIn("Get-Service sshd", script)
         self.assertNotIn("Get-ScheduledTask", script)
-        self.assertNotIn("TcpClient", script)
+        self.assertIn("TcpClient", script)
+        self.assertIn("ReadTimeout=5000", script)
         self.assertNotIn("tailscale.exe", script)
-        broker.assert_called_once_with("100.64.0.2")
-
-    def test_controller_probes_the_broker_forwarding_protocol(self) -> None:
-        response = json.dumps({"type": "broker_ready"}) + "\n"
-        with (
-            patch.object(backend, "ensure_windows_identity"),
-            patch.object(
-                backend.subprocess,
-                "run",
-                return_value=subprocess.CompletedProcess([], 0, response, ""),
-            ) as run,
-        ):
-            self.assertTrue(backend.windows_broker_ready("100.64.0.2"))
-
-        self.assertIn("-W", run.call_args.args[0])
-        self.assertIn("127.0.0.1:43121", run.call_args.args[0])
-        self.assertEqual(run.call_args.kwargs["input"], '{"type":"health"}\n')
+        run.assert_called_once()
 
     def test_ensure_health_uses_the_same_broker_contract(self) -> None:
         with patch.object(backend, "bootstrap_digest", return_value="b" * 20):
@@ -2184,10 +2168,9 @@ class WindowsDesktopBrokerTests(unittest.TestCase):
                 backend,
                 "run_guest_ssh",
                 return_value=subprocess.CompletedProcess(
-                    [], 0, "healthy|1073741824|1\n", ""
+                    [], 1, "CUA_REPAIR_REQUIRED:broker\r\n", ""
                 ),
             ),
-            patch.object(backend, "windows_broker_ready", return_value=False),
         ):
             result = backend.guest_runtime_preflight("100.64.0.2", "windows", "c" * 20)
 

@@ -194,6 +194,65 @@ test("offline fleet remains selectable for bounded automatic recovery", async ()
   assert.equal(result.generation, "old");
 });
 
+test("switch event is visible and model-readable without starting a turn", () => {
+  const messages = [];
+  const scope = {
+    process: { platform: "darwin" },
+    pi: { sendMessage: (...args) => messages.push(args) },
+  };
+  const announce = handler("announceTargetChange", scope);
+  announce(
+    { kind: "local" },
+    { kind: "sandbox", name: "windows-1", os: "windows" },
+  );
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0][0].display, true);
+  assert.match(
+    messages[0][0].content,
+    /local \(macos\).*windows-1 \(windows\)/,
+  );
+  assert.equal(messages[0][1].triggerTurn, false);
+  assert.equal(messages[0][1].deliverAs, undefined);
+  announce(
+    { kind: "sandbox", name: "windows-1", os: "windows" },
+    { kind: "sandbox", name: "windows-1", os: "windows" },
+  );
+  assert.equal(messages.length, 1);
+});
+
+for (const mode of ["switch", "restore", "failure"]) {
+  test(`activation announces only a completed explicit switch: ${mode}`, async () => {
+    const announcements = [];
+    const scope = {
+      runtimeClosed: false,
+      target: { kind: "local" },
+      bridge: undefined,
+      placementError: undefined,
+      executionRoutes: () => ({ tools: [] }),
+      ToolBridge: class {
+        async connect() {
+          if (mode === "failure") throw new Error("unreachable");
+        }
+        close() {}
+      },
+      formatSandboxProgress: () => "connecting",
+      installProxies() {},
+      saveTarget() {},
+      pi: { events: { emit() {} } },
+      refreshWorkspaceDiff() {},
+      announceTargetChange: (...args) => announcements.push(args),
+    };
+    const pending = handler("activate", scope)(
+      { kind: "sandbox", name: "windows-1", os: "windows", reconciled: true },
+      { ui: { setStatus() {} } },
+      { persist: mode !== "restore" },
+    );
+    if (mode === "failure") await assert.rejects(pending, /unreachable/);
+    else await pending;
+    assert.equal(announcements.length, mode === "switch" ? 1 : 0);
+  });
+}
+
 const parent = {
   kind: "sandbox",
   name: "mac-studio",

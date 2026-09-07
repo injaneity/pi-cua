@@ -1319,7 +1319,7 @@ def windows_broker_health_script(require_task: bool = False) -> str:
         if require_task
         else ""
     )
-    return rf"""{task_check}try{{$c=[Net.Sockets.TcpClient]::new('127.0.0.1',{WINDOWS_BROKER_PORT});$s=$c.GetStream();$b=[Text.Encoding]::UTF8.GetBytes("{{`"type`":`"health`"}}`n");$s.Write($b,0,$b.Length);if(([IO.StreamReader]::new($s)).ReadLine()-ne'{{"type":"broker_ready"}}'){{exit 6}}}}catch{{exit 6}}
+    return rf"""{task_check}try{{$c=[Net.Sockets.TcpClient]::new('127.0.0.1',{WINDOWS_BROKER_PORT});$s=$c.GetStream();$s.ReadTimeout=5000;$s.WriteTimeout=5000;$b=[Text.Encoding]::UTF8.GetBytes("{{`"type`":`"health`"}}`n");$s.Write($b,0,$b.Length);if(([IO.StreamReader]::new($s)).ReadLine()-ne'{{"type":"broker_ready"}}'){{Write-Output 'CUA_BROKER_PROBE_FAILED';exit 7}}}}catch{{if($_.Exception.GetBaseException().SocketErrorCode -eq [Net.Sockets.SocketError]::ConnectionRefused){{Write-Output 'CUA_REPAIR_REQUIRED:broker';exit 6}};Write-Output 'CUA_BROKER_PROBE_FAILED';exit 7}}
 """
 
 
@@ -1336,7 +1336,7 @@ def windows_machine_health_script() -> str:
 
 
 def windows_ssh_health_script() -> str:
-    return windows_install_health_script()
+    return windows_install_health_script() + windows_broker_health_script()
 
 
 def powershell_encoded_command(script: str) -> str:
@@ -2120,47 +2120,14 @@ class GuestRuntimePreflight:
     free_bytes: int = 1024**3
 
 
-def windows_broker_ready(name: str) -> bool:
-    try:
-        result = subprocess.run(
-            [
-                "ssh",
-                *ssh_options("windows"),
-                "-T",
-                "-W",
-                f"127.0.0.1:{WINDOWS_BROKER_PORT}",
-                f"cua@{name}",
-            ],
-            input='{"type":"health"}\n',
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise RuntimeError(
-            f"Windows broker transport failed on {name}: {error}"
-        ) from error
-    if result.returncode != 0:
-        if "connect failed: Connection refused" in result.stderr:
-            return False
-        raise RuntimeError(
-            f"Windows broker SSH failed on {name}: {result.stderr.strip()}"
-        )
-    try:
-        response = json.loads(result.stdout.strip())
-    except json.JSONDecodeError as error:
-        raise RuntimeError(f"invalid Windows broker response from {name}") from error
-    return response == {"type": "broker_ready"}
-
-
 def preflight_succeeded(
     result: subprocess.CompletedProcess[str], name: str, profile: str
 ) -> bool:
     if profile == "windows":
-        if result.returncode in {1, 2, 3} and result.stdout.strip() in {
+        if result.returncode in {1, 2, 3, 6} and result.stdout.strip() in {
             "CUA_REPAIR_REQUIRED:bootstrap",
             "CUA_REPAIR_REQUIRED:pi",
+            "CUA_REPAIR_REQUIRED:broker",
         }:
             return False
     elif result.returncode == 20:
@@ -2170,7 +2137,7 @@ def preflight_succeeded(
             f"preflight on {name} failed with exit {result.returncode}: "
             f"{(result.stderr or result.stdout).strip()}"
         )
-    return profile != "windows" or windows_broker_ready(name)
+    return True
 
 
 def guest_runtime_preflight(

@@ -1624,6 +1624,26 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     pi.setActiveTools(active);
   }
 
+  function announceTargetChange(
+    previous: ExecutionTarget,
+    next: ExecutionTarget,
+  ): void {
+    const label = (value: ExecutionTarget) =>
+      value.kind === "sandbox"
+        ? `${value.name} (${value.os})`
+        : `local (${process.platform === "darwin" ? "macos" : process.platform === "win32" ? "windows" : process.platform})`;
+    if (label(previous) === label(next)) return;
+    pi.sendMessage(
+      {
+        customType: "cua-execution-switch",
+        content: `execution switched: ${label(previous)} → ${label(next)}. subsequent workspace tools use the destination environment.`,
+        display: true,
+        details: { from: label(previous), to: label(next) },
+      },
+      { triggerTurn: false },
+    );
+  }
+
   async function activate(
     next: ExecutionTarget,
     ctx: UIContext,
@@ -1692,11 +1712,13 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       throw error;
     }
     bridge?.close(true);
+    const previous = target;
     target = resolved;
     placementError = undefined;
     bridge = nextBridge;
     ctx.ui.setStatus("cua-session", undefined);
     pi.events.emit("cua:execution-target-changed", resolved);
+    if (options.persist !== false) announceTargetChange(previous, resolved);
     void refreshWorkspaceDiff();
   }
 
