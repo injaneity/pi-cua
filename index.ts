@@ -98,16 +98,9 @@ const resourceSchema = Type.Object({
       description: "Digest-pinned OCI image for create",
     }),
   ),
-  recover: Type.Optional(
-    Type.Boolean({
-      description:
-        "Explicitly rebuild missing Fleet guest setup with ensure; requires confirmation and does not recover lost files",
-    }),
-  ),
   confirm: Type.Optional(
     Type.Boolean({
-      description:
-        "Required for create, delete, or recovery when no UI is available",
+      description: "Required for create or delete when no UI is available",
     }),
   ),
 });
@@ -1276,7 +1269,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       if (!name) continue;
       const item = sandboxes.find((sandbox) => sandbox.name === name);
       if (!item) throw new Error(`unknown sandbox: ${name}`);
-      if (!item.online)
+      if (!item.online && item.kind !== "fleet")
         throw new Error(
           `${name}: ${item.unavailable_reason ?? "unavailable; inspect before repair"}`,
         );
@@ -1320,7 +1313,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       (candidate) => candidate.name === value,
     );
     if (!item) throw new Error(`unknown managed sandbox: ${value}`);
-    if (!item.online)
+    if (!item.online && item.kind !== "fleet")
       throw new Error(
         `${value}: ${item.unavailable_reason ?? "unavailable; inspect before repair"}`,
       );
@@ -1746,7 +1739,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       "Use cua_sandbox for sandbox resources; use /sandbox to choose where the current session executes tools.",
       "For custom resources, cua_sandbox create requires both cpu and memory_mb; omit both to use the OS defaults.",
       "Use a custom image only when the user explicitly provides a digest-pinned OCI reference.",
-      "Tagged macOS peers are discovered from Tailscale and never acquire Fleet deletion semantics.",
+      "Fleet-managed guests are disposable: missing setup may be recovered automatically and lost guest state rebuilt from controller source. Externally added hosts are persistent and must not be reset or re-enrolled automatically.",
       "Do not delete a CUA sandbox unless the user explicitly asks.",
     ],
     parameters: resourceSchema,
@@ -1757,18 +1750,6 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         input.os !== "windows"
       )
         throw new Error("create requires os=linux or os=windows");
-      if (input.recover && input.action !== "ensure")
-        throw new Error("recover is only valid for ensure");
-      if (input.recover) {
-        const allowed = ctx.hasUI
-          ? await ctx.ui.confirm(
-              `recover setup on ${input.name}?`,
-              "This may re-enroll the existing Fleet guest with a new device identity. It does not recover files from a lost guest disk. Check workspace recovery before continuing.",
-            )
-          : input.confirm === true;
-        if (!allowed) throw new Error("recovery requires confirmation");
-        input = { ...input, confirm: true };
-      }
       const hasResources =
         input.cpu !== undefined || input.memory_mb !== undefined;
       if (
@@ -1848,6 +1829,13 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       !saved.sandboxGeneration ||
       !destination.generation ||
       destination.generation === saved.sandboxGeneration
+    )
+      return true;
+    const inventory = await listSandboxes(ctx.signal);
+    if (
+      inventory.sandboxes?.some(
+        (item) => item.name === destination.name && item.kind === "fleet",
+      )
     )
       return true;
     if (

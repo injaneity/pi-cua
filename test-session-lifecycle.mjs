@@ -125,6 +125,9 @@ for (const approved of [false, true]) {
     let closed = false;
     const scope = {
       loadSessionTarget: () => saved,
+      listSandboxes: async () => ({
+        sandboxes: [{ name: "windows-1", kind: "external" }],
+      }),
       pi: { appendEntry: (...entry) => entries.push(entry) },
       bridge: {
         close: () => {
@@ -149,6 +152,47 @@ for (const approved of [false, true]) {
     }
   });
 }
+
+test("fleet identity replacement requires no data-salvage prompt", async () => {
+  const scope = {
+    loadSessionTarget: () => ({
+      kind: "sandbox",
+      name: "fleet",
+      sandboxGeneration: "old",
+    }),
+    listSandboxes: async () => ({
+      sandboxes: [{ name: "fleet", kind: "fleet" }],
+    }),
+  };
+  assert.equal(
+    await handler("acceptReplacement", scope)(
+      { kind: "sandbox", name: "fleet", generation: "new" },
+      { hasUI: false },
+    ),
+    true,
+  );
+});
+
+test("offline fleet remains selectable for bounded automatic recovery", async () => {
+  const scope = {
+    listSandboxes: async () => ({
+      sandboxes: [
+        {
+          name: "linux-1",
+          os: "linux",
+          kind: "fleet",
+          online: false,
+          generation: "old",
+        },
+      ],
+    }),
+    searchDestinationOptions: async (_ctx, options) =>
+      options.some((item) => item.value === "connect") ? "connect" : "linux-1",
+  };
+  const result = await handler("pickDestination", scope)({ hasUI: true });
+  assert.equal(result.name, "linux-1");
+  assert.equal(result.generation, "old");
+});
 
 const parent = {
   kind: "sandbox",

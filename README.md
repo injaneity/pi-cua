@@ -34,27 +34,19 @@ custom images are available through the structured `cua_sandbox` create action's
 
 ## unavailable or replaced machines
 
-The picker retains known unavailable machines and explains that their saved target is not online in the local Tailscale view. Selecting one stops with an error; it does not silently create a replacement. A peer with the same hostname cannot make a different saved address appear online.
+Lifecycle policy follows ownership, never hostname or operating system. Fleet-managed guests are disposable. Externally added hosts are persistent, including future externally added Linux and Windows hosts.
 
-Saved device generations are checked for Fleet and external hosts alike. An identity mismatch blocks resume before guest preparation. A persistent Fleet claim is not proof that the VM disk survived: inspect the provider binding and original workspace before accepting a replacement. This extension cannot guarantee provider disk durability or recover uncommitted files from a lost guest disk. It does not automatically repair missing hosts or reset saved thread placement to conceal a loss.
+The picker retains unavailable targets. Selecting an unavailable Fleet guest makes one bounded setup-recovery attempt through its existing claim. `ensure` installs missing prerequisites and re-enrolls only when enrollment is missing or mismatched. A changed Fleet device generation discards stale resume paths and reconstructs from the controller's source. Guest-only edits and artifacts may be lost; save important work to the controller or another durable location. Recovery reports what happened and never replays an already dispatched tool operation. It does not create or delete Fleet claims automatically.
 
-### explicit setup recovery
+Persistent hosts never enter Fleet bootstrap or automatic re-enrollment. Offline persistent hosts report an access error, and changed identities block automatic resume. Explicit replacement selection retains the existing confirmation and placement audit record. Persistent does not imply that the extension keeps a machine powered on or backs up its disk.
 
-After inspecting the original workspace and accepting that missing guest files will not be recovered, use:
-
-```json
-{ "action": "ensure", "name": "windows-1", "recover": true, "confirm": true }
-```
-
-Recovery uses the existing Fleet claim. It permits bootstrap when enrollment cannot be inspected, installs missing prerequisites, verifies enrollment and SSH, and updates the saved device address. It does not delete or recreate the claim. In interactive Pi this requires a confirmation dialog; non-interactive calls require `confirm=true`. External hosts remain owner-managed.
-
-Normal `ensure` still repairs verified prerequisites without changing valid enrollment. Offline status alone does not authorize recovery. After recovery, explicitly selecting the sandbox from a thread with a different saved device identity asks whether to accept the replacement. Acceptance retains the previous placement as an audit entry, never syncs or deletes the old workspace, and connects using the controller checkout. Automatic reload continues to reject identity changes.
+No recovery flags are needed: use `/sandbox windows-1` or `cua_sandbox` with `action=ensure` and its name. A controller network outage, invalid enrollment response, or guest transport failure stops with an error rather than triggering a blind reset. A peer sharing a hostname cannot establish the identity of a saved target.
 
 ## failure and repair boundaries
 
 Cancellation is a control-flow exception, not an unhealthy result. Health, enrollment, transport, and retry handlers must let it escape. Setup preserves SSH errors and invalid protocol responses instead of converting them into automatic repair requests. Fleet connection has one application-level attempt; a known missing prerequisite or refused Windows broker connection may request repair, but authentication failures and timeouts do not.
 
-A machine repair checks enrollment separately. If the tailnet and admission tag already match, bootstrap does not mint an auth key or force reauthentication. This preserves device identity during Pi or prerequisite updates. A failed enrollment inspection stops with its error rather than guessing that reauthentication is safe. Machine prerequisites still share a bootstrap script; they are not yet independently installed runtime components.
+A machine repair checks enrollment separately. If the tailnet and admission tag already match, bootstrap does not mint an auth key or force reauthentication. This preserves device identity during Pi or prerequisite updates. A missing Tailscale installation or explicit logged-out state permits Fleet recovery. Other failed enrollment inspections stop with their error rather than guessing that reauthentication is safe. Machine prerequisites still share a bootstrap script; they are not yet independently installed runtime components.
 
 Lock acquisition is bounded to 30 seconds per lock. Controller backend processes have a 45-minute deadline; execution materialization and its repair attempt share a 10-minute abort signal. Cancellation allows five seconds for cleanup, then terminates the local backend process group. Forced termination does not prove a detached guest job stopped: retained claims and incomplete staging directories may require inspection before another attempt.
 

@@ -94,31 +94,122 @@ class InventoryVisibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result["sandboxes"]), 2)
         for item in result["sandboxes"]:
             self.assertFalse(item["online"])
-            self.assertIn("inspect", item["unavailable_reason"])
+            self.assertIn("persistent host unavailable", item["unavailable_reason"])
+
+
+class DisposablePolicyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_offline_fleet_requests_repair_without_touching_old_guest(
+        self,
+    ) -> None:
+        with (
+            patch.object(
+                backend,
+                "managed_sandboxes",
+                return_value=[
+                    {
+                        "name": "fleet",
+                        "os": "linux",
+                        "kind": "fleet",
+                        "address": "100.64.0.9",
+                        "generation": "old",
+                    }
+                ],
+            ),
+            patch.object(
+                backend,
+                "local_tailscale_status",
+                return_value={"BackendState": "Running", "Peer": {}},
+            ),
+            patch.object(backend, "guest_runtime_preflight") as preflight,
+            self.assertRaises(backend.SandboxRepairRequired),
+        ):
+            try:
+                await backend.activate_execution(
+                    "fleet", "/controller", "session", sandbox_generation="old"
+                )
+            finally:
+                preflight.assert_not_called()
+
+    async def test_controller_network_failure_does_not_request_guest_recovery(
+        self,
+    ) -> None:
+        with (
+            patch.object(
+                backend,
+                "managed_sandboxes",
+                return_value=[{"name": "fleet", "os": "linux", "kind": "fleet"}],
+            ),
+            patch.object(backend, "local_tailscale_status", return_value=None),
+            self.assertRaisesRegex(RuntimeError, "controller Tailscale is unavailable"),
+        ):
+            await backend.activate_execution("fleet", "/controller", "session")
+
+    async def test_fleet_replacement_discards_stale_resume_state(self) -> None:
+        for profile in ("linux", "windows"):
+            with (
+                self.subTest(profile=profile),
+                patch.object(
+                    backend,
+                    "managed_sandboxes",
+                    return_value=[
+                        {
+                            "name": "fleet",
+                            "os": profile,
+                            "kind": "fleet",
+                            "address": "100.64.0.9",
+                            "generation": "new",
+                        }
+                    ],
+                ),
+                patch.object(
+                    backend,
+                    "local_tailscale_status",
+                    return_value={
+                        "BackendState": "Running",
+                        "Peer": {
+                            "peer": {
+                                "ID": "new",
+                                "Online": True,
+                                "TailscaleIPs": ["100.64.0.9"],
+                                "Tags": ["tag:cua-sandbox"],
+                            }
+                        },
+                    },
+                ),
+                patch.object(
+                    backend, "discover_workspace", return_value=None
+                ) as discover,
+                patch.object(
+                    backend,
+                    "guest_runtime_preflight",
+                    return_value=backend.GuestRuntimePreflight("100.64.0.9", True),
+                ),
+                patch.object(backend, "execution_directory", return_value="/fresh"),
+            ):
+                result = await backend.activate_execution(
+                    "fleet",
+                    "/controller",
+                    "session",
+                    resume={"os": profile, "remoteCwd": "/lost", "state": {}},
+                    sandbox_generation="old",
+                    force_reconcile=False,
+                )
+                self.assertEqual(result["remote_cwd"], "/fresh")
+                self.assertEqual(result["sandbox_generation"], "new")
+                self.assertNotIn("workspace_state", result)
+                discover.assert_called_once()
 
 
 class RecoveryTests(unittest.IsolatedAsyncioTestCase):
-    async def test_recovery_requires_confirmation(self) -> None:
+    async def test_ensure_uses_ownership_without_a_recovery_flag(self) -> None:
         with (
             patch.object(backend, "uses_fleet", return_value=False),
             patch.object(backend, "ensure_one", AsyncMock()) as ensure,
         ):
-            with self.assertRaisesRegex(ValueError, "confirm=true"):
-                await backend.dispatch(
-                    {"action": "ensure", "name": "windows-1", "recover": True}
-                )
-            ensure.assert_not_awaited()
-            await backend.dispatch(
-                {
-                    "action": "ensure",
-                    "name": "windows-1",
-                    "recover": True,
-                    "confirm": True,
-                }
-            )
-            ensure.assert_awaited_once_with("windows-1", recover=True)
+            await backend.dispatch({"action": "ensure", "name": "windows-1"})
+            ensure.assert_awaited_once_with("windows-1")
 
-    async def test_missing_enrollment_is_only_rebuilt_in_recovery_mode(self) -> None:
+    async def test_only_confirmed_missing_enrollment_triggers_recovery(self) -> None:
         for recover in (False, True):
             with (
                 self.subTest(recover=recover),
@@ -138,7 +229,13 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(
                     backend,
                     "guest_enrollment_matches",
-                    AsyncMock(side_effect=RuntimeError("tailscale missing")),
+                    AsyncMock(
+                        side_effect=(
+                            backend.EnrollmentMissing("tailscale missing")
+                            if recover
+                            else RuntimeError("inspection failed")
+                        )
+                    ),
                 ),
                 patch.object(
                     backend, "bootstrap_windows", AsyncMock(return_value="100.64.0.9")
@@ -147,24 +244,41 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(backend, "disconnect_safely", AsyncMock()),
             ):
                 if recover:
-                    result = await backend.ensure_one("windows-1", recover=True)
+                    result = await backend.ensure_one("windows-1")
                     self.assertTrue(result["changed"])
                     self.assertTrue(bootstrap.call_args.kwargs["reenroll"])
                 else:
-                    with self.assertRaisesRegex(RuntimeError, "no reset attempted"):
+                    with self.assertRaisesRegex(RuntimeError, "inspection failed"):
                         await backend.ensure_one("windows-1")
                     bootstrap.assert_not_awaited()
 
-    async def test_external_recovery_is_refused(self) -> None:
-        with (
-            patch.object(
-                backend,
-                "managed_sandboxes",
-                return_value=[{"name": "mac", "os": "macos", "kind": "external"}],
-            ),
-            self.assertRaisesRegex(ValueError, "owner-managed"),
-        ):
-            await backend.ensure_one("mac", recover=True)
+    async def test_external_failure_never_bootstraps_any_os(self) -> None:
+        for os in ("linux", "windows", "macos"):
+            with (
+                self.subTest(os=os),
+                patch.object(
+                    backend,
+                    "managed_sandboxes",
+                    return_value=[
+                        {
+                            "name": "external",
+                            "os": os,
+                            "kind": "external",
+                            "address": "100.64.0.9",
+                        }
+                    ],
+                ),
+                patch.object(backend, "guest_health_command", return_value="health"),
+                patch.object(
+                    backend, "run_guest_ssh", side_effect=RuntimeError("offline")
+                ),
+                patch.object(backend, "connect_sandbox", AsyncMock()) as connect,
+                self.assertRaisesRegex(RuntimeError, "offline"),
+            ):
+                try:
+                    await backend.ensure_one("external")
+                finally:
+                    connect.assert_not_awaited()
 
 
 class FailureBoundaryTests(unittest.IsolatedAsyncioTestCase):
@@ -657,6 +771,7 @@ class ManagedSandboxTests(unittest.TestCase):
                             "name": "linux-1",
                             "os": "linux",
                             "pool": custom_pool,
+                            "kind": "fleet",
                             "address": None,
                         }
                     ],

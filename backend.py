@@ -64,6 +64,10 @@ CONTROLLER_LOCK = CONTROLLER_DIR / "controller.lock"
 CURRENT_PHASE = "startup"
 
 
+class EnrollmentMissing(RuntimeError):
+    pass
+
+
 class OperationCancelled(BaseException):
     pass
 
@@ -503,7 +507,7 @@ def controller_sandboxes() -> list[dict[str, Any]]:
                 "name": record["name"],
                 "os": record["os"],
                 "pool": record["pool"],
-                **({"kind": "external"} if record.get("kind") == "external" else {}),
+                "kind": "external" if record.get("kind") == "external" else "fleet",
                 "address": (record.get("addresses") or [None])[0],
                 **(
                     {"generation": record["deviceId"]}
@@ -771,11 +775,13 @@ def managed_sandboxes() -> list[dict[str, Any]]:
 
 async def guest_tailscale_identity(sb: Any, profile: str) -> tuple[str, str, list[str]]:
     command = (
-        "tailscale status --json"
+        "if command -v tailscale >/dev/null 2>&1; then tailscale status --json; else echo CUA_ENROLLMENT_MISSING; fi"
         if profile == "linux"
-        else "powershell.exe -NoProfile -Command \"& 'C:\\Program Files\\Tailscale\\tailscale.exe' status --json\""
+        else "powershell.exe -NoProfile -Command \"if (Test-Path 'C:\\Program Files\\Tailscale\\tailscale.exe') { & 'C:\\Program Files\\Tailscale\\tailscale.exe' status --json } else { Write-Output 'CUA_ENROLLMENT_MISSING' }\""
     )
     result = await sb.shell.run(command, timeout=30)
+    if result.stdout.strip() == "CUA_ENROLLMENT_MISSING":
+        raise EnrollmentMissing("guest Tailscale is not installed")
     if result.returncode != 0:
         raise RuntimeError(result.stderr or "guest Tailscale status failed")
     try:
@@ -785,6 +791,8 @@ async def guest_tailscale_identity(sb: Any, profile: str) -> tuple[str, str, lis
     tailnet = (status.get("CurrentTailnet") or {}).get("Name")
     hostname = (status.get("Self") or {}).get("HostName")
     tags = (status.get("Self") or {}).get("Tags") or []
+    if status.get("BackendState") in {"NeedsLogin", "NoState"}:
+        raise EnrollmentMissing("guest Tailscale requires enrollment")
     if status.get("BackendState") != "Running":
         raise RuntimeError("guest Tailscale backend is not running")
     if not isinstance(tailnet, str) or not tailnet:
@@ -1399,14 +1407,12 @@ def guest_health_address(result: subprocess.CompletedProcess[str], name: str) ->
     return lines[-1]
 
 
-async def ensure_one(name: str, *, recover: bool = False) -> dict[str, Any]:
+async def ensure_one(name: str) -> dict[str, Any]:
     states = {item["name"]: item for item in managed_sandboxes()}
     if name not in states:
         raise ValueError(f"unknown managed sandbox: {name}")
     profile = states[name]["os"]
     if states[name].get("kind") == "external":
-        if recover:
-            raise ValueError("external hosts require owner-managed recovery")
         address = str(states[name].get("address") or "")
         if states[name].get("discovered") is True:
             pin_verified_ssh_host_key(address)
@@ -1434,13 +1440,11 @@ async def ensure_one(name: str, *, recover: bool = False) -> dict[str, Any]:
         progress("tailscale.enrollment", "checking enrollment before repair")
         try:
             enrolled = await guest_enrollment_matches(sb, profile, tailnet)
-        except (RuntimeError, TimeoutError) as error:
-            if not recover:
-                raise RuntimeError(
-                    "enrollment inspection failed; no reset attempted. "
-                    "After checking workspace recovery, use ensure with recover=true and confirm=true. "
-                    f"Cause: {error_text(error)}"
-                ) from error
+        except EnrollmentMissing:
+            progress(
+                "sandbox.recovery",
+                "rebuilding disposable Fleet guest setup; previous guest data is not recovered",
+            )
             enrolled = False
         changed = address is None or not enrolled
         if changed:
@@ -2931,12 +2935,36 @@ async def activate_execution(
         raise ValueError(f"unknown managed sandbox: {name}")
     state = states[name]
     current_generation = state.get("generation")
+    disposable = state.get("kind") == "fleet"
+    if disposable:
+        status = local_tailscale_status()
+        if not status or status.get("BackendState") != "Running":
+            raise RuntimeError(
+                "controller Tailscale is unavailable; no guest recovery attempted"
+            )
+        peers = (status.get("Peer") or {}).values()
+        if not any(
+            peer.get("Online") is True
+            and state.get("address") in (peer.get("TailscaleIPs") or [])
+            and "tag:cua-sandbox" in (peer.get("Tags") or [])
+            and (peer.get("StableID") or peer.get("ID")) == current_generation
+            for peer in peers
+        ):
+            raise SandboxRepairRequired(
+                f"disposable Fleet target is unavailable: {name}"
+            )
     if sandbox_generation and sandbox_generation != current_generation:
-        raise RuntimeError(
-            f"sandbox identity changed: {name}; expected {sandbox_generation}, "
-            f"found {current_generation or 'unknown'}. Execution stopped; "
-            "inspect the original workspace before accepting a replacement"
+        if not disposable:
+            raise RuntimeError(
+                f"sandbox identity changed: {name}; expected {sandbox_generation}, "
+                f"found {current_generation or 'unknown'}. Execution stopped; "
+                "inspect the original workspace before accepting a replacement"
+            )
+        progress(
+            "sandbox.recovery",
+            "Fleet device changed; rebuilding workspace from controller source",
         )
+        resume = None
     profile = state["os"]
     if state.get("discovered") is True:
         pin_verified_ssh_host_key(str(state.get("address") or ""))
@@ -3127,7 +3155,11 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
                     "online": reachable,
                     **(
                         {
-                            "unavailable_reason": "saved target is not online in the local Tailscale view; inspect the existing machine and workspace before repair"
+                            "unavailable_reason": (
+                                "disposable Fleet guest unavailable; select to attempt setup recovery"
+                                if item.get("kind") == "fleet"
+                                else "persistent host unavailable; owner must restore access without resetting its data"
+                            )
                         }
                         if not reachable
                         else {}
@@ -3156,15 +3188,6 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
             request.get("image"),
         )
     if action == "ensure":
-        recover = request.get("recover", False)
-        if not isinstance(recover, bool):
-            raise TypeError("recover must be a boolean")
-        if recover:
-            if request.get("confirm") is not True:
-                raise ValueError(
-                    "recovery requires confirm=true; previous guest files may be unavailable"
-                )
-            return await ensure_one(str(request.get("name") or ""), recover=True)
         return await ensure_one(str(request.get("name") or ""))
     if action == "delete":
         return await delete_one(str(request.get("name") or ""))
