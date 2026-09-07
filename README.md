@@ -52,6 +52,12 @@ Lock acquisition is bounded to 30 seconds per lock. Controller backend processes
 
 Runtime staging must successfully create and dispose a tool host with the base coding tools before publishing its completion marker. Actual connection still validates the complete requested tool manifest and, on Windows, the interactive broker. This installation check is not a GUI permission or desktop-readiness certification.
 
+## resume checks
+
+A matching saved device generation takes the direct connection path without a separate runtime, disk, or repository preflight. If connection setup falls back to reconciliation, one SSH call checks the saved runtime and Git workspace together, including the saved working directory. An existing usable runtime and workspace can resume below the 1 GiB setup threshold without querying the repository remote or inspecting the controller checkout.
+
+The space gate still applies when installing a missing runtime or preparing a new workspace. A missing workspace enters the normal reconstruction path. This is not a general maintenance mode: first entry that needs a new workspace can still be blocked by low disk space. Identity checks remain unchanged, and no dispatched tool operation is replayed. The controller Pi version is cached only for the lifetime of one backend process, avoiding repeated `pi --version` subprocesses during setup.
+
 ## execution path
 
 1. the extension starts one backend process and reads progress and the final result from its jsonl stream; healthy setup uses the controller's existing Python, while provisioning and repair re-exec under the isolated Fleet sdk runtime;

@@ -32,6 +32,7 @@ from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import cache
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, NotRequired, TypedDict, cast
 from urllib.error import HTTPError
@@ -210,6 +211,7 @@ def ensure_windows_identity() -> Path:
     return WINDOWS_IDENTITY
 
 
+@cache
 def pi_version() -> str:
     proc = subprocess.run(
         # pi 0.84+ runs a network update check on --version; 10s flakes
@@ -2118,6 +2120,7 @@ class GuestRuntimePreflight:
     address: str
     runtime_available: bool
     free_bytes: int = 1024**3
+    workspace_available: bool = False
 
 
 def preflight_succeeded(
@@ -2141,26 +2144,39 @@ def preflight_succeeded(
 
 
 def guest_runtime_preflight(
-    name: str, profile: str, runtime_digest: str
+    name: str, profile: str, runtime_digest: str, workspace_cwd: str | None = None
 ) -> GuestRuntimePreflight | None:
+    root = saved_workspace_root(profile, workspace_cwd) if workspace_cwd else None
     if is_unix(profile):
         home = guest_home(profile)
         complete = shlex.quote(f"{home}/.cua-pi/runtimes/{runtime_digest}/complete")
+        workspace_check = (
+            f"if [ -d {shlex.quote(root + '/.git')} ] && [ -d {shlex.quote(workspace_cwd)} ]; then workspace=1; else workspace=0; fi"
+            if root and workspace_cwd
+            else "workspace=0"
+        )
         command = f"""set -u
 address=$({guest_health_command(profile)}) || exit 20
 free_bytes=$(( $(df -Pk {shlex.quote(home)} | awk 'NR == 2 {{ print $4 }}') * 1024 ))
 if [ -f {complete} ]; then ready=1; else ready=0; fi
-printf '%s|%s|%s\n' "$address" "$free_bytes" "$ready"
+{workspace_check}
+printf '%s|%s|%s|%s\n' "$address" "$free_bytes" "$ready" "$workspace"
 """
     else:
         complete = powershell_literal(
             rf"C:\Users\cua\.cua-pi\runtimes\{runtime_digest}\complete"
         )
+        workspace_check = (
+            f"$workspace = if ((Test-Path -LiteralPath {powershell_literal(root + '/.git')} -PathType Container) -and (Test-Path -LiteralPath {powershell_literal(workspace_cwd)} -PathType Container)) {{ '1' }} else {{ '0' }}\n"
+            if root and workspace_cwd
+            else "$workspace = '0'\n"
+        )
         script = (
             windows_ssh_health_script()
             + "$free = [IO.DriveInfo]::new('C:\\').AvailableFreeSpace\n"
             + f'$ready = if (Test-Path {complete}) {{ "1" }} else {{ "0" }}\n'
-            + '"healthy|$free|$ready"\n'
+            + workspace_check
+            + '"healthy|$free|$ready|$workspace"\n'
         )
         command = powershell_encoded_command(script)
     result = run_guest_ssh(
@@ -2176,12 +2192,18 @@ printf '%s|%s|%s\n' "$address" "$free_bytes" "$ready"
         ),
         [],
     )
-    if len(fields) != 3 or not fields[1].isdigit() or fields[2] not in {"0", "1"}:
+    if (
+        len(fields) != 4
+        or not fields[1].isdigit()
+        or fields[2] not in {"0", "1"}
+        or fields[3] not in {"0", "1"}
+    ):
         raise RuntimeError(f"invalid runtime preflight response from {name}")
     return GuestRuntimePreflight(
         address=name if profile in {"windows", "macos"} else fields[0],
         free_bytes=int(fields[1]),
         runtime_available=fields[2] == "1",
+        workspace_available=fields[3] == "1",
     )
 
 
@@ -2637,31 +2659,19 @@ New-Item -ItemType Directory -Force -Path 'C:\\cua\\workspaces','C:\\cua\\cache\
     return str(PureWindowsPath(workspace_root) / relative_windows)
 
 
-def sandbox_workspace_exists(name: str, profile: str, cwd: str) -> bool:
+def saved_workspace_root(profile: str, cwd: str) -> str:
     if is_unix(profile):
         workspace_prefix = f"{guest_home(profile)}/workspaces"
         match = re.match(
             rf"^({re.escape(workspace_prefix)}/[0-9a-f]{{16}})(?:/|$)", cwd
         )
-        command = f"test -d {shlex.quote(match.group(1) if match else '')}/.git"
     else:
         match = re.match(
             r"^(C:\\cua\\workspaces\\[0-9a-f]{16})(?:\\|$)", cwd, re.IGNORECASE
         )
-        root = match.group(1) if match else ""
-        command = (
-            'powershell.exe -NoProfile -Command "if(Test-Path '
-            + powershell_literal(root + r"\.git")
-            + '){exit 0}else{exit 1}"'
-        )
     if match is None:
         raise ValueError("saved sandbox workspace path is invalid")
-    result = run_guest_ssh(name, profile, command, timeout=30, check=False)
-    if result.returncode not in {0, 1}:
-        raise RuntimeError(
-            result.stderr or f"workspace probe exited {result.returncode}"
-        )
-    return result.returncode == 0
+    return match.group(1)
 
 
 def workspace_location(name: str, profile: str, cwd: str) -> tuple[str, str]:
@@ -2963,6 +2973,43 @@ async def activate_execution(
             "sandbox_generation": current_generation,
             "reconciled": False,
         }
+    if workspace_resume:
+        progress("sandbox.resume", "checking saved runtime and workspace")
+        runtime = guest_runtime_preflight(
+            candidate, profile, guest_digest, workspace_resume["remoteCwd"]
+        )
+        if runtime is None:
+            raise SandboxRepairRequired(f"sandbox repair required: {name}")
+        if runtime.workspace_available:
+            if runtime.runtime_available and runtime.free_bytes < 1024**3:
+                progress(
+                    "sandbox.resume",
+                    f"low disk space: {runtime.free_bytes // 1048576} MiB free; "
+                    "reusing existing runtime and workspace without setup",
+                )
+            if not runtime.runtime_available:
+                if runtime.free_bytes < 1024**3:
+                    raise RuntimeError(
+                        "runtime setup requires 1 GiB free; "
+                        f"only {runtime.free_bytes // 1048576} MiB is available"
+                    )
+                await asyncio.to_thread(
+                    install_guest_runtime,
+                    runtime.address,
+                    profile,
+                    guest_runtime_archive(config_files),
+                    guest_digest,
+                )
+            return {
+                "name": name,
+                "os": profile,
+                "address": runtime.address,
+                "remote_cwd": workspace_resume["remoteCwd"],
+                "workspace_state": workspace_resume["state"],
+                "runtime_digest": guest_digest,
+                "sandbox_generation": current_generation,
+                "reconciled": True,
+            }
     repository = (
         None
         if resume and not workspace_resume
@@ -3017,28 +3064,6 @@ async def activate_execution(
     runtime_content = (
         guest_runtime_archive(config_files) if not preflight.runtime_available else None
     )
-    if workspace_resume and sandbox_workspace_exists(
-        address, profile, workspace_resume["remoteCwd"]
-    ):
-        if runtime_content:
-            await asyncio.to_thread(
-                install_guest_runtime,
-                address,
-                profile,
-                runtime_content,
-                guest_digest,
-            )
-        return {
-            "name": name,
-            "os": profile,
-            "address": address,
-            "remote_cwd": workspace_resume["remoteCwd"],
-            "workspace_state": workspace_resume["state"],
-            "runtime_digest": guest_digest,
-            "sandbox_generation": current_generation,
-            "reconciled": True,
-        }
-
     transfer = (
         capture_sandbox_workspace(source)
         if source

@@ -2008,16 +2008,21 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         cleanup.assert_not_called()
 
     async def test_activate_execution_reuses_an_existing_saved_workspace(self) -> None:
-        preflight = backend.GuestPreflight("100.64.0.2", 2**30, True, True)
+        preflight = backend.GuestRuntimePreflight(
+            "100.64.0.2", True, 286 * 1024**2, True
+        )
         with (
             patch.object(
                 backend,
                 "managed_sandboxes",
                 return_value=[{"name": "linux-1", "os": "linux"}],
             ),
-            patch.object(backend, "inspect_workspace", return_value=self.repository),
-            patch.object(backend, "guest_preflight", return_value=preflight),
-            patch.object(backend, "sandbox_workspace_exists", return_value=True),
+            patch.object(backend, "discover_workspace") as discover,
+            patch.object(backend, "guest_preflight") as setup_probe,
+            patch.object(
+                backend, "guest_runtime_preflight", return_value=preflight
+            ) as resume_probe,
+            patch.object(backend, "install_guest_runtime") as install,
             patch.object(backend, "capture_local_workspace") as capture,
             patch.object(backend, "prepare_workspace") as prepare,
         ):
@@ -2028,8 +2033,40 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["address"], "100.64.0.2")
         self.assertEqual(result["remote_cwd"], self.source["remoteCwd"])
         self.assertEqual(result["workspace_state"], self.state)
+        resume_probe.assert_called_once()
+        setup_probe.assert_not_called()
+        discover.assert_not_called()
+        install.assert_not_called()
         capture.assert_not_called()
         prepare.assert_not_called()
+
+    async def test_existing_workspace_still_requires_capacity_for_missing_runtime(
+        self,
+    ) -> None:
+        with (
+            patch.object(
+                backend,
+                "managed_sandboxes",
+                return_value=[{"name": "linux-1", "os": "linux"}],
+            ),
+            patch.object(
+                backend,
+                "guest_runtime_preflight",
+                return_value=backend.GuestRuntimePreflight(
+                    "100.64.0.2", False, 286 * 1024**2, True
+                ),
+            ),
+            patch.object(backend, "guest_preflight") as setup,
+            patch.object(backend, "install_guest_runtime") as install,
+            self.assertRaisesRegex(RuntimeError, "runtime setup requires 1 GiB"),
+        ):
+            try:
+                await backend.activate_execution(
+                    "linux-1", "/local", "session-1", resume=self.source
+                )
+            finally:
+                install.assert_not_called()
+                setup.assert_not_called()
 
     async def test_activate_execution_reconstructs_a_missing_saved_workspace(
         self,
@@ -2044,7 +2081,13 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch.object(backend, "inspect_workspace", return_value=self.repository),
             patch.object(backend, "guest_preflight", return_value=preflight),
-            patch.object(backend, "sandbox_workspace_exists", return_value=False),
+            patch.object(
+                backend,
+                "guest_runtime_preflight",
+                return_value=backend.GuestRuntimePreflight(
+                    "100.64.0.2", True, 2**30, False
+                ),
+            ),
             patch.object(backend, "capture_local_workspace", return_value=transfer),
             patch.object(
                 backend,
@@ -2111,6 +2154,81 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         configure.assert_not_called()
         prepare.assert_awaited_once()
         self.assertEqual(result, {"remote_cwd": "/workspace"})
+
+
+class ResumePreflightTests(unittest.TestCase):
+    def test_pi_version_is_resolved_once_per_backend_process(self) -> None:
+        backend.pi_version.cache_clear()
+        try:
+            with patch.object(
+                backend.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess([], 0, "0.85.0\n", ""),
+            ) as run:
+                self.assertEqual(backend.pi_version(), "0.85.0")
+                self.assertEqual(backend.pi_version(), "0.85.0")
+                run.assert_called_once()
+        finally:
+            backend.pi_version.cache_clear()
+
+    def test_resume_uses_one_ssh_call_without_repository_network_checks(self) -> None:
+        for profile in ("linux", "windows", "macos"):
+            root = (
+                r"C:\cua\workspaces\0123456789abcdef"
+                if profile == "windows"
+                else f"{backend.guest_home(profile)}/workspaces/0123456789abcdef"
+            )
+            with (
+                self.subTest(profile=profile),
+                patch.object(backend, "bootstrap_digest", return_value="b" * 20),
+                patch.object(
+                    backend,
+                    "run_guest_ssh",
+                    return_value=subprocess.CompletedProcess(
+                        [], 0, "100.64.0.2|299892736|1|1\n", ""
+                    ),
+                ) as ssh,
+            ):
+                result = backend.guest_runtime_preflight(
+                    "100.64.0.2", profile, "a" * 20, root
+                )
+                self.assertTrue(result.workspace_available)
+                self.assertTrue(result.runtime_available)
+                self.assertEqual(result.free_bytes, 286 * 1024**2)
+                ssh.assert_called_once()
+                command = ssh.call_args.args[2]
+                if profile == "windows":
+                    command = backend.base64.b64decode(
+                        command.rsplit(" ", 1)[-1]
+                    ).decode("utf-16le")
+                self.assertIn(".git", command)
+                self.assertNotIn("ls-remote", command)
+                self.assertNotIn("cat-file", command)
+
+    def test_invalid_workspace_is_rejected_before_ssh(self) -> None:
+        for profile in ("linux", "windows", "macos"):
+            with (
+                self.subTest(profile=profile),
+                patch.object(backend, "run_guest_ssh") as ssh,
+            ):
+                with self.assertRaisesRegex(ValueError, "workspace path is invalid"):
+                    backend.guest_runtime_preflight(
+                        "host", profile, "a" * 20, "/unrelated"
+                    )
+                ssh.assert_not_called()
+
+    def test_invalid_resume_response_and_transport_errors_do_not_request_repair(
+        self,
+    ) -> None:
+        for result in (
+            subprocess.CompletedProcess([], 0, "healthy|123|1|garbage\n", ""),
+            subprocess.CompletedProcess([], 255, "", "permission denied"),
+        ):
+            with (
+                patch.object(backend, "run_guest_ssh", return_value=result),
+                self.assertRaises(RuntimeError),
+            ):
+                backend.guest_runtime_preflight("host", "linux", "a" * 20)
 
 
 class WindowsDesktopBrokerTests(unittest.TestCase):
