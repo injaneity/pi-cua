@@ -1399,12 +1399,14 @@ def guest_health_address(result: subprocess.CompletedProcess[str], name: str) ->
     return lines[-1]
 
 
-async def ensure_one(name: str) -> dict[str, Any]:
+async def ensure_one(name: str, *, recover: bool = False) -> dict[str, Any]:
     states = {item["name"]: item for item in managed_sandboxes()}
     if name not in states:
         raise ValueError(f"unknown managed sandbox: {name}")
     profile = states[name]["os"]
     if states[name].get("kind") == "external":
+        if recover:
+            raise ValueError("external hosts require owner-managed recovery")
         address = str(states[name].get("address") or "")
         if states[name].get("discovered") is True:
             pin_verified_ssh_host_key(address)
@@ -1430,7 +1432,16 @@ async def ensure_one(name: str) -> dict[str, Any]:
         progress("sandbox.health", "checking machine prerequisites")
         address = await healthy(sb, profile)
         progress("tailscale.enrollment", "checking enrollment before repair")
-        enrolled = await guest_enrollment_matches(sb, profile, tailnet)
+        try:
+            enrolled = await guest_enrollment_matches(sb, profile, tailnet)
+        except (RuntimeError, TimeoutError) as error:
+            if not recover:
+                raise RuntimeError(
+                    "enrollment inspection failed; no reset attempted. "
+                    "After checking workspace recovery, use ensure with recover=true and confirm=true. "
+                    f"Cause: {error_text(error)}"
+                ) from error
+            enrolled = False
         changed = address is None or not enrolled
         if changed:
             address = await (
@@ -3145,6 +3156,15 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
             request.get("image"),
         )
     if action == "ensure":
+        recover = request.get("recover", False)
+        if not isinstance(recover, bool):
+            raise TypeError("recover must be a boolean")
+        if recover:
+            if request.get("confirm") is not True:
+                raise ValueError(
+                    "recovery requires confirm=true; previous guest files may be unavailable"
+                )
+            return await ensure_one(str(request.get("name") or ""), recover=True)
         return await ensure_one(str(request.get("name") or ""))
     if action == "delete":
         return await delete_one(str(request.get("name") or ""))

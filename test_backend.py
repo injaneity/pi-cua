@@ -97,6 +97,76 @@ class InventoryVisibilityTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("inspect", item["unavailable_reason"])
 
 
+class RecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_recovery_requires_confirmation(self) -> None:
+        with (
+            patch.object(backend, "uses_fleet", return_value=False),
+            patch.object(backend, "ensure_one", AsyncMock()) as ensure,
+        ):
+            with self.assertRaisesRegex(ValueError, "confirm=true"):
+                await backend.dispatch(
+                    {"action": "ensure", "name": "windows-1", "recover": True}
+                )
+            ensure.assert_not_awaited()
+            await backend.dispatch(
+                {
+                    "action": "ensure",
+                    "name": "windows-1",
+                    "recover": True,
+                    "confirm": True,
+                }
+            )
+            ensure.assert_awaited_once_with("windows-1", recover=True)
+
+    async def test_missing_enrollment_is_only_rebuilt_in_recovery_mode(self) -> None:
+        for recover in (False, True):
+            with (
+                self.subTest(recover=recover),
+                patch.object(
+                    backend,
+                    "managed_sandboxes",
+                    return_value=[{"name": "windows-1", "os": "windows"}],
+                ),
+                patch.object(
+                    backend, "local_tailscale_identity", return_value="example.test"
+                ),
+                patch.object(backend, "restore_cua_state"),
+                patch.object(
+                    backend, "connect_sandbox", AsyncMock(return_value=object())
+                ),
+                patch.object(backend, "healthy", AsyncMock(return_value=None)),
+                patch.object(
+                    backend,
+                    "guest_enrollment_matches",
+                    AsyncMock(side_effect=RuntimeError("tailscale missing")),
+                ),
+                patch.object(
+                    backend, "bootstrap_windows", AsyncMock(return_value="100.64.0.9")
+                ) as bootstrap,
+                patch.object(backend, "complete_tailscale_enrollment", AsyncMock()),
+                patch.object(backend, "disconnect_safely", AsyncMock()),
+            ):
+                if recover:
+                    result = await backend.ensure_one("windows-1", recover=True)
+                    self.assertTrue(result["changed"])
+                    self.assertTrue(bootstrap.call_args.kwargs["reenroll"])
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "no reset attempted"):
+                        await backend.ensure_one("windows-1")
+                    bootstrap.assert_not_awaited()
+
+    async def test_external_recovery_is_refused(self) -> None:
+        with (
+            patch.object(
+                backend,
+                "managed_sandboxes",
+                return_value=[{"name": "mac", "os": "macos", "kind": "external"}],
+            ),
+            self.assertRaisesRegex(ValueError, "owner-managed"),
+        ):
+            await backend.ensure_one("mac", recover=True)
+
+
 class FailureBoundaryTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancelled_health_never_starts_repair(self) -> None:
         for profile in ("linux", "windows"):

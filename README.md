@@ -38,6 +38,18 @@ The picker retains known unavailable machines and explains that their saved targ
 
 Saved device generations are checked for Fleet and external hosts alike. An identity mismatch blocks resume before guest preparation. A persistent Fleet claim is not proof that the VM disk survived: inspect the provider binding and original workspace before accepting a replacement. This extension cannot guarantee provider disk durability or recover uncommitted files from a lost guest disk. It does not automatically repair missing hosts or reset saved thread placement to conceal a loss.
 
+### explicit setup recovery
+
+After inspecting the original workspace and accepting that missing guest files will not be recovered, use:
+
+```json
+{ "action": "ensure", "name": "windows-1", "recover": true, "confirm": true }
+```
+
+Recovery uses the existing Fleet claim. It permits bootstrap when enrollment cannot be inspected, installs missing prerequisites, verifies enrollment and SSH, and updates the saved device address. It does not delete or recreate the claim. In interactive Pi this requires a confirmation dialog; non-interactive calls require `confirm=true`. External hosts remain owner-managed.
+
+Normal `ensure` still repairs verified prerequisites without changing valid enrollment. Offline status alone does not authorize recovery. After recovery, explicitly selecting the sandbox from a thread with a different saved device identity asks whether to accept the replacement. Acceptance retains the previous placement as an audit entry, never syncs or deletes the old workspace, and connects using the controller checkout. Automatic reload continues to reject identity changes.
+
 ## failure and repair boundaries
 
 Cancellation is a control-flow exception, not an unhealthy result. Health, enrollment, transport, and retry handlers must let it escape. Setup preserves SSH errors and invalid protocol responses instead of converting them into automatic repair requests. Fleet connection has one application-level attempt; a known missing prerequisite or refused Windows broker connection may request repair, but authentication failures and timeouts do not.

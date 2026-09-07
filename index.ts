@@ -98,9 +98,16 @@ const resourceSchema = Type.Object({
       description: "Digest-pinned OCI image for create",
     }),
   ),
+  recover: Type.Optional(
+    Type.Boolean({
+      description:
+        "Explicitly rebuild missing Fleet guest setup with ensure; requires confirmation and does not recover lost files",
+    }),
+  ),
   confirm: Type.Optional(
     Type.Boolean({
-      description: "Required for create or delete when no UI is available",
+      description:
+        "Required for create, delete, or recovery when no UI is available",
     }),
   ),
 });
@@ -1750,6 +1757,18 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         input.os !== "windows"
       )
         throw new Error("create requires os=linux or os=windows");
+      if (input.recover && input.action !== "ensure")
+        throw new Error("recover is only valid for ensure");
+      if (input.recover) {
+        const allowed = ctx.hasUI
+          ? await ctx.ui.confirm(
+              `recover setup on ${input.name}?`,
+              "This may re-enroll the existing Fleet guest with a new device identity. It does not recover files from a lost guest disk. Check workspace recovery before continuing.",
+            )
+          : input.confirm === true;
+        if (!allowed) throw new Error("recovery requires confirmation");
+        input = { ...input, confirm: true };
+      }
       const hasResources =
         input.cpu !== undefined || input.memory_mb !== undefined;
       if (
@@ -1817,6 +1836,39 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     },
   });
 
+  async function acceptReplacement(
+    destination: Destination,
+    ctx: UIContext,
+  ): Promise<boolean> {
+    const saved = loadSessionTarget(ctx);
+    if (
+      destination.kind !== "sandbox" ||
+      saved?.kind !== "sandbox" ||
+      destination.name !== saved.name ||
+      !saved.sandboxGeneration ||
+      !destination.generation ||
+      destination.generation === saved.sandboxGeneration
+    )
+      return true;
+    if (
+      !ctx.hasUI ||
+      !(await ctx.ui.confirm(
+        `accept recovered ${destination.name}?`,
+        "The device identity changed. This starts from your controller's current checkout, not the missing guest workspace. The previous placement record will be retained; no old workspace will be deleted or synced.",
+      ))
+    )
+      return false;
+    pi.appendEntry("cua-replaced-execution-target", saved);
+    bridge?.close();
+    bridge = undefined;
+    target = { kind: "local" };
+    saveTarget(target);
+    placementError = new Error(
+      "replacement accepted; sandbox connection has not completed",
+    );
+    return true;
+  }
+
   pi.registerCommand("sandbox", {
     description: "Choose where this local Pi session executes tools",
     handler: async (args, ctx) => {
@@ -1824,7 +1876,8 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       try {
         await ctx.waitForIdle();
         const destination = await destinationFromArgument(args, ctx);
-        if (!destination) return;
+        if (!destination || !(await acceptReplacement(destination, ctx)))
+          return;
         intent = saveConnectionIntent(destination);
         if (destination.kind === "local") {
           const source = target.kind === "sandbox" ? target : undefined;

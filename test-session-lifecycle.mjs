@@ -113,6 +113,43 @@ test("picker retains unavailable sandboxes and refuses execution", async () => {
   assert.match(menus[1][0].description, /inspect/);
 });
 
+for (const approved of [false, true]) {
+  test(`replacement acceptance preserves evidence and requires approval=${approved}`, async () => {
+    const saved = {
+      kind: "sandbox",
+      name: "windows-1",
+      sandboxGeneration: "old",
+    };
+    const entries = [];
+    const placements = [];
+    let closed = false;
+    const scope = {
+      loadSessionTarget: () => saved,
+      pi: { appendEntry: (...entry) => entries.push(entry) },
+      bridge: {
+        close: () => {
+          closed = true;
+        },
+      },
+      target: saved,
+      saveTarget: (target) => placements.push(target),
+      placementError: undefined,
+    };
+    const result = await handler("acceptReplacement", scope)(
+      { kind: "sandbox", name: "windows-1", generation: "new" },
+      { hasUI: true, ui: { confirm: async () => approved } },
+    );
+    assert.equal(result, approved);
+    assert.equal(closed, approved);
+    assert.equal(entries.length, approved ? 1 : 0);
+    assert.equal(placements.length, approved ? 1 : 0);
+    if (approved) {
+      assert.equal(entries[0][1], saved);
+      assert.equal(placements[0].kind, "local");
+    }
+  });
+}
+
 const parent = {
   kind: "sandbox",
   name: "mac-studio",
