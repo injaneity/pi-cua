@@ -26,6 +26,25 @@ function handler(event, scope) {
       node.arguments[0]?.text === event
     )
       callback = node.arguments[1].getText(ast);
+    if (
+      ts.isCallExpression(node) &&
+      node.expression.getText(ast) === "pi.registerTool"
+    ) {
+      const properties = node.arguments[0]?.properties ?? [];
+      if (
+        properties.some(
+          (item) =>
+            item.name?.text === "name" && item.initializer?.text === event,
+        )
+      ) {
+        const execute = properties.find(
+          (item) => item.name?.text === "execute",
+        );
+        callback = execute
+          .getText(ast)
+          .replace(/^async execute/, "async function");
+      }
+    }
     ts.forEachChild(node, visit);
   }
   visit(ast);
@@ -36,6 +55,131 @@ function handler(event, scope) {
   scope.AbortSignal = AbortSignal;
   return vm.runInNewContext(code, scope);
 }
+
+test("OS selection uses existing online targets and excludes offline external hosts", async () => {
+  const scope = {
+    target: { kind: "local" },
+    listSandboxes: async () => ({
+      sandboxes: [
+        { name: "offline", os: "windows", online: false, kind: "external" },
+        { name: "repair", os: "windows", online: false, kind: "fleet" },
+        { name: "ready", os: "windows", online: true, kind: "fleet" },
+      ],
+    }),
+  };
+  const select = handler("environmentDestination", scope);
+  assert.equal((await select("windows", undefined, {})).name, "ready");
+  assert.equal((await select("windows", "repair", {})).name, "repair");
+  await assert.rejects(
+    select("windows", "offline", {}),
+    /no eligible existing/,
+  );
+  await assert.rejects(
+    select("linux", undefined, {}),
+    /no machine was created/,
+  );
+});
+
+test("model entry reuses an already connected matching sandbox without backend work", async () => {
+  const scope = {
+    enteringEnvironment: false,
+    target: { kind: "sandbox", name: "windows-1", os: "windows" },
+    bridge: { connected: true },
+    acceptReplacement: async () => true,
+  };
+  scope.environmentDestination = handler("environmentDestination", scope);
+  const result = await handler("enter_environment", scope)(
+    "id",
+    { os: "windows" },
+    undefined,
+    undefined,
+    {},
+  );
+  assert.match(result.content[0].text, /windows-1/);
+});
+
+test("model entry forwards cancellation and uses the existing shared entry function", async () => {
+  const controller = new AbortController();
+  let entered;
+  const destination = { kind: "sandbox", name: "mac-studio", os: "macos" };
+  const scope = {
+    enteringEnvironment: false,
+    target: { kind: "local" },
+    environmentDestination: async () => destination,
+    acceptReplacement: async () => true,
+    enterSandbox: async (value, ctx) => {
+      entered = value;
+      assert.equal(ctx.signal, controller.signal);
+    },
+  };
+  await handler("enter_environment", scope)(
+    "id",
+    { os: "macos" },
+    controller.signal,
+    undefined,
+    {},
+  );
+  assert.equal(entered, destination);
+});
+
+for (const failure of [false, true]) {
+  test(`shared sandbox entry preserves original transfer and cleanup behavior: failure=${failure}`, async () => {
+    const order = [];
+    const source = { kind: "sandbox", name: "linux-1" };
+    const scope = {
+      target: source,
+      enteringEnvironment: false,
+      runtimeClosed: false,
+      saveConnectionIntent: () => ({ id: "intent" }),
+      materializeTarget: async () => {
+        order.push("prepare");
+        if (failure) throw new Error("failed setup");
+        return { kind: "sandbox", name: "windows-1" };
+      },
+      ownsConnectionIntent: () => true,
+      activate: async () => order.push("activate"),
+      clearConnectionIntent: () => order.push("clear"),
+      cleanupTarget: async (value) => {
+        assert.equal(value, source);
+        order.push("cleanup");
+      },
+    };
+    const pending = handler("enterSandbox", scope)(
+      { kind: "sandbox", name: "windows-1", os: "windows" },
+      {},
+    );
+    if (failure) await assert.rejects(pending, /failed setup/);
+    else await pending;
+    assert.deepEqual(
+      order,
+      failure
+        ? ["prepare", "clear"]
+        : ["prepare", "activate", "clear", "cleanup"],
+    );
+    assert.equal(scope.enteringEnvironment, false);
+  });
+}
+
+test("mixed environment batches are blocked before any tool dispatch", () => {
+  const scope = { mixedEnvironmentBatch: false };
+  handler(
+    "message_end",
+    scope,
+  )({
+    message: {
+      role: "assistant",
+      content: [
+        { type: "toolCall", name: "enter_environment" },
+        { type: "toolCall", name: "bash" },
+      ],
+    },
+  });
+  assert.equal(handler("tool_call", scope)({ toolName: "bash" }).block, true);
+  assert.equal(
+    handler("tool_call", scope)({ toolName: "enter_environment" }).block,
+    true,
+  );
+});
 
 for (const os of ["linux", "windows", "macos"]) {
   for (const git of [false, true]) {

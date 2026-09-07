@@ -23,6 +23,7 @@ external macos targets are existing machines, not Fleet resources. install node 
 
 ## behavior
 
+- the model can call `enter_environment({os: "linux" | "windows" | "macos", name?: string})` to enter an existing sandbox or switch between sandboxes. selection prefers online targets; unavailable Fleet guests remain eligible for the existing bounded repair path. an already connected matching target is a no-op. no machine is automatically created. call it alone in its tool batch. it uses the same preparation, proxy activation, transfer, and cleanup behavior as the picker, without modifying Pi or reloading on entry. returning locally remains a manual `/sandbox local` action that syncs back and reloads extensions; there is no model-callable local return.
 - `/sandbox` opens a compact action search. while a sandbox is active, the first action returns to local execution and syncs first only when the thread has a Git workspace. every session can reconnect to its current sandbox, connect to another online Fleet sandbox or tagged macos peer, or create one. connect and create open focused nested searches where Escape returns to the action search, and create entries use the prompt-template heading accent when selected. `/sandbox linux 16 65536` creates a sandbox with 16 CPUs and 65536 MiB of memory; omitting both values uses the existing OS defaults. `/new` and `/fork` hand the active sandbox execution to the replacement session without syncing or tearing it down.
 - `/tree` changes conversation history but never changes execution placement.
 - `/resume` restores the selected thread's saved sandbox and workspace. session switching, reload, and quit disconnect without syncing or deleting workspaces. use `/sandbox local` to explicitly sync back.
@@ -30,7 +31,7 @@ external macos targets are existing machines, not Fleet resources. install node 
 
 custom images are available through the structured `cua_sandbox` create action's `image` field. they must be Fleet-compatible CUA containerDisks and pinned by `sha256` digest; mutable tags are rejected.
 
-`cua_sandbox` and `report_papercut` are local control-plane tools. every other registered tool is proxied by name, except that `read` handles Pi's controller-local `pi-clipboard-*` image paths locally so pasted screenshots remain visible. ordinary file reads stay remote. sandbox activation fails if the remote pi sdk host does not expose a required tool; calls never fall back to local execution. tools registered after activation are blocked until `/reload` rebuilds the routed tool set, and the active sandbox cannot be deleted until the session returns to local execution.
+`cua_sandbox`, `enter_environment`, and `report_papercut` are local control-plane tools. every other registered tool is proxied by name, except that `read` handles Pi's controller-local `pi-clipboard-*` image paths locally so pasted screenshots remain visible. ordinary file reads stay remote. sandbox activation fails if the remote pi sdk host does not expose a required tool; calls never fall back to local execution. tools registered after activation are blocked until `/reload` rebuilds the routed tool set, and the active sandbox cannot be deleted until the session returns to local execution.
 
 ## unavailable or replaced machines
 

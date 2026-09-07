@@ -39,7 +39,11 @@ const maxProtocolLine = 1024 * 1024;
 const windowsBrokerTask = "CuaPiDesktopToolBroker";
 const executionTargetEntry = "cua-execution-target";
 const executionTargetIntentEntry = "cua-execution-target-intent";
-const localTools = new Set(["cua_sandbox", "report_papercut"]);
+const localTools = new Set([
+  "cua_sandbox",
+  "report_papercut",
+  "enter_environment",
+]);
 
 function latestCustomEntryData(
   entries: Array<{ type: string; customType?: string; data?: unknown }>,
@@ -1758,7 +1762,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       "List tagged Tailscale hosts or provision, repair, and delete Fleet sandboxes.",
     promptSnippet: "Manage Linux, Windows, and tagged macOS execution targets",
     promptGuidelines: [
-      "Use cua_sandbox for sandbox resources; use /sandbox to choose where the current session executes tools.",
+      "Use cua_sandbox for resources and enter_environment to execute tools in an existing sandbox. /sandbox remains the user picker; /sandbox local manually restores local execution.",
       "For custom resources, cua_sandbox create requires both cpu and memory_mb; omit both to use the OS defaults.",
       "Use a custom image only when the user explicitly provides a digest-pinned OCI reference.",
       "Fleet-managed guests are disposable: missing setup may be recovered automatically and lost guest state rebuilt from controller source. Externally added hosts are persistent and must not be reset or re-enrolled automatically.",
@@ -1879,15 +1883,148 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     return true;
   }
 
+  let enteringEnvironment = false;
+  let mixedEnvironmentBatch = false;
+
+  async function enterSandbox(
+    destination: Extract<Destination, { kind: "sandbox" }>,
+    ctx: UIContext,
+    intent?: ExecutionTargetIntent,
+  ): Promise<void> {
+    if (enteringEnvironment)
+      throw new Error("another sandbox entry is in progress");
+    enteringEnvironment = true;
+    try {
+      intent ??= saveConnectionIntent(destination);
+      const source = target.kind === "sandbox" ? target : undefined;
+      const reconnecting = source?.name === destination.name;
+      const prepared = await materializeTarget(
+        destination,
+        ctx,
+        reconnecting ? { inheritExecution: false, resume: source } : undefined,
+      );
+      if (!ownsConnectionIntent(ctx, intent))
+        throw new Error("sandbox entry was superseded");
+      await activate(prepared, ctx);
+      clearConnectionIntent(ctx, intent);
+      if (source && !reconnecting) await cleanupTarget(source, ctx, ctx.signal);
+    } catch (error) {
+      if (!runtimeClosed) clearConnectionIntent(ctx, intent);
+      throw error;
+    } finally {
+      enteringEnvironment = false;
+    }
+  }
+
+  async function environmentDestination(
+    os: SandboxOS,
+    name: string | undefined,
+    ctx: UIContext,
+  ): Promise<Extract<Destination, { kind: "sandbox" }>> {
+    if (
+      target.kind === "sandbox" &&
+      target.os === os &&
+      (!name || name === target.name)
+    )
+      return {
+        kind: "sandbox",
+        name: target.name,
+        os,
+        generation: target.sandboxGeneration,
+      };
+    const listed = await listSandboxes(ctx.signal);
+    const candidates = (listed.sandboxes ?? []).filter(
+      (item) =>
+        item.os === os &&
+        (!name || item.name === name) &&
+        (item.online || item.kind === "fleet"),
+    );
+    candidates.sort(
+      (a, b) =>
+        Number(b.online) - Number(a.online) || a.name.localeCompare(b.name),
+    );
+    const selected = candidates[0];
+    if (!selected)
+      throw new Error(
+        `no eligible existing ${os} sandbox${name ? ` named ${name}` : ""}; no machine was created`,
+      );
+    return {
+      kind: "sandbox",
+      name: selected.name,
+      os,
+      generation: selected.generation,
+    };
+  }
+
+  pi.registerTool({
+    name: "enter_environment",
+    label: "Enter Environment",
+    description:
+      "Move this thread's tool execution to an existing sandbox by OS, optionally selecting its name. Does not create machines or return to local execution.",
+    promptGuidelines: [
+      "Call enter_environment alone in its tool batch. Use /sandbox local manually to sync back and restore local execution.",
+    ],
+    parameters: Type.Object({
+      os: StringEnum(["linux", "windows", "macos"] as const),
+      name: Type.Optional(Type.String()),
+    }),
+    executionMode: "sequential",
+    async execute(_id, input, signal, _onUpdate, ctx) {
+      if (enteringEnvironment)
+        throw new Error("another sandbox entry is in progress");
+      const context = Object.create(ctx, {
+        signal: { value: signal ?? ctx.signal },
+      }) as UIContext;
+      const destination = await environmentDestination(
+        input.os,
+        input.name,
+        context,
+      );
+      if (!(await acceptReplacement(destination, context)))
+        throw new Error("sandbox replacement was not approved");
+      if (!(
+        target.kind === "sandbox" &&
+        target.name === destination.name &&
+        bridge?.connected
+      ))
+        await enterSandbox(destination, context);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `execution environment: ${destination.name} (${destination.os}). Subsequent tools run there. Return to local execution manually with /sandbox local.`,
+          },
+        ],
+        details: { name: destination.name, os: destination.os },
+      };
+    },
+  });
+
+  pi.on("message_end", (event) => {
+    if (event.message.role !== "assistant") return;
+    const calls = event.message.content.filter(
+      (item) => item.type === "toolCall",
+    );
+    mixedEnvironmentBatch =
+      calls.length > 1 &&
+      calls.some(
+        (item) => item.type === "toolCall" && item.name === "enter_environment",
+      );
+  });
+
   pi.registerCommand("sandbox", {
     description: "Choose where this local Pi session executes tools",
     handler: async (args, ctx) => {
       let intent: ExecutionTargetIntent | undefined;
       try {
         await ctx.waitForIdle();
+        if (enteringEnvironment)
+          throw new Error("another sandbox entry is in progress");
         const destination = await destinationFromArgument(args, ctx);
         if (!destination || !(await acceptReplacement(destination, ctx)))
           return;
+        if (enteringEnvironment)
+          throw new Error("another sandbox entry is in progress");
         intent = saveConnectionIntent(destination);
         if (destination.kind === "local") {
           const source = target.kind === "sandbox" ? target : undefined;
@@ -1915,20 +2052,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
           await ctx.reload();
           return;
         }
-        const source = target.kind === "sandbox" ? target : undefined;
-        const reconnecting = source?.name === destination.name;
-        const prepared = await materializeTarget(
-          destination,
-          ctx,
-          reconnecting
-            ? { inheritExecution: false, resume: source }
-            : undefined,
-        );
-        if (!ownsConnectionIntent(ctx, intent)) return;
-        await activate(prepared, ctx);
-        clearConnectionIntent(ctx, intent);
-        if (source && !reconnecting)
-          await cleanupTarget(source, ctx, ctx.signal);
+        await enterSandbox(destination, ctx, intent);
       } catch (error) {
         if (runtimeClosed) return;
         clearConnectionIntent(ctx, intent);
@@ -2067,6 +2191,17 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
   });
 
   pi.on("tool_call", (event) => {
+    if (mixedEnvironmentBatch)
+      return {
+        block: true,
+        reason:
+          "enter_environment must be the only tool call in its batch; no tools dispatched",
+      };
+    if (enteringEnvironment)
+      return {
+        block: true,
+        reason: "sandbox entry is in progress; no tool dispatched",
+      };
     if (
       target.kind === "sandbox" &&
       !localTools.has(event.toolName) &&
