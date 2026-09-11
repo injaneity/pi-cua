@@ -402,6 +402,8 @@ class FailureBoundaryTests(unittest.IsolatedAsyncioTestCase):
                 backend.install_guest_runtime("test", profile, b"archive", "a" * 20)
                 command = run.call_args.args[2]
                 self.assertIn("createToolHost", command)
+                self.assertNotIn('ls -dt "$runtimes"', command)
+                self.assertNotIn("Get-ChildItem -Directory $runtimes", command)
                 self.assertLess(
                     command.index("createToolHost"), command.index("complete")
                 )
@@ -1276,7 +1278,7 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn("pi.cmd' update --extensions --no-approve", script)
         self.assertLess(script.index("update --extensions"), script.index("complete"))
         self.assertLess(script.index("complete"), script.index("Move-Item -Force"))
-        self.assertIn("Select-Object -Skip 3", script)
+        self.assertNotIn("Select-Object -Skip 3", script)
         self.assertEqual(run.call_args.kwargs["timeout"], 600)
 
     def test_linux_runtime_install_publishes_after_packages(self) -> None:
@@ -1294,7 +1296,7 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn("pi update --extensions --no-approve", script)
         self.assertLess(script.index("update --extensions"), script.index("complete"))
         self.assertIn('mv "$staging" "$runtime"', script)
-        self.assertIn("tail -n +4", script)
+        self.assertNotIn("tail -n +4", script)
         self.assertEqual(run.call_args.kwargs["timeout"], 600)
 
     def test_macos_runtime_install_uses_the_external_user_home(self) -> None:

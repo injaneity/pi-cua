@@ -58,6 +58,46 @@ function handler(event, scope) {
   return vm.runInNewContext(code, scope);
 }
 
+for (const os of ["linux", "windows", "macos"]) {
+  test(`${os} stale known skill paths resolve to the active snapshot before dispatch`, () => {
+    const home =
+      os === "windows"
+        ? "C:/Users/cua"
+        : os === "macos"
+          ? "/Users/administrator"
+          : "/home/cua";
+    const current = `${home}/.cua-pi/runtimes/${"b".repeat(20)}/agent`;
+    const old = `${home}/.cua-pi/runtimes/${"a".repeat(20)}/agent`;
+    const route = handler("mapConfigInput", {
+      posix,
+      homedir: () => "/controller",
+      runtimeAgentDir: () => current,
+    });
+    const active = {
+      os,
+      configPaths: {
+        "/controller/project/.agents/skills": "skills/project-shared",
+      },
+    };
+    const path = `${old}/skills/project-shared/poll-github-work/SKILL.md`;
+    const mapped = route("read", { path }, active);
+    const expected = `${current}/skills/project-shared/poll-github-work/SKILL.md`;
+    assert.equal(
+      mapped.path,
+      os === "windows" ? expected.replaceAll("/", "\\") : expected,
+    );
+    for (const suffix of [
+      "auth.json",
+      "workspace/code.ts",
+      "skills/unknown/SKILL.md",
+    ]) {
+      const input = { path: `${old}/${suffix}` };
+      assert.equal(route("read", input, active).input, input);
+    }
+    assert.throws(() => route("edit", { path }, active), /read-only/);
+  });
+}
+
 test("credentialed web search is not packaged or proxied to guests", () => {
   const declaration = ast.statements
     .filter(ts.isVariableStatement)

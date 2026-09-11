@@ -171,6 +171,17 @@ export default function (pi) {
   assert.match(JSON.stringify(grepped), /config-transfer-probe.txt/);
   const skill = await execute("read", { path: join(skillRoot, "SKILL.md") });
   assert.match(JSON.stringify(skill), /resource path in this environment/);
+  const currentSkill = skill.content[0].text.replace(
+    "resource path in this environment: ",
+    "",
+  );
+  const staleSkill = currentSkill
+    .replaceAll("\\", "/")
+    .replace(/\/runtimes\/[a-f0-9]{20}\//, `/runtimes/${"0".repeat(20)}/`);
+  assert.notEqual(staleSkill, currentSkill);
+  const refreshedSkill = await execute("read", { path: staleSkill });
+  assert.equal(refreshedSkill.content[0].text, skill.content[0].text);
+  assert.match(JSON.stringify(refreshedSkill), /Run helper.mjs/);
   const helper = await execute("read", { path: join(skillRoot, "helper.mjs") });
   const path = helper.content[0].text.replace(
     "resource path in this environment: ",

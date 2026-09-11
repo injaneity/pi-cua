@@ -83,10 +83,28 @@ function mapConfigInput(
     ? `${homedir()}/${input.path.slice(2)}`
     : input.path;
   const path = posix.normalize(raw.replaceAll("\\", "/"));
+  if (!Object.keys(active.configPaths ?? {}).length) return { input };
+  const currentRoot = runtimeAgentDir(active).replaceAll("\\", "/");
+  const generationsRoot = currentRoot.replace(/\/[a-f0-9]{20}\/agent$/, "");
+  const generation = path.startsWith(`${generationsRoot}/`)
+    ? path
+        .slice(generationsRoot.length)
+        .match(/^\/([a-f0-9]{20})\/agent\//)?.[1]
+    : undefined;
+  const snapshotRoot = generation
+    ? `${generationsRoot}/${generation}/agent`
+    : undefined;
   for (const [source, destination] of Object.entries(
     active.configPaths ?? {},
   ).sort(([a], [b]) => b.length - a.length)) {
-    if (path !== source && !path.startsWith(`${source}/`)) continue;
+    const aliases = [
+      source,
+      ...(snapshotRoot ? [`${snapshotRoot}/${destination}`] : []),
+    ];
+    const matchedSource = aliases.find(
+      (alias) => path === alias || path.startsWith(`${alias}/`),
+    );
+    if (!matchedSource) continue;
     if (["write", "edit"].includes(name))
       throw new Error(
         "Pi configuration snapshots are read-only; edit controller configuration locally and reconnect",
@@ -95,7 +113,7 @@ function mapConfigInput(
       return { input };
     if (destination.startsWith("/") || destination.split("/").includes(".."))
       throw new Error("invalid remote configuration mapping");
-    const remote = `${runtimeAgentDir(active)}/${destination}${path.slice(source.length)}`;
+    const remote = `${currentRoot}/${destination}${path.slice(matchedSource.length)}`;
     const mapped =
       active.os === "windows" ? remote.replaceAll("/", "\\") : remote;
     return { input: { ...input, path: mapped }, path: mapped };

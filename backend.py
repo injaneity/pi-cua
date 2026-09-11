@@ -2512,7 +2512,6 @@ CUA_RUNTIME_STAGE="$staging" node --input-type=module -e {shlex.quote(validation
 printf '%s\n' {shlex.quote(digest)} > "$staging/complete"
 rm -rf "$runtime"
 mv "$staging" "$runtime"
-ls -dt "$runtimes"/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f] 2>/dev/null | tail -n +4 | while IFS= read -r old; do rm -rf -- "$old"; done
 {legacy_cleanup}
 rm -f {shlex.quote(archive_path)}
 """
@@ -2538,7 +2537,6 @@ if ($LASTEXITCODE -ne 0) {{ throw "staged tool-host validation failed with exit 
 Set-Content -NoNewline -Path (Join-Path $staging 'complete') -Value {powershell_literal(digest)}
 Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $runtime
 Move-Item -Force $staging $runtime
-Get-ChildItem -Directory $runtimes | Where-Object Name -Match '^[0-9a-f]{20}$' | Sort-Object LastWriteTime -Descending | Select-Object -Skip 3 | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 $legacyManifest = 'C:\Users\cua\.cua-pi\config-files'
 if (Test-Path $legacyManifest) {{
   Get-Content $legacyManifest | ForEach-Object {{
