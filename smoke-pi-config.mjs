@@ -141,6 +141,18 @@ export default function (pi) {
   await writeFile(ledgerPath, "papercut-after-entry\n");
   const after = await execute("read", { path: ledgerPath });
   assert.match(JSON.stringify(after), /papercut-after-entry/);
+  await execute("edit", {
+    path: ledgerPath,
+    edits: [
+      { oldText: "papercut-after-entry", newText: "papercut-after-edit" },
+    ],
+  });
+  assert.equal(await readFile(ledgerPath, "utf8"), "papercut-after-edit\n");
+  await execute("write", { path: ledgerPath, content: "# papercuts\n" });
+  assert.equal(await readFile(ledgerPath, "utf8"), "# papercuts\n");
+  const cleared = await execute("read", { path: ledgerPath });
+  assert.match(JSON.stringify(cleared), /# papercuts/);
+  assert.doesNotMatch(JSON.stringify(cleared), /papercut-after/);
   for (const name of ["find", "grep"]) {
     assert.equal(
       session.getAllTools().find((tool) => tool.name === name).sourceInfo.path,
@@ -180,7 +192,7 @@ export default function (pi) {
   });
   assert.match(JSON.stringify(config), /override/);
   console.log(
-    `${os}: controller web search, live controller papercuts, remote fff, copied configuration, skill paths, scoped search, and helper execution passed; no model calls`,
+    `${os}: controller web search, live controller papercut reads/edits/writes, remote fff, copied configuration, skill paths, scoped search, and helper execution passed; no model calls`,
   );
 } finally {
   await runtime?.dispose();

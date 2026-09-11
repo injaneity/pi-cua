@@ -2,6 +2,10 @@ import {
   type AgentToolResult,
   type BashOperations,
   createReadTool,
+  createEditTool,
+  createWriteTool,
+  type EditToolInput,
+  type WriteToolInput,
   getAgentDir,
   type ExtensionAPI,
   type ReadToolInput,
@@ -103,11 +107,16 @@ function shouldUseControllerTool(
   toolName: string,
   input: unknown,
 ): input is ReadToolInput {
-  if (toolName !== "read" || input === null || typeof input !== "object")
+  if (
+    !["read", "edit", "write"].includes(toolName) ||
+    input === null ||
+    typeof input !== "object"
+  )
     return false;
   const path = (input as { path?: unknown }).path;
   if (typeof path !== "string") return false;
   if (
+    toolName === "read" &&
     /^\/(?:private\/)?var\/folders\/[^/]+\/[^/]+\/T\/pi-clipboard-[^/]+\.(?:png|jpe?g|gif|webp|bmp)$/i.test(
       path,
     )
@@ -125,6 +134,7 @@ function shouldUseControllerTool(
     )
   )
     return true;
+  if (toolName !== "read") return false;
   const temporaryRoot = `${posix.normalize(tmpdir().replaceAll("\\", "/"))}/`;
   return (
     normalized.startsWith(temporaryRoot) &&
@@ -1696,12 +1706,27 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         ...remote,
         async execute(id, input, signal, onUpdate, toolCtx) {
           if (shouldUseControllerTool(info.name, input)) {
-            const result = await createReadTool(toolCtx.cwd).execute(
-              id,
-              input,
-              signal,
-              onUpdate,
-            );
+            const result =
+              info.name === "edit"
+                ? await createEditTool(toolCtx.cwd).execute(
+                    id,
+                    input as EditToolInput,
+                    signal,
+                    onUpdate,
+                  )
+                : info.name === "write"
+                  ? await createWriteTool(toolCtx.cwd).execute(
+                      id,
+                      input as WriteToolInput,
+                      signal,
+                      onUpdate,
+                    )
+                  : await createReadTool(toolCtx.cwd).execute(
+                      id,
+                      input,
+                      signal,
+                      onUpdate,
+                    );
             if (input.path.endsWith("papercuts.md"))
               result.content.unshift({
                 type: "text",
@@ -2345,7 +2370,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
           `${source} → ${runtimeAgentDir(target as Extract<ExecutionTarget, { kind: "sandbox" }>)}/${destination}`,
       )
       .join("\n");
-    const environment = `Execution environment: ${target.os}. Workspace tools and user shell commands run in ${target.os}; use workspace-relative paths. Web search and reads of its full-output files remain on the controller; API credentials are not copied to guests. Papercut reports and reads of their absolute ledger paths remain on the controller and share the controller project's live ledger across sandboxes; do not use guest shell commands to access it. Pi resources have been copied to this runtime; use these guest paths for their supporting scripts:\n${resources}\nConfiguration transfer notes: ${(target.configWarnings ?? []).join("; ") || "none"}`;
+    const environment = `Execution environment: ${target.os}. Workspace tools and user shell commands run in ${target.os}; use workspace-relative paths. Web search and reads of its full-output files remain on the controller; API credentials are not copied to guests. Papercut reports and read/edit/write operations on their absolute ledger paths remain on the controller and share the controller project's live ledger across sandboxes; do not use guest shell commands to access it. Pi resources have been copied to this runtime; use these guest paths for their supporting scripts:\n${resources}\nConfiguration transfer notes: ${(target.configWarnings ?? []).join("; ") || "none"}`;
     return {
       systemPrompt: `${event.systemPrompt.replace(localCwd, `Current working directory: ${logicalCwd}`)}\n\n${environment}`,
     };

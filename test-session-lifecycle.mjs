@@ -121,7 +121,7 @@ test("full web search output has an explicit controller read route", () => {
   );
 });
 
-test("only canonical papercut ledger reads stay on the controller", () => {
+test("only canonical papercut ledger file operations stay on the controller", () => {
   const route = handler("shouldUseControllerTool", {
     posix,
     homedir: () => "/home/user",
@@ -131,8 +131,9 @@ test("only canonical papercut ledger reads stay on the controller", () => {
     "/home/user/.pi/agent/papercuts/project-012345abcdef/papercuts.md",
     "~/.pi/agent/papercuts/project-012345abcdef/papercuts.md",
   ]) {
-    assert.equal(route("read", { path }), true);
-    for (const name of ["write", "edit", "grep", "bash"])
+    for (const name of ["read", "write", "edit"])
+      assert.equal(route(name, { path }), true);
+    for (const name of ["grep", "bash"])
       assert.equal(route(name, { path }), false);
   }
   for (const path of [
@@ -142,7 +143,14 @@ test("only canonical papercut ledger reads stay on the controller", () => {
     "/home/user/.pi/agent/papercuts/project-012345abcdef/../../auth.json",
     "/home/user/.pi/agent/papercuts/project-012345abcdef/extra/papercuts.md",
   ])
-    assert.equal(route("read", { path }), false);
+    for (const name of ["read", "write", "edit"])
+      assert.equal(route(name, { path }), false);
+  for (const path of [
+    "/var/folders/aa/bb/T/pi-clipboard-123.png",
+    "/controller/tmp/pi-exa-search-Ab123z/results.txt",
+  ])
+    for (const name of ["write", "edit"])
+      assert.equal(route(name, { path }), false);
 });
 
 test("controller clipboard image reads remain supported", () => {
@@ -230,6 +238,73 @@ test("papercut proxy reads stay live across switches without contacting guests",
     assert.equal(result.content[1].text, text);
   }
 });
+
+for (const name of ["edit", "write"]) {
+  test(`papercut ${name} uses the controller executor across all sandbox targets`, async () => {
+    let proxy;
+    const calls = [];
+    const info = { name, sourceInfo: { origin: "builtin", source: "builtin" } };
+    const factory = (cwd) => ({
+      execute: async (...args) => {
+        calls.push({ cwd, args });
+        return { content: [{ type: "text", text: "updated" }] };
+      },
+    });
+    const scope = {
+      join,
+      extensionDir: "/controller/pi-cua",
+      executionRoutes: () => ({ definitions: [info] }),
+      shouldUseControllerTool: handler("shouldUseControllerTool", {
+        posix,
+        homedir: () => "/home/user",
+        getAgentDir: () => "/home/user/.pi/agent",
+      }),
+      createEditTool:
+        name === "edit"
+          ? factory
+          : () => {
+              throw Error("wrong executor");
+            },
+      createWriteTool:
+        name === "write"
+          ? factory
+          : () => {
+              throw Error("wrong executor");
+            },
+      connectedBridge: () => {
+        throw Error("must not contact guest");
+      },
+      pi: {
+        getActiveTools: () => [name],
+        registerTool: (tool) => {
+          proxy = tool;
+        },
+        setActiveTools() {},
+        getAllTools: () => [
+          { ...info, sourceInfo: { path: "/controller/pi-cua/index.ts" } },
+        ],
+      },
+    };
+    handler("installProxies", scope)({ definition: () => info });
+    const input = {
+      path: "/home/user/.pi/agent/papercuts/project-012345abcdef/papercuts.md",
+      ...(name === "edit"
+        ? { edits: [{ oldText: "old", newText: "new" }] }
+        : { content: "new" }),
+    };
+    const signal = new AbortController().signal;
+    for (const os of ["linux", "windows", "macos"]) {
+      scope.target = { kind: "sandbox", os };
+      const result = await proxy.execute("update", input, signal, undefined, {
+        cwd: "/controller/project",
+      });
+      assert.match(result.content[0].text, /live controller/);
+      assert.equal(calls.at(-1).cwd, "/controller/project");
+      assert.equal(calls.at(-1).args[1], input);
+      assert.equal(calls.at(-1).args[2], signal);
+    }
+  });
+}
 
 test("OS selection uses existing online targets and excludes offline external hosts", async () => {
   const scope = {
