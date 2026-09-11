@@ -2,6 +2,7 @@ import {
   type AgentToolResult,
   type BashOperations,
   createReadTool,
+  getAgentDir,
   type ExtensionAPI,
   type ReadToolInput,
   type ExtensionCommandContext,
@@ -104,10 +105,22 @@ function shouldUseControllerTool(
   if (toolName !== "read" || input === null || typeof input !== "object")
     return false;
   const path = (input as { path?: unknown }).path;
-  return (
-    typeof path === "string" &&
+  if (typeof path !== "string") return false;
+  if (
     /^\/(?:private\/)?var\/folders\/[^/]+\/[^/]+\/T\/pi-clipboard-[^/]+\.(?:png|jpe?g|gif|webp|bmp)$/i.test(
       path,
+    )
+  )
+    return true;
+  const expanded = path.startsWith("~/")
+    ? `${homedir()}/${path.slice(2)}`
+    : path;
+  const normalized = posix.normalize(expanded.replaceAll("\\", "/"));
+  const root = `${posix.normalize(getAgentDir().replaceAll("\\", "/"))}/papercuts/`;
+  return (
+    normalized.startsWith(root) &&
+    /^[a-z0-9._-]+-[a-f0-9]{12}\/papercuts\.md$/.test(
+      normalized.slice(root.length),
     )
   );
 }
@@ -1674,12 +1687,18 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         ...remote,
         async execute(id, input, signal, onUpdate, toolCtx) {
           if (shouldUseControllerTool(info.name, input)) {
-            return createReadTool(toolCtx.cwd).execute(
+            const result = await createReadTool(toolCtx.cwd).execute(
               id,
               input,
               signal,
               onUpdate,
             );
+            if (input.path.endsWith("papercuts.md"))
+              result.content.unshift({
+                type: "text",
+                text: `live controller papercut ledger: ${input.path}. This is shared across sandbox switches, not a guest file.`,
+              });
+            return result;
           }
           const activeBridge = await connectedBridge(toolCtx);
           if (target.kind !== "sandbox")
@@ -2312,7 +2331,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
           `${source} → ${runtimeAgentDir(target as Extract<ExecutionTarget, { kind: "sandbox" }>)}/${destination}`,
       )
       .join("\n");
-    const environment = `Execution environment: ${target.os}. Workspace tools and user shell commands run in ${target.os}; use workspace-relative paths. Pi resources have been copied to this runtime; use these guest paths for their supporting scripts:\n${resources}\nConfiguration transfer notes: ${(target.configWarnings ?? []).join("; ") || "none"}`;
+    const environment = `Execution environment: ${target.os}. Workspace tools and user shell commands run in ${target.os}; use workspace-relative paths. Papercut reports and reads of their absolute ledger paths remain on the controller and share the controller project's live ledger across sandboxes; do not use guest shell commands to access it. Pi resources have been copied to this runtime; use these guest paths for their supporting scripts:\n${resources}\nConfiguration transfer notes: ${(target.configWarnings ?? []).join("; ") || "none"}`;
     return {
       systemPrompt: `${event.systemPrompt.replace(localCwd, `Current working directory: ${logicalCwd}`)}\n\n${environment}`,
     };

@@ -40,7 +40,18 @@ const agentDir = join(directory, "agent");
 const cwd = join(directory, "work");
 const skillRoot = join(directory, "fixture-skill");
 let runtime;
+const ledgerDir = join(
+  controller,
+  "papercuts",
+  `config-smoke-${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`,
+);
+let ledgerCreated = false;
 try {
+  await mkdir(join(controller, "papercuts"), { recursive: true });
+  await mkdir(ledgerDir);
+  ledgerCreated = true;
+  const ledgerPath = join(ledgerDir, "papercuts.md");
+  await writeFile(ledgerPath, "papercut-before-entry\n");
   await Promise.all([mkdir(agentDir), mkdir(cwd), mkdir(skillRoot)]);
   await mkdir(join(agentDir, "npm"));
   await symlink(npmModules, join(agentDir, "npm", "node_modules"));
@@ -106,6 +117,12 @@ try {
   };
   const entry = await execute("enter_environment", { os });
   console.log(JSON.stringify(entry));
+  const before = await execute("read", { path: ledgerPath });
+  assert.match(JSON.stringify(before), /live controller papercut ledger/);
+  assert.match(JSON.stringify(before), /papercut-before-entry/);
+  await writeFile(ledgerPath, "papercut-after-entry\n");
+  const after = await execute("read", { path: ledgerPath });
+  assert.match(JSON.stringify(after), /papercut-after-entry/);
   for (const name of ["find", "grep"]) {
     assert.equal(
       session.getAllTools().find((tool) => tool.name === name).sourceInfo.path,
@@ -145,9 +162,10 @@ try {
   });
   assert.match(JSON.stringify(config), /override/);
   console.log(
-    `${os}: remote fff, copied configuration, skill paths, scoped search, and helper execution passed; no model calls`,
+    `${os}: live controller papercuts, remote fff, copied configuration, skill paths, scoped search, and helper execution passed; no model calls`,
   );
 } finally {
   await runtime?.dispose();
+  if (ledgerCreated) await rm(ledgerDir, { recursive: true, force: true });
   await rm(directory, { recursive: true, force: true });
 }

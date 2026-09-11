@@ -57,6 +57,116 @@ function handler(event, scope) {
   return vm.runInNewContext(code, scope);
 }
 
+test("only canonical papercut ledger reads stay on the controller", () => {
+  const route = handler("shouldUseControllerTool", {
+    posix,
+    homedir: () => "/home/user",
+    getAgentDir: () => "/home/user/.pi/agent",
+  });
+  for (const path of [
+    "/home/user/.pi/agent/papercuts/project-012345abcdef/papercuts.md",
+    "~/.pi/agent/papercuts/project-012345abcdef/papercuts.md",
+  ]) {
+    assert.equal(route("read", { path }), true);
+    for (const name of ["write", "edit", "grep", "bash"])
+      assert.equal(route(name, { path }), false);
+  }
+  for (const path of [
+    "papercuts.md",
+    "/work/papercuts.md",
+    "/home/user/.pi/agent/auth.json",
+    "/home/user/.pi/agent/papercuts/project-012345abcdef/../../auth.json",
+    "/home/user/.pi/agent/papercuts/project-012345abcdef/extra/papercuts.md",
+  ])
+    assert.equal(route("read", { path }), false);
+});
+
+test("controller clipboard image reads remain supported", () => {
+  const route = handler("shouldUseControllerTool", {});
+  assert.equal(
+    route("read", { path: "/var/folders/aa/bb/T/pi-clipboard-123.png" }),
+    true,
+  );
+  assert.equal(
+    route("read", {
+      path: "/private/var/folders/aa/bb/T/pi-clipboard-123.webp",
+    }),
+    true,
+  );
+});
+
+test("papercut reads use the configured controller agent directory", () => {
+  const route = handler("shouldUseControllerTool", {
+    posix,
+    homedir: () => "/home/user",
+    getAgentDir: () => "/custom/agent",
+  });
+  assert.equal(
+    route("read", {
+      path: "/custom/agent/papercuts/project-012345abcdef/papercuts.md",
+    }),
+    true,
+  );
+  assert.equal(
+    route("read", {
+      path: "/home/user/.pi/agent/papercuts/project-012345abcdef/papercuts.md",
+    }),
+    false,
+  );
+});
+
+test("papercut proxy reads stay live across switches without contacting guests", async () => {
+  let proxy;
+  let text = "first report";
+  const info = {
+    name: "read",
+    sourceInfo: { origin: "builtin", source: "builtin" },
+  };
+  const scope = {
+    join,
+    extensionDir: "/controller/pi-cua",
+    executionRoutes: () => ({ definitions: [info] }),
+    shouldUseControllerTool: handler("shouldUseControllerTool", {
+      posix,
+      homedir: () => "/home/user",
+      getAgentDir: () => "/home/user/.pi/agent",
+    }),
+    connectedBridge: () => {
+      throw new Error("guest must not be contacted");
+    },
+    createReadTool: (cwd) => {
+      assert.equal(cwd, "/controller/project");
+      return { execute: async () => ({ content: [{ type: "text", text }] }) };
+    },
+    pi: {
+      getActiveTools: () => ["read"],
+      registerTool: (tool) => {
+        proxy = tool;
+      },
+      setActiveTools() {},
+      getAllTools: () => [
+        { ...info, sourceInfo: { path: "/controller/pi-cua/index.ts" } },
+      ],
+    },
+  };
+  handler("installProxies", scope)({ definition: () => info });
+  for (const os of ["linux", "windows", "macos"]) {
+    scope.target = { kind: "sandbox", os };
+    text += ` ${os}`;
+    const result = await proxy.execute(
+      "read-ledger",
+      {
+        path: "/home/user/.pi/agent/papercuts/project-012345abcdef/papercuts.md",
+      },
+      undefined,
+      undefined,
+      { cwd: "/controller/project" },
+    );
+    assert.match(result.content[0].text, /live controller/);
+    assert.equal(result.content[1].text, text);
+  }
+});
+
 test("OS selection uses existing online targets and excludes offline external hosts", async () => {
   const scope = {
     target: { kind: "local" },
