@@ -46,7 +46,7 @@ async function prepareRuntime(digest, moduleGeneration) {
             send(JSON.stringify({ type: "ready", pid: process.pid, attachments, moduleGeneration, agentDir: process.env.PI_CODING_AGENT_DIR }) + "\\n");
             echo(message.initialInput);
           } else if (message.type === "input") echo(message.data);
-          else if (message.type === "end") process.send({ type: "detached", result: { disposeRequested } });
+          else if (message.type === "end") setTimeout(() => process.send({ type: "detached", result: { disposeRequested } }), 25);
           else if (message.type === "dispose") process.exit(0);
         });
         process.on("disconnect", () => process.exit(0));
@@ -139,6 +139,10 @@ try {
   await once(abandonedProbe, "connect");
   abandonedProbe.destroy();
   await once(abandonedProbe, "close");
+  const emptyProbe = createConnection({ host: "127.0.0.1", port });
+  await once(emptyProbe, "connect");
+  emptyProbe.end();
+  await once(emptyProbe, "close", { signal: AbortSignal.timeout(5_000) });
   assert.deepEqual(await checkHealth(), { type: "broker_ready" });
 
   const first = await connectOnce();

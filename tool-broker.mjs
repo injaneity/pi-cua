@@ -242,12 +242,16 @@ async function attach(socket, request, remainder) {
   }
 }
 
-const server = createServer((socket) => {
+const server = createServer({ allowHalfOpen: true }, (socket) => {
   socket.setNoDelay(true);
   socket.on("error", (error) => {
     process.stderr.write(
       `desktop tool broker connection failed: ${error.message}\n`,
     );
+  });
+  let handshakeReceived = false;
+  socket.once("end", () => {
+    if (!handshakeReceived) socket.end();
   });
   let buffer = Buffer.alloc(0);
   const onData = (chunk) => {
@@ -257,6 +261,7 @@ const server = createServer((socket) => {
       if (buffer.length > 1024 * 1024) socket.destroy();
       return;
     }
+    handshakeReceived = true;
     socket.removeListener("data", onData);
     const line = buffer
       .subarray(0, newline)
