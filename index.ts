@@ -26,7 +26,7 @@ import {
 import { StringDecoder } from "node:string_decoder";
 import { homedir } from "node:os";
 import { existsSync, readFileSync } from "node:fs";
-import { dirname, join, parse } from "node:path";
+import { dirname, join, parse, posix } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const extensionDir = dirname(fileURLToPath(import.meta.url));
@@ -59,6 +59,42 @@ function latestCustomEntryData(
 
 function createsSession(reason: string): boolean {
   return reason === "new" || reason === "fork";
+}
+
+function mapConfigInput(
+  name: string,
+  input: unknown,
+  active: Extract<ExecutionTarget, { kind: "sandbox" }>,
+): { input: unknown; path?: string } {
+  if (
+    !input ||
+    typeof input !== "object" ||
+    !("path" in input) ||
+    typeof input.path !== "string"
+  )
+    return { input };
+  const raw = input.path.startsWith("~/")
+    ? `${homedir()}/${input.path.slice(2)}`
+    : input.path;
+  const path = posix.normalize(raw.replaceAll("\\", "/"));
+  for (const [source, destination] of Object.entries(
+    active.configPaths ?? {},
+  ).sort(([a], [b]) => b.length - a.length)) {
+    if (path !== source && !path.startsWith(`${source}/`)) continue;
+    if (["write", "edit"].includes(name))
+      throw new Error(
+        "Pi configuration snapshots are read-only; edit controller configuration locally and reconnect",
+      );
+    if (!["read", "find", "grep", "fffind", "ffgrep"].includes(name))
+      return { input };
+    if (destination.startsWith("/") || destination.split("/").includes(".."))
+      throw new Error("invalid remote configuration mapping");
+    const remote = `${runtimeAgentDir(active)}/${destination}${path.slice(source.length)}`;
+    const mapped =
+      active.os === "windows" ? remote.replaceAll("/", "\\") : remote;
+    return { input: { ...input, path: mapped }, path: mapped };
+  }
+  return { input };
 }
 
 function shouldUseControllerTool(
@@ -151,6 +187,8 @@ type BackendResult = {
   remote_cwd?: string;
   workspace_state?: WorkspaceState;
   runtime_digest?: string;
+  config_paths?: Record<string, string>;
+  config_warnings?: string[];
   reconciled?: boolean;
   sandbox_generation?: string;
   additions?: number;
@@ -187,6 +225,8 @@ type ExecutionTarget =
   | (Extract<StoredExecutionTarget, { kind: "sandbox" }> & {
       address: string;
       runtimeDigest: string;
+      configPaths?: Record<string, string>;
+      configWarnings?: string[];
       reconciled: boolean;
     });
 type ExecutionTargetIntent = {
@@ -282,6 +322,7 @@ type PendingRequest = {
 };
 
 type RemoteToolInfo = {
+  sourceInfo?: ToolWithSource["sourceInfo"];
   name: string;
   label: string;
   description: string;
@@ -823,6 +864,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         tools: readonly string[];
         packages: readonly string[];
         files: readonly string[];
+        skills: readonly string[];
         definitions: readonly ToolWithSource[];
       }>
     | undefined;
@@ -1333,6 +1375,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     tools: readonly string[];
     packages: readonly string[];
     files: readonly string[];
+    skills: readonly string[];
     definitions: readonly ToolWithSource[];
   }> {
     if (routeCatalog) return routeCatalog;
@@ -1362,6 +1405,12 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       tools: Object.freeze(definitions.map((tool) => tool.name)),
       packages: Object.freeze([...packages]),
       files: Object.freeze([...files]),
+      skills: Object.freeze(
+        pi
+          .getCommands()
+          .filter((command) => command.source === "skill")
+          .map((command) => command.sourceInfo.path),
+      ),
       definitions: Object.freeze(definitions),
     });
     return routeCatalog;
@@ -1416,6 +1465,8 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       execution_id: executionId,
       tool_packages: routes.packages,
       tool_files: routes.files,
+      skill_files: routes.skills ?? [],
+      project_trusted: ctx.isProjectTrusted?.() === true,
       force_reconcile: !resume || forceReconcile,
       sandbox_generation: resume?.sandboxGeneration ?? destination.generation,
       source: options.source?.workspaceState
@@ -1474,6 +1525,8 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         remoteCwd: result.remote_cwd,
         workspaceState: parseWorkspaceState(result.workspace_state),
         runtimeDigest: result.runtime_digest,
+        configPaths: result.config_paths ?? {},
+        configWarnings: result.config_warnings ?? [],
         reconciled: result.reconciled,
       };
     } catch (error) {
@@ -1606,6 +1659,14 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       const remote = nextBridge.definition(info.name);
       if (!remote)
         throw new Error(`remote tool metadata missing: ${info.name}`);
+      if (
+        remote.sourceInfo?.origin !== info.sourceInfo.origin ||
+        (info.sourceInfo.origin === "package" &&
+          remote.sourceInfo?.source !== immutablePackageSource(info))
+      )
+        throw new Error(
+          `remote tool provider mismatch for ${info.name}; expected ${info.sourceInfo.source}, got ${remote.sourceInfo?.source ?? "unknown"}`,
+        );
       return { info, remote };
     });
     for (const { info, remote } of definitions) {
@@ -1621,9 +1682,33 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
             );
           }
           const activeBridge = await connectedBridge(toolCtx);
-          return activeBridge.execute(info.name, id, input, signal, onUpdate);
+          if (target.kind !== "sandbox")
+            throw new Error("sandbox placement changed before dispatch");
+          const mapped = mapConfigInput(info.name, input, target);
+          const result = await activeBridge.execute(
+            info.name,
+            id,
+            mapped.input,
+            signal,
+            onUpdate,
+          );
+          if (mapped.path)
+            result.content.unshift({
+              type: "text",
+              text: `resource path in this environment: ${mapped.path}`,
+            });
+          return result;
         },
       });
+    }
+    for (const { info } of definitions) {
+      const effective = pi
+        .getAllTools()
+        .find((tool) => tool.name === info.name);
+      if (effective?.sourceInfo.path !== join(extensionDir, "index.ts"))
+        throw new Error(
+          `local extension precedence prevents routing ${info.name}; load pi-cua before other tool packages and reload`,
+        );
     }
     pi.setActiveTools(active);
   }
@@ -1992,7 +2077,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         content: [
           {
             type: "text" as const,
-            text: `execution environment: ${destination.name} (${destination.os}). Subsequent tools run there. Return to local execution manually with /sandbox local.`,
+            text: `execution environment: ${destination.name} (${destination.os}). Subsequent tools run there. Return to local execution manually with /sandbox local.\n${target.kind === "sandbox" && target.configWarnings?.length ? `Pi configuration transfer notes:\n${target.configWarnings.join("\n")}` : ""}`,
           },
         ],
         details: { name: destination.name, os: destination.os },
@@ -2220,7 +2305,14 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     const logicalCwd = target.workspaceState
       ? "workspace root"
       : "execution root";
-    const environment = `Execution environment: ${target.os}. All tools and user shell commands run in ${target.os}; use paths relative to the current directory and answer environment questions for ${target.os}.`;
+    const resources = Object.entries(target.configPaths ?? {})
+      .sort(([a], [b]) => b.length - a.length)
+      .map(
+        ([source, destination]) =>
+          `${source} → ${runtimeAgentDir(target as Extract<ExecutionTarget, { kind: "sandbox" }>)}/${destination}`,
+      )
+      .join("\n");
+    const environment = `Execution environment: ${target.os}. Workspace tools and user shell commands run in ${target.os}; use workspace-relative paths. Pi resources have been copied to this runtime; use these guest paths for their supporting scripts:\n${resources}\nConfiguration transfer notes: ${(target.configWarnings ?? []).join("; ") || "none"}`;
     return {
       systemPrompt: `${event.systemPrompt.replace(localCwd, `Current working directory: ${logicalCwd}`)}\n\n${environment}`,
     };

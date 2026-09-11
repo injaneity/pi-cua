@@ -2,6 +2,7 @@
 
 import { spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
+import { PassThrough, Writable } from "node:stream";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { join, resolve } from "node:path";
 
@@ -39,6 +40,7 @@ export async function createToolHost({ cwd, agentDir, encodedManifest }) {
   if (!cwd || !agentDir || !encodedManifest) {
     throw new Error("tool host requires cwd, agent directory, and manifest");
   }
+  process.env.PI_CODING_AGENT_DIR = agentDir;
   const decodedManifest = JSON.parse(
     Buffer.from(encodedManifest, "base64").toString("utf8"),
   );
@@ -105,6 +107,7 @@ export async function createToolHost({ cwd, agentDir, encodedManifest }) {
       const active = tool(item.name);
       return {
         name: item.name,
+        sourceInfo: item.sourceInfo,
         label: active?.label ?? item.name,
         description: definition?.description ?? item.description,
         promptSnippet: definition?.promptSnippet,
@@ -373,7 +376,67 @@ if (invokedDirectly) {
       "usage: cua-pi-tool-host <cwd> <agent-dir> <execution-manifest-base64>",
     );
   }
-  const host = await createToolHost({ cwd, agentDir, encodedManifest });
-  await host.attach({ input: process.stdin, output: process.stdout });
-  await host.dispose();
+  if (process.send) {
+    let host;
+    process.on("disconnect", () => {
+      void Promise.resolve(host?.dispose()).finally(() => process.exit(0));
+    });
+    try {
+      host = await createToolHost({ cwd, agentDir, encodedManifest });
+      let input;
+      process.on("message", (message) => {
+        if (message.type === "attach") {
+          if (input) {
+            process.send({ type: "failure", error: "host already attached" });
+            return;
+          }
+          input = new PassThrough();
+          const output = new Writable({
+            write(chunk, _encoding, callback) {
+              process.send(
+                { type: "data", data: chunk.toString("base64") },
+                callback,
+              );
+            },
+          });
+          void host
+            .attach({
+              input,
+              output,
+              initialInput: Buffer.from(message.initialInput, "base64"),
+            })
+            .then(
+              (result) => {
+                input = undefined;
+                output.end();
+                process.send({ type: "detached", result });
+              },
+              (error) => {
+                input = undefined;
+                output.end();
+                process.send({
+                  type: "failure",
+                  error: error.message,
+                  code: error.code,
+                });
+              },
+            );
+        } else if (message.type === "input")
+          input?.write(Buffer.from(message.data, "base64"));
+        else if (message.type === "end") input?.end();
+        else if (message.type === "dispose")
+          void host.dispose().finally(() => process.exit(0));
+      });
+      process.send({ type: "initialized" });
+    } catch (error) {
+      process.send(
+        { type: "failure", error: error.message, code: error.code },
+        () => process.exit(1),
+      );
+    }
+  } else {
+    const host = await createToolHost({ cwd, agentDir, encodedManifest });
+    await host.attach({ input: process.stdin, output: process.stdout });
+    await host.dispose();
+  }
 }

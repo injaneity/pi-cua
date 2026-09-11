@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 
-import { createHash } from "node:crypto";
+import { fork } from "node:child_process";
 import { createServer } from "node:net";
 import { dirname, join } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
 const agentDir = dirname(fileURLToPath(import.meta.url));
 const homeDir = process.env.CUA_PI_HOME || dirname(dirname(agentDir));
@@ -12,7 +12,6 @@ process.env.USERPROFILE = homeDir;
 process.env.PI_CODING_AGENT_DIR = agentDir;
 
 const port = Number(process.env.CUA_PI_TOOL_BROKER_PORT || "43121");
-const hostFactories = new Map();
 const hosts = new Map();
 
 function openError(socket, owner, code, error) {
@@ -41,34 +40,133 @@ function expectedAgentDir(encodedManifest) {
   return join(homeDir, ".cua-pi", "runtimes", manifest.runtimeDigest, "agent");
 }
 
-function hostFactory(agentDir, manifest) {
-  const key = `${agentDir}\0${manifest}`;
-  let factory = hostFactories.get(key);
-  if (factory) return factory;
-  const generation = createHash("sha256").update(key).digest("hex");
-  const toolHostUrl = pathToFileURL(join(agentDir, "cua-tool-host.mjs"));
-  factory = import(`${toolHostUrl.href}?generation=${generation}`).then(
-    (module) => module.createToolHost,
-  );
-  hostFactories.set(key, factory);
-  return factory;
-}
-
 function hostEntry(cwd, agentDir, manifest) {
   const key = `${cwd}\0${manifest}`;
   const current = hosts.get(key);
   if (current) return current;
-
-  const entry = {
-    host: (async () => {
-      const createToolHost = await hostFactory(agentDir, manifest);
-      return createToolHost({ cwd, agentDir, encodedManifest: manifest });
-    })(),
-  };
-  hosts.set(key, entry);
-  entry.host.catch(() => {
-    if (hosts.get(key) === entry) hosts.delete(key);
+  const child = fork(
+    join(agentDir, "cua-tool-host.mjs"),
+    [cwd, agentDir, manifest],
+    {
+      cwd,
+      env: { ...process.env, PI_CODING_AGENT_DIR: agentDir },
+      execArgv: [],
+      stdio: ["ignore", "pipe", "pipe", "ipc"],
+    },
+  );
+  let diagnostics = "";
+  for (const stream of [child.stdout, child.stderr])
+    stream.on("data", (chunk) => {
+      diagnostics = (diagnostics + chunk).slice(-16384);
+    });
+  let attached = false;
+  const host = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error("tool host initialization timed out"));
+    }, 120000);
+    const fail = (error) => {
+      clearTimeout(timer);
+      reject(error);
+    };
+    child.once("error", fail);
+    child.once("exit", (code) =>
+      fail(new Error(`tool host exited ${code}: ${diagnostics}`)),
+    );
+    const initialized = (message) => {
+      if (message.type === "failure") {
+        fail(Object.assign(new Error(message.error), { code: message.code }));
+        return;
+      }
+      if (message.type !== "initialized") return;
+      clearTimeout(timer);
+      child.off("message", initialized);
+      resolve({
+        attach({ input, output, initialInput }) {
+          if (attached)
+            return Promise.reject(
+              new Error("remote tool host is already attached"),
+            );
+          attached = true;
+          return new Promise((resolve, reject) => {
+            let ended = false;
+            let settled = false;
+            const finish = (error, result) => {
+              if (settled) return;
+              settled = true;
+              attached = false;
+              input.off("data", data);
+              input.off("end", end);
+              input.off("close", end);
+              child.off("message", message);
+              child.off("exit", exit);
+              if (error) reject(error);
+              else resolve(result);
+            };
+            const send = (message) =>
+              child.send(message, (error) => {
+                if (error) finish(error);
+              });
+            const data = (chunk) =>
+              send({ type: "input", data: chunk.toString("base64") });
+            const end = () => {
+              if (!ended) {
+                ended = true;
+                send({ type: "end" });
+              }
+            };
+            const exit = (code) =>
+              finish(new Error(`tool host exited ${code}: ${diagnostics}`));
+            const message = (value) => {
+              if (value.type === "data" && !output.destroyed)
+                output.write(Buffer.from(value.data, "base64"));
+              else if (value.type === "detached")
+                finish(undefined, value.result);
+              else if (value.type === "failure")
+                finish(
+                  Object.assign(new Error(value.error), { code: value.code }),
+                );
+            };
+            child.on("message", message);
+            child.once("exit", exit);
+            input.on("data", data);
+            input.once("end", end);
+            input.once("close", end);
+            send({
+              type: "attach",
+              initialInput: initialInput.toString("base64"),
+            });
+            input.resume();
+            if (input.destroyed || input.readableEnded) end();
+          });
+        },
+        dispose() {
+          return new Promise((resolve) => {
+            if (!child.connected) {
+              resolve();
+              return;
+            }
+            const timer = setTimeout(() => child.kill(), 5000);
+            child.once("exit", () => {
+              clearTimeout(timer);
+              resolve();
+            });
+            child.send({ type: "dispose" }, (error) => {
+              if (error) child.kill();
+            });
+          });
+        },
+      });
+    };
+    child.on("message", initialized);
   });
+  const entry = { host };
+  hosts.set(key, entry);
+  const remove = () => {
+    if (hosts.get(key) === entry) hosts.delete(key);
+  };
+  child.once("exit", remove);
+  host.catch(remove);
   return entry;
 }
 

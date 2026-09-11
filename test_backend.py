@@ -18,6 +18,16 @@ import backend
 PINNED_IMAGE = "ghcr.io/acme/cua-linux@sha256:" + "a" * 64
 
 
+def setUpModule() -> None:
+    directory = unittest.enterModuleContext(tempfile.TemporaryDirectory())
+    unittest.enterModuleContext(
+        patch.object(backend, "PI_DIR", Path(directory) / ".pi" / "agent")
+    )
+    unittest.enterModuleContext(
+        patch.object(backend, "pi_documentation_root", return_value=None)
+    )
+
+
 class ResourceSelectionTests(unittest.TestCase):
     def test_resources_have_a_deterministic_pool(self) -> None:
         default = backend.sandbox_resources("linux")
@@ -1185,11 +1195,14 @@ class WorkspaceTests(unittest.TestCase):
             )
             self.assertEqual(
                 json.loads(archive.extractfile("agent/settings.json").read()),
-                {"packages": []},
+                {"packages": [], "skills": []},
             )
             self.assertEqual(
                 sorted(archive.getnames()),
                 [
+                    "agent/cua-config-executables.json",
+                    "agent/cua-config-paths.json",
+                    "agent/cua-config-report.json",
                     "agent/cua-runtime.json",
                     "agent/example.ts",
                     "agent/settings.json",
@@ -1308,7 +1321,7 @@ class WorkspaceTests(unittest.TestCase):
             settings = json.loads(archive.extractfile("agent/settings.json").read())
         self.assertEqual(
             settings,
-            {"packages": ["git:github.com/example/tool-package"]},
+            {"packages": ["git:github.com/example/tool-package"], "skills": []},
         )
 
     def test_guest_bundle_digest_includes_tool_packages(self) -> None:
@@ -1967,7 +1980,15 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
             patch.object(backend, "inspect_workspace", return_value=self.repository),
             patch.object(backend, "capture_sandbox_workspace", return_value=transfer),
             patch.object(backend, "guest_preflight", return_value=preflight),
-            patch.object(backend, "guest_runtime_files", return_value={"x": b""}),
+            patch.object(
+                backend,
+                "guest_runtime_files",
+                return_value={
+                    "x": b"",
+                    "cua-config-paths.json": b"{}",
+                    "cua-config-report.json": b"[]",
+                },
+            ),
             patch.object(backend, "runtime_digest", return_value="c" * 20),
             patch.object(backend, "guest_runtime_archive", return_value=b"bundle"),
             patch.object(backend, "install_guest_runtime") as sync_config,

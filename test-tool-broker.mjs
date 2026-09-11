@@ -32,30 +32,25 @@ async function prepareRuntime(digest, moduleGeneration) {
       join(agent, "cua-tool-host.mjs"),
       `import { readFile } from "node:fs/promises";
       const moduleGeneration = Number(await readFile(new URL("./generation", import.meta.url), "utf8"));
-      globalThis.cuaTestNextHost ||= 0;
-      export async function createToolHost({ encodedManifest }) {
-        const host = ++globalThis.cuaTestNextHost;
-        const manifest = JSON.parse(Buffer.from(encodedManifest, "base64").toString("utf8"));
-        if (manifest.tools.includes("missing")) {
-          const error = new Error("remote tool host is missing: find_roots");
-          error.code = "ERR_CUA_MISSING_TOOLS";
-          throw error;
-        }
-        return {
-          async attach({ input, output, initialInput }) {
-            output.write(JSON.stringify({ type: "ready", pid: process.pid, host, moduleGeneration }) + "\\n");
-            let disposeRequested = initialInput.includes('"shutdown"');
-            if (initialInput.length > 0) output.write(initialInput);
-            input.on("data", (chunk) => {
-              disposeRequested ||= chunk.includes('"shutdown"');
-              output.write(chunk);
-            });
-            input.resume();
-            await new Promise((resolve) => input.once("end", resolve));
-            return { disposeRequested };
-          },
-          async dispose() {},
-        };
+      const manifest = JSON.parse(Buffer.from(process.argv[4], "base64").toString("utf8"));
+      if (manifest.tools.includes("missing")) {
+        process.send({ type: "failure", error: "remote tool host is missing: find_roots", code: "ERR_CUA_MISSING_TOOLS" }, () => process.exit(1));
+      } else {
+        let attachments = 0;
+        let disposeRequested = false;
+        const send = (text) => process.send({ type: "data", data: Buffer.from(text).toString("base64") });
+        const echo = (data) => { const text = Buffer.from(data, "base64").toString(); disposeRequested ||= text.includes('"shutdown"'); if (text) send(text); };
+        process.on("message", (message) => {
+          if (message.type === "attach") {
+            attachments++; disposeRequested = false;
+            send(JSON.stringify({ type: "ready", pid: process.pid, attachments, moduleGeneration, agentDir: process.env.PI_CODING_AGENT_DIR }) + "\\n");
+            echo(message.initialInput);
+          } else if (message.type === "input") echo(message.data);
+          else if (message.type === "end") process.send({ type: "detached", result: { disposeRequested } });
+          else if (message.type === "dispose") process.exit(0);
+        });
+        process.on("disconnect", () => process.exit(0));
+        process.send({ type: "initialized" });
       }`,
     ),
     writeFile(join(agent, "generation"), String(moduleGeneration)),
@@ -154,12 +149,14 @@ try {
   const retired = await connectOnce('{"type":"shutdown"}\n', digests.second);
   const replacement = await connectOnce("hello\n", digests.second);
 
-  assert.equal(first.pid, broker.pid);
-  assert.equal(second.pid, broker.pid);
-  assert.equal(first.host, 1);
+  assert.notEqual(first.pid, broker.pid);
+  assert.equal(second.pid, first.pid);
+  assert.equal(first.attachments, 1);
+  assert.equal(second.attachments, 2);
+  assert.equal(first.agentDir, agentDir(digests.first));
   assert.equal(first.moduleGeneration, 1);
-  assert.equal(second.host, 1);
-  assert.equal(reconfigured.host, 2);
+  assert.notEqual(reconfigured.pid, first.pid);
+  assert.equal(reconfigured.agentDir, agentDir(digests.second));
   assert.equal(reconfigured.moduleGeneration, 2);
   assert.deepEqual(failure, {
     type: "open_error",
@@ -167,9 +164,15 @@ try {
     code: "ERR_CUA_MISSING_TOOLS",
     error: "remote tool host is missing: find_roots",
   });
-  assert.equal(recovered.host, 2);
-  assert.equal(retired.host, 2);
-  assert.equal(replacement.host, 4);
+  assert.equal(recovered.pid, reconfigured.pid);
+  assert.equal(retired.pid, reconfigured.pid);
+  assert.notEqual(replacement.pid, reconfigured.pid);
+  const [firstAgain, secondAgain] = await Promise.all([
+    connectOnce("one\\n", digests.first),
+    connectOnce("two\\n", digests.second),
+  ]);
+  assert.equal(firstAgain.agentDir, agentDir(digests.first));
+  assert.equal(secondAgain.agentDir, agentDir(digests.second));
   console.log("desktop tool broker test passed");
 } finally {
   if (broker?.exitCode === null) {

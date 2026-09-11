@@ -19,6 +19,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import ssl
 import subprocess
@@ -39,6 +40,8 @@ from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from pi_config import portable_config
+
 
 def tls_context() -> ssl.SSLContext:
     if os.environ.get("SSL_CERT_FILE"):
@@ -58,7 +61,11 @@ TLS_CONTEXT = tls_context()
 
 HOME = Path.home()
 STATE_DIR = HOME / ".cua" / "sandboxes"
-PI_DIR = HOME / ".pi" / "agent"
+PI_DIR = (
+    Path(os.environ.get("PI_CODING_AGENT_DIR", str(HOME / ".pi" / "agent")))
+    .expanduser()
+    .resolve()
+)
 CONTROLLER_DIR = HOME / ".cua" / "pi-controller"
 SANDBOX_RECORD_DIR = CONTROLLER_DIR / "sandboxes"
 CONTROLLER_LOCK = CONTROLLER_DIR / "controller.lock"
@@ -245,16 +252,41 @@ def bootstrap_digest(profile: str) -> str:
     return digest.hexdigest()[:20]
 
 
+def pi_documentation_root() -> Path | None:
+    executable = shutil.which("pi")
+    if not executable:
+        return None
+    for root in Path(executable).resolve().parents:
+        manifest = root / "package.json"
+        if manifest.is_file():
+            try:
+                if (
+                    json.loads(manifest.read_text()).get("name")
+                    == "@earendil-works/pi-coding-agent"
+                ):
+                    return root
+            except (ValueError, UnicodeError):
+                pass
+    return None
+
+
 def guest_runtime_files(
-    packages: tuple[str, ...] = (), tool_files: tuple[str, ...] = ()
+    packages: tuple[str, ...] = (),
+    tool_files: tuple[str, ...] = (),
+    skill_files: tuple[str, ...] = (),
+    project_dir: Path | None = None,
 ) -> dict[str, bytes]:
-    files = remote_pi_files(tool_files)
+    files, _, warnings = portable_config(
+        PI_DIR, skill_files, pi_documentation_root(), project_dir
+    )
+    files.update(remote_pi_files(tool_files))
+    files["cua-config-report.json"] = json.dumps(warnings).encode() + b"\n"
     files["cua-runtime.json"] = (
         b'{"packageInstall":"production-without-peer-copies","validation":"tool-host-v1"}\n'
     )
-    files["settings.json"] = (
-        json.dumps({"packages": list(packages)}, indent=2).encode() + b"\n"
-    )
+    settings = json.loads(files["settings.json"])
+    settings["packages"] = list(packages)
+    files["settings.json"] = json.dumps(settings, indent=2).encode() + b"\n"
     return files
 
 
@@ -2428,11 +2460,12 @@ def copy_guest_file(name: str, profile: str, content: bytes, remote_path: str) -
 
 def guest_runtime_archive(files: dict[str, bytes]) -> bytes:
     buffer = io.BytesIO()
+    executables = set(json.loads(files.get("cua-config-executables.json", b"[]")))
     with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
         for path, content in files.items():
             info = tarfile.TarInfo(f"agent/{path}")
             info.size = len(content)
-            info.mode = 0o644
+            info.mode = 0o755 if path in executables else 0o644
             archive.addfile(info, io.BytesIO(content))
     return buffer.getvalue()
 
@@ -2906,6 +2939,8 @@ async def activate_execution(
     tool_files: tuple[str, ...] = (),
     force_reconcile: bool = True,
     sandbox_generation: str | None = None,
+    skill_files: tuple[str, ...] = (),
+    project_trusted: bool = False,
 ) -> dict[str, Any]:
     states = {item["name"]: item for item in managed_sandboxes()}
     if name not in states:
@@ -2954,8 +2989,18 @@ async def activate_execution(
     )
     identity_digest = execution_digest(execution_key)
     execution_id = identity_digest[:16]
-    config_files = guest_runtime_files(tool_packages, tool_files)
+    config_files = guest_runtime_files(
+        tool_packages,
+        tool_files,
+        skill_files,
+        Path(source_cwd).expanduser().resolve() if project_trusted else None,
+    )
     guest_digest = runtime_digest(config_files)
+    configuration = {
+        "runtime_digest": guest_digest,
+        "config_paths": json.loads(config_files["cua-config-paths.json"]),
+        "config_warnings": json.loads(config_files["cua-config-report.json"]),
+    }
     candidate = state.get("address") or name
     if (
         resume
@@ -2969,7 +3014,7 @@ async def activate_execution(
             "address": candidate,
             "remote_cwd": resume["remoteCwd"],
             **({"workspace_state": resume["state"]} if "state" in resume else {}),
-            "runtime_digest": guest_digest,
+            **configuration,
             "sandbox_generation": current_generation,
             "reconciled": False,
         }
@@ -3006,7 +3051,7 @@ async def activate_execution(
                 "address": runtime.address,
                 "remote_cwd": workspace_resume["remoteCwd"],
                 "workspace_state": workspace_resume["state"],
-                "runtime_digest": guest_digest,
+                **configuration,
                 "sandbox_generation": current_generation,
                 "reconciled": True,
             }
@@ -3039,7 +3084,7 @@ async def activate_execution(
             "os": profile,
             "address": runtime.address,
             "remote_cwd": execution_directory(runtime.address, profile, execution_id),
-            "runtime_digest": guest_digest,
+            **configuration,
             "sandbox_generation": current_generation,
             "reconciled": True,
         }
@@ -3128,7 +3173,7 @@ async def activate_execution(
         "address": address,
         "remote_cwd": remote_cwd,
         "workspace_state": transfer.state,
-        "runtime_digest": guest_digest,
+        **configuration,
         "sandbox_generation": current_generation,
         "reconciled": True,
     }
@@ -3213,6 +3258,8 @@ async def dispatch(request: dict[str, Any]) -> dict[str, Any]:
             tool_files,
             force_reconcile,
             sandbox_generation,
+            require_tool_files(request.get("skill_files", [])),
+            request.get("project_trusted") is True,
         )
     raise ValueError(
         "action must be list, create, ensure, delete, activate_execution, sync_workspace_to_local, cleanup_workspace, or workspace_diff_status"

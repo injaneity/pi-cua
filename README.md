@@ -33,6 +33,24 @@ custom images are available through the structured `cua_sandbox` create action's
 
 `cua_sandbox`, `enter_environment`, and `report_papercut` are local control-plane tools. every other registered tool is proxied by name, except that `read` handles Pi's controller-local `pi-clipboard-*` image paths locally so pasted screenshots remain visible. ordinary file reads stay remote. sandbox activation fails if the remote pi sdk host does not expose a required tool; calls never fall back to local execution. tools registered after activation are blocked until `/reload` rebuilds the routed tool set, and the active sandbox cannot be deleted until the session returns to local execution.
 
+## portable Pi configuration
+
+Sandbox runtimes inherit portable Pi configuration instead of starting with package settings alone:
+
+- global Pi JSON configuration, including `pi-fff.json`, plus JSON overrides from the current project's `.pi` directory when the controller marks that project trusted;
+- global and shared skills, declared skill resources from packages/settings, supporting files, and executable permissions;
+- global themes, prompt files, `config/` and `configs/` resources, and the installed Pi documentation/examples.
+
+Authentication, model stores, trust records, model-selection settings, and controller execution hooks stay local. Credential-looking fields and unsupported absolute-path settings are omitted with transfer notes. Packages/extensions remain restricted to the existing routed-tool selection; this does not copy the sandbox controller into the guest or execute another model. Configuration transfer is not arbitrary home-directory synchronization.
+
+Skill roots explicitly declared by the controller may resolve through directory symlinks; their canonical contents and original path aliases are recorded. Other symlinks, dependency caches, environment files, and private-key files are excluded. Files over 8 MiB are reported and skipped; root JSON configuration is limited to 1 MiB per file and the snapshot to 64 MiB. Invalid JSON fails preparation. Review transfer notes for settings that require platform-specific configuration or separate credentials.
+
+`read`, `find`, and `grep` (including fff's prefixed names) translate known controller resource paths into the copied guest runtime. Reads identify the actual guest path so supporting scripts can use it. Ordinary workspace paths are untouched, missing remote files never fall back locally, and mapped configuration writes are rejected. To change configuration, edit it on the controller and reconnect or reload; a live connection is a snapshot, not continuous synchronization. Config/resource changes participate in the runtime digest.
+
+Tool activation verifies the remote provider, not just its name: builtin search cannot silently stand in for fff. The controller proxy must also win Pi's extension registration precedence. Load pi-cua before competing tool packages. For an auto-discovered local installation, place `"./extensions/cua-sandbox"` first in the global `settings.json` packages array, then `/reload`. This uses normal Pi configuration, not a modified SDK.
+
+Every guest host sets `PI_CODING_AGENT_DIR` to its own runtime before extension initialization. Windows caches separate child host processes under the interactive broker, preserving reconnect state while isolating per-runtime environment variables. They inherit the broker's logged-in desktop session and communicate over IPC behind the same SSH connection; there is no additional network connection or model turn.
+
 ## unavailable or replaced machines
 
 Lifecycle policy follows ownership, never hostname or operating system. Fleet-managed guests are disposable. Externally added hosts are persistent, including future externally added Linux and Windows hosts.
@@ -87,22 +105,26 @@ pi-cua emits `cua:execution-target-changed` with local, connecting, failed, and 
 
 ## guest boundary
 
-the guest receives the pi sdk version, only the user packages and declared regular user-extension entry files that own routed tools, and the generic tool host. symlinks and undeclared extension files do not cross the guest boundary. machine bootstrap owns operating-system dependencies and the Windows desktop broker. execution runtimes own their isolated host, extensions, settings, and package installs. the local route catalog is captured once before proxies replace tool definitions, and package sources are pinned to the installed npm version or Git commit. because each runtime contains only routed-tool packages, the host can run their normal lifecycle before validating the required-tool set, including extensions that register tools during session startup. it does not receive local model credentials, prompts, conversation sessions, or the sandbox controller.
+the guest receives the pi sdk version, routed-tool packages and declared regular user-extension entry files, the portable configuration snapshot described above, and the generic tool host. symlinks and undeclared extension files do not cross the guest boundary. machine bootstrap owns operating-system dependencies and the Windows desktop broker. execution runtimes own their isolated host, extensions, settings, and package installs. the local route catalog is captured once before proxies replace tool definitions, and package sources are pinned to the installed npm version or Git commit. because each runtime contains only routed-tool packages, the host can run their normal lifecycle before validating the required-tool set, including extensions that register tools during session startup. it does not receive local model credentials, prompts, conversation sessions, or the sandbox controller.
 
 workspace transfer requires a git repository with a network `origin` and does not support submodules, Git content filters, or working-tree encodings. if the guest cannot authenticate to the origin, the controller sends a clean commit snapshot and creates an isolated baseline without copying git credentials. entering a sandbox from local carries local changes, limited to 200 mib. guests keep one bare repository cache outside all workspaces; isolated clones borrow its objects through Git alternates instead of duplicating packs or sharing mutable Git configuration. package-manager caches remain in the guest user profile. target changes between local and sandbox environments transfer only the accumulated binary Git tree diff, then remove the generated source workspace. `/new` and `/fork` instead transfer ownership of the active workspace without copying it. ignored files, credentials, caches, and processes are not transferred as task state.
 
 on macos, the external host must already have a logged-in graphical session. desktop tools also require the relevant Accessibility and Screen Recording approvals for the installed runtime. registration and health checks prove only SSH and command-line readiness; they do not grant TCC rights or claim universal GUI support.
 
-on Windows, OpenSSH remains in Session 0 and forwards its authenticated channel directly to the loopback-only broker. scheduled task `CuaPiDesktopToolBroker` runs that broker as the logged-in user and keeps execution-and-generation-scoped Pi hosts in Session 1, so GUI tools and shell commands share the interactive desktop without another remote process. bootstrap disables Windows Server's shutdown event tracker so an unexpected guest restart cannot leave a modal dialog blocking unattended desktop work. the broker accepts only a runtime directory that matches the requested content digest, caches exact generation matches, and returns typed broker or runtime open failures. `cua_sandbox ensure` repairs a missing, disabled, or non-listening broker, while package capability errors remain distinct from task failures.
+on Windows, OpenSSH remains in Session 0 and forwards its authenticated channel directly to the loopback-only broker. scheduled task `CuaPiDesktopToolBroker` runs that broker as the logged-in user and keeps execution-and-generation-scoped child Pi hosts in the same interactive session, so GUI tools and shell commands share the desktop while configuration remains process-isolated. bootstrap disables Windows Server's shutdown event tracker so an unexpected guest restart cannot leave a modal dialog blocking unattended desktop work. the broker accepts only a runtime directory that matches the requested content digest, caches exact generation matches, and returns typed broker or runtime open failures. `cua_sandbox ensure` repairs a missing, disabled, or non-listening broker, while package capability errors remain distinct from task failures.
 
 ## verification
 
 ```bash
-uvx --quiet ruff format --check backend.py test_backend.py
-uvx --quiet ruff check backend.py test_backend.py
-python3 -m unittest -q test_backend.py
-node test-tool-broker.mjs
-npm exec --yes --package=prettier -- prettier --check index.ts tool-host.mjs tool-broker.mjs test-tool-broker.mjs
+uvx --quiet ruff format --check backend.py pi_config.py test_backend.py test_pi_config.py
+uvx --quiet ruff check backend.py pi_config.py test_backend.py test_pi_config.py
+python3 -m unittest -q test_backend.py test_pi_config.py
+node --test test-tool-broker.mjs test-session-lifecycle.mjs test-tool-host-worker.mjs
+npm exec --yes --package=prettier -- prettier --check index.ts tool-host.mjs tool-broker.mjs test-tool-broker.mjs test-session-lifecycle.mjs test-tool-host-worker.mjs
 node --check tool-host.mjs
 pi --list-models
 ```
+
+For an opt-in native configuration smoke, install fff locally in override mode and run `node smoke-pi-config.mjs linux` (or `macos`/`windows`). It uses an isolated SDK conversation with model networking disabled, enters an existing guest, verifies fff search, mapped skill/config reads, and execution of a copied helper. It does not create or delete machines; its small execution workspace is retained by the normal lifecycle.
+
+The configuration-transfer change has native Linux and macOS command-line evidence, plus broker/worker lifecycle coverage using local IPC. Windows native validation is blocked by its unavailable guest and timed-out repair; these tests do not claim Windows desktop or GUI readiness. Session-only extension mode changes and environment-variable overrides are not copied as configuration: persist portable settings in JSON, and inspect provider-mismatch errors or transfer notes rather than assuming a fallback is equivalent.

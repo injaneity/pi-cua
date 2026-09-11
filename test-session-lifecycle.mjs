@@ -5,6 +5,7 @@ import vm from "node:vm";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
+import { posix, join } from "node:path";
 import ts from "typescript";
 
 const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
@@ -180,6 +181,106 @@ test("mixed environment batches are blocked before any tool dispatch", () => {
     true,
   );
 });
+
+for (const os of ["linux", "windows", "macos"]) {
+  test(`${os} maps controller skill paths into the guest runtime without local fallback`, () => {
+    const scope = {
+      posix,
+      homedir: () => "/controller",
+      runtimeAgentDir: () =>
+        os === "windows" ? "C:\\runtime\\agent" : "/runtime/agent",
+    };
+    const map = handler("mapConfigInput", scope);
+    const active = {
+      os,
+      configPaths: { "/controller/.pi/agent/skills": "skills/global" },
+    };
+    const result = map(
+      "read",
+      { path: "~/.pi/agent/skills/demo/SKILL.md" },
+      active,
+    );
+    assert.equal(
+      result.path,
+      os === "windows"
+        ? "C:\\runtime\\agent\\skills\\global\\demo\\SKILL.md"
+        : "/runtime/agent/skills/global/demo/SKILL.md",
+    );
+    assert.equal(
+      map(
+        "grep",
+        { path: "/controller/.pi/agent/skills/demo", pattern: "example" },
+        active,
+      ).input.pattern,
+      "example",
+    );
+    const workspace = { path: "src/main.ts" };
+    assert.equal(map("read", workspace, active).input, workspace);
+    assert.equal(
+      map("read", { path: "/controller/.pi/agent/skills/../auth.json" }, active)
+        .path,
+      undefined,
+    );
+    assert.throws(
+      () =>
+        map(
+          "write",
+          { path: "/controller/.pi/agent/skills/demo/SKILL.md" },
+          active,
+        ),
+      /read-only/,
+    );
+  });
+}
+
+for (const mode of ["valid", "builtin-fallback", "local-wins"]) {
+  test(`proxy validation checks both remote provider and local precedence: ${mode}`, () => {
+    const source = "npm:@ff-labs/pi-fff@0.10.6";
+    const info = {
+      name: "find",
+      sourceInfo: { origin: "package", source, path: "/fff/index.ts" },
+    };
+    const scope = {
+      join,
+      extensionDir: "/controller/pi-cua",
+      immutablePackageSource: () => source,
+      executionRoutes: () => ({ definitions: [info] }),
+      pi: {
+        getActiveTools: () => ["find"],
+        registerTool() {},
+        setActiveTools() {},
+        getAllTools: () => [
+          {
+            ...info,
+            sourceInfo: {
+              ...info.sourceInfo,
+              path:
+                mode === "local-wins"
+                  ? "/fff/index.ts"
+                  : "/controller/pi-cua/index.ts",
+            },
+          },
+        ],
+      },
+    };
+    const bridge = {
+      definition: () => ({
+        name: "find",
+        sourceInfo:
+          mode === "builtin-fallback"
+            ? { origin: "builtin", source: "builtin" }
+            : info.sourceInfo,
+      }),
+    };
+    const install = () => handler("installProxies", scope)(bridge);
+    if (mode === "valid") install();
+    else
+      assert.throws(
+        install,
+        mode === "builtin-fallback" ? /provider mismatch/ : /precedence/,
+      );
+  });
+}
 
 for (const os of ["linux", "windows", "macos"]) {
   for (const git of [false, true]) {
