@@ -54,8 +54,72 @@ function handler(event, scope) {
     compilerOptions: { target: ts.ScriptTarget.ES2023 },
   }).outputText;
   scope.AbortSignal = AbortSignal;
+  scope.tmpdir ??= () => "/controller/tmp";
   return vm.runInNewContext(code, scope);
 }
+
+test("credentialed web search is not packaged or proxied to guests", () => {
+  const declaration = ast.statements
+    .filter(ts.isVariableStatement)
+    .flatMap((node) => [...node.declarationList.declarations])
+    .find((node) => node.name.getText(ast) === "localTools");
+  const localTools = vm.runInNewContext(declaration.initializer.getText(ast), {
+    Set,
+  });
+  const tools = [
+    {
+      name: "web_search",
+      sourceInfo: {
+        origin: "top-level",
+        scope: "user",
+        path: "/controller/extensions/exa-search.ts",
+      },
+    },
+    {
+      name: "find",
+      sourceInfo: {
+        origin: "package",
+        scope: "user",
+        source: "npm:@ff-labs/pi-fff",
+      },
+    },
+    { name: "read", sourceInfo: { origin: "builtin", source: "builtin" } },
+  ];
+  const routes = handler("executionRoutes", {
+    routeCatalog: undefined,
+    localTools,
+    pi: { getAllTools: () => tools, getCommands: () => [] },
+    immutablePackageSource: () => "npm:@ff-labs/pi-fff@0.10.6",
+  })();
+  assert.deepEqual([...routes.tools], ["find", "read"]);
+  assert.deepEqual([...routes.files], []);
+  assert.deepEqual([...routes.packages], ["npm:@ff-labs/pi-fff@0.10.6"]);
+});
+
+test("full web search output has an explicit controller read route", () => {
+  const route = handler("shouldUseControllerTool", {
+    posix,
+    homedir: () => "/home/user",
+    getAgentDir: () => "/home/user/.pi/agent",
+    tmpdir: () => "/controller/tmp",
+  });
+  assert.equal(
+    route("read", { path: "/controller/tmp/pi-exa-search-Ab123z/results.txt" }),
+    true,
+  );
+  for (const path of [
+    "/guest/tmp/pi-exa-search-Ab123z/results.txt",
+    "/controller/tmp/other/results.txt",
+    "/controller/tmp/pi-exa-search-Ab123z/../secret.txt",
+  ])
+    assert.equal(route("read", { path }), false);
+  assert.equal(
+    route("write", {
+      path: "/controller/tmp/pi-exa-search-Ab123z/results.txt",
+    }),
+    false,
+  );
+});
 
 test("only canonical papercut ledger reads stay on the controller", () => {
   const route = handler("shouldUseControllerTool", {

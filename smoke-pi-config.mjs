@@ -53,6 +53,16 @@ try {
   const ledgerPath = join(ledgerDir, "papercuts.md");
   await writeFile(ledgerPath, "papercut-before-entry\n");
   await Promise.all([mkdir(agentDir), mkdir(cwd), mkdir(skillRoot)]);
+  await mkdir(join(agentDir, "extensions"));
+  const searchExtension = join(agentDir, "extensions", "web-search.ts");
+  await writeFile(
+    searchExtension,
+    `import { Type } from "typebox";
+export default function (pi) {
+  pi.registerTool({ name: "web_search", label: "Controller search fixture", description: "Controller-only search fixture; no network requests", parameters: Type.Object({ query: Type.String() }), async execute(_id, _input, _signal, _update, ctx) { return { content: [{ type: "text", text: "controller search fixture" }], details: { pid: process.pid, cwd: ctx.cwd } }; } });
+}
+`,
+  );
   await mkdir(join(agentDir, "npm"));
   await symlink(npmModules, join(agentDir, "npm", "node_modules"));
   await writeFile(join(agentDir, "pi-fff.json"), '{"mode":"override"}\n');
@@ -117,6 +127,14 @@ try {
   };
   const entry = await execute("enter_environment", { os });
   console.log(JSON.stringify(entry));
+  assert.equal(
+    session.getAllTools().find((tool) => tool.name === "web_search").sourceInfo
+      .path,
+    searchExtension,
+  );
+  const search = await execute("web_search", { query: "routing fixture" });
+  assert.equal(search.details.pid, process.pid);
+  assert.equal(search.details.cwd, cwd);
   const before = await execute("read", { path: ledgerPath });
   assert.match(JSON.stringify(before), /live controller papercut ledger/);
   assert.match(JSON.stringify(before), /papercut-before-entry/);
@@ -162,7 +180,7 @@ try {
   });
   assert.match(JSON.stringify(config), /override/);
   console.log(
-    `${os}: live controller papercuts, remote fff, copied configuration, skill paths, scoped search, and helper execution passed; no model calls`,
+    `${os}: controller web search, live controller papercuts, remote fff, copied configuration, skill paths, scoped search, and helper execution passed; no model calls`,
   );
 } finally {
   await runtime?.dispose();

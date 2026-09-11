@@ -25,7 +25,7 @@ import {
   type ChildProcessWithoutNullStreams,
 } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, parse, posix } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -43,6 +43,7 @@ const executionTargetIntentEntry = "cua-execution-target-intent";
 const localTools = new Set([
   "cua_sandbox",
   "report_papercut",
+  "web_search",
   "enter_environment",
 ]);
 
@@ -117,10 +118,18 @@ function shouldUseControllerTool(
     : path;
   const normalized = posix.normalize(expanded.replaceAll("\\", "/"));
   const root = `${posix.normalize(getAgentDir().replaceAll("\\", "/"))}/papercuts/`;
-  return (
+  if (
     normalized.startsWith(root) &&
     /^[a-z0-9._-]+-[a-f0-9]{12}\/papercuts\.md$/.test(
       normalized.slice(root.length),
+    )
+  )
+    return true;
+  const temporaryRoot = `${posix.normalize(tmpdir().replaceAll("\\", "/"))}/`;
+  return (
+    normalized.startsWith(temporaryRoot) &&
+    /^pi-exa-search-[a-zA-Z0-9]+\/results\.txt$/.test(
+      normalized.slice(temporaryRoot.length),
     )
   );
 }
@@ -1698,6 +1707,11 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
                 type: "text",
                 text: `live controller papercut ledger: ${input.path}. This is shared across sandbox switches, not a guest file.`,
               });
+            else if (input.path.endsWith("results.txt"))
+              result.content.unshift({
+                type: "text",
+                text: `controller web search result: ${input.path}. This is not a guest file.`,
+              });
             return result;
           }
           const activeBridge = await connectedBridge(toolCtx);
@@ -2331,7 +2345,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
           `${source} → ${runtimeAgentDir(target as Extract<ExecutionTarget, { kind: "sandbox" }>)}/${destination}`,
       )
       .join("\n");
-    const environment = `Execution environment: ${target.os}. Workspace tools and user shell commands run in ${target.os}; use workspace-relative paths. Papercut reports and reads of their absolute ledger paths remain on the controller and share the controller project's live ledger across sandboxes; do not use guest shell commands to access it. Pi resources have been copied to this runtime; use these guest paths for their supporting scripts:\n${resources}\nConfiguration transfer notes: ${(target.configWarnings ?? []).join("; ") || "none"}`;
+    const environment = `Execution environment: ${target.os}. Workspace tools and user shell commands run in ${target.os}; use workspace-relative paths. Web search and reads of its full-output files remain on the controller; API credentials are not copied to guests. Papercut reports and reads of their absolute ledger paths remain on the controller and share the controller project's live ledger across sandboxes; do not use guest shell commands to access it. Pi resources have been copied to this runtime; use these guest paths for their supporting scripts:\n${resources}\nConfiguration transfer notes: ${(target.configWarnings ?? []).join("; ") || "none"}`;
     return {
       systemPrompt: `${event.systemPrompt.replace(localCwd, `Current working directory: ${logicalCwd}`)}\n\n${environment}`,
     };
