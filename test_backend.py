@@ -1370,6 +1370,101 @@ class WorkspaceTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "filter=lfs"):
                 backend.inspect_workspace(root)
 
+    def test_ignored_tracked_files_survive_capture_apply_and_rollback(self) -> None:
+        for operation in ("local", "remote", "rollback"):
+            with (
+                self.subTest(operation=operation),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = self.repository(directory)
+
+                def git(*args: str, _root: Path = root) -> bytes:
+                    return subprocess.run(
+                        ["git", "-C", str(_root), *args],
+                        check=True,
+                        capture_output=True,
+                    ).stdout
+
+                (root / ".gitignore").write_text("shared/\n")
+                git("add", ".")
+                git("commit", "-qm", "baseline")
+                baseline = backend.git_output(root, "rev-parse", "HEAD^{tree}")
+                path = root / "shared" / "journal.test.cjs"
+                path.parent.mkdir()
+                path.write_text("fixture\n")
+                git("add", "-f", "shared/journal.test.cjs")
+                expected = backend.git_output(root, "write-tree")
+                staged = git("diff", "--cached", "--binary")
+                self.assertEqual(backend.workspace_tree(root)[1], expected)
+                self.assertEqual(git("diff", "--cached", "--binary"), staged)
+                patch_bytes = backend.workspace_patch(root, baseline, expected)
+                git("reset", "--hard", "HEAD")
+                if operation == "remote":
+
+                    def ssh(
+                        _name: str, _profile: str, command: str, **_kwargs: object
+                    ) -> subprocess.CompletedProcess[str]:
+                        return subprocess.run(
+                            ["bash", "-c", command],
+                            check=True,
+                            capture_output=True,
+                            text=True,
+                        )
+
+                    with (
+                        patch.object(backend, "run_guest_ssh", side_effect=ssh),
+                        patch.object(
+                            backend,
+                            "copy_guest_file",
+                            side_effect=lambda _name, _profile, data, path: Path(
+                                path
+                            ).write_bytes(data),
+                        ),
+                    ):
+                        backend.apply_remote_workspace_patch(
+                            "test", "linux", str(root), patch_bytes, expected
+                        )
+                elif operation == "rollback":
+                    with self.assertRaisesRegex(RuntimeError, "verification failed"):
+                        backend.apply_workspace_patch(root, patch_bytes, baseline)
+                    self.assertFalse(path.exists())
+                    self.assertEqual(git("ls-files").decode().strip(), ".gitignore")
+                    continue
+                else:
+                    backend.apply_workspace_patch(root, patch_bytes, expected)
+                self.assertEqual(path.read_text(), "fixture\n")
+                self.assertEqual(backend.workspace_tree(root)[1], expected)
+
+    def test_importing_ignored_file_preserves_existing_partial_staging(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.repository(directory)
+            (root / ".gitignore").write_text("shared/\n")
+            tracked = root / "tracked.txt"
+            tracked.write_text("baseline\n")
+            subprocess.run(["git", "-C", root, "add", "."], check=True)
+            subprocess.run(["git", "-C", root, "commit", "-qm", "baseline"], check=True)
+            baseline = backend.workspace_tree(root)[1]
+            added = root / "shared" / "journal.test.cjs"
+            added.parent.mkdir()
+            added.write_text("fixture\n")
+            subprocess.run(["git", "-C", root, "add", "-f", str(added)], check=True)
+            expected = backend.git_output(root, "write-tree")
+            incoming = backend.workspace_patch(root, baseline, expected)
+            subprocess.run(
+                ["git", "-C", root, "reset", "--hard", "HEAD"],
+                check=True,
+                capture_output=True,
+            )
+            tracked.write_text("staged\n")
+            subprocess.run(["git", "-C", root, "add", "tracked.txt"], check=True)
+            tracked.write_text("unstaged\n")
+            before = backend.workspace_tree(root)[1]
+            merged, final = backend.merge_workspace_patch(root, before, incoming)
+            backend.apply_workspace_patch(root, merged, final, before_tree=before)
+            self.assertEqual(backend.git_output(root, "show", ":tracked.txt"), "staged")
+            self.assertEqual(tracked.read_text(), "unstaged\n")
+            self.assertEqual(added.read_text(), "fixture\n")
+
     def test_clean_workspace_tree_reuses_the_head_tree(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = self.repository(directory)

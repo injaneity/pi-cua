@@ -1806,7 +1806,16 @@ def workspace_tree(source: Path) -> tuple[Path, str]:
     with tempfile.TemporaryDirectory() as directory:
         index = Path(directory) / "index"
         environment = {**os.environ, "GIT_INDEX_FILE": str(index)}
-        for arguments in (("read-tree", "HEAD"), ("add", "-A", "--", ".")):
+        original_index = Path(
+            git_output(
+                root, "rev-parse", "--path-format=absolute", "--git-path", "index"
+            )
+        )
+        if original_index.is_file():
+            shutil.copy2(original_index, index)
+        commands = [] if index.exists() else [("read-tree", "HEAD")]
+        commands.append(("add", "-A", "--", "."))
+        for arguments in commands:
             subprocess.run(
                 ["git", "-C", str(root), *arguments],
                 check=True,
@@ -1875,8 +1884,10 @@ def remote_workspace_tree(
 index=$(mktemp)
 rm -f "$index"
 trap 'rm -f "$index"' EXIT
+original_index=$(git -C {shlex.quote(root)} rev-parse --path-format=absolute --git-path index)
+if [ -f "$original_index" ]; then cp -p "$original_index" "$index"; fi
 export GIT_INDEX_FILE="$index"
-git -C {shlex.quote(root)} read-tree HEAD
+if [ ! -f "$index" ]; then git -C {shlex.quote(root)} read-tree HEAD; fi
 git -C {shlex.quote(root)} add -A -- .
 tree=$(git -C {shlex.quote(root)} write-tree)
 """
@@ -1892,9 +1903,14 @@ tree=$(git -C {shlex.quote(root)} write-tree)
         command = f"""$ErrorActionPreference = 'Stop'
 $index = Join-Path $env:TEMP ('cua-sync-' + [guid]::NewGuid().ToString('N'))
 try {{
+  $originalIndex = (git -C {powershell_literal(root)} rev-parse --path-format=absolute --git-path index).Trim()
+  if ($LASTEXITCODE -ne 0) {{ throw 'git index lookup failed' }}
+  if (Test-Path -LiteralPath $originalIndex) {{ Copy-Item -LiteralPath $originalIndex -Destination $index }}
   $env:GIT_INDEX_FILE = $index
-  git -C {powershell_literal(root)} read-tree HEAD
-  if ($LASTEXITCODE -ne 0) {{ throw 'git read-tree failed' }}
+  if (-not (Test-Path -LiteralPath $index)) {{
+    git -C {powershell_literal(root)} read-tree HEAD
+    if ($LASTEXITCODE -ne 0) {{ throw 'git read-tree failed' }}
+  }}
   git -C {powershell_literal(root)} add -A -- .
   if ($LASTEXITCODE -ne 0) {{ throw 'git add failed' }}
   $tree = (git -C {powershell_literal(root)} write-tree).Trim()
@@ -2009,20 +2025,84 @@ def merge_workspace_patch(
     return workspace_patch(root, local_tree, merged_tree), merged_tree
 
 
+def track_ignored_patch_files(root: Path, patch: bytes) -> bytes:
+    summary = subprocess.run(
+        ["git", "-C", str(root), "apply", "--numstat", "-z"],
+        input=patch,
+        capture_output=True,
+        check=True,
+        timeout=300,
+    ).stdout
+    paths = [record.split(b"\t", 2)[2] for record in summary.split(b"\0") if record]
+    candidates = b"".join(
+        path + b"\0"
+        for path in paths
+        if (root / os.fsdecode(path)).exists()
+        or (root / os.fsdecode(path)).is_symlink()
+    )
+    ignored = subprocess.run(
+        ["git", "-C", str(root), "check-ignore", "-z", "--stdin"],
+        input=candidates,
+        capture_output=True,
+        check=False,
+        timeout=60,
+    )
+    if ignored.returncode not in (0, 1):
+        ignored.check_returncode()
+    if ignored.stdout:
+        subprocess.run(
+            [
+                "git",
+                "--literal-pathspecs",
+                "-C",
+                str(root),
+                "add",
+                "-f",
+                "--pathspec-from-file=-",
+                "--pathspec-file-nul",
+            ],
+            input=ignored.stdout,
+            check=True,
+            capture_output=True,
+            timeout=300,
+        )
+    return ignored.stdout
+
+
 def apply_workspace_patch(
     root: Path, patch: bytes, expected_tree: str, before_tree: str | None = None
 ) -> None:
     if before_tree is not None and workspace_tree(root)[1] != before_tree:
         raise RuntimeError("local workspace changed while sandbox sync was running")
     command = ["git", "-C", str(root), "apply", "--binary", "--whitespace=nowarn"]
+    tracked = b""
     if patch:
         subprocess.run(command, input=patch, check=True, timeout=300)
+        tracked = track_ignored_patch_files(root, patch)
     _, actual_tree = workspace_tree(root)
     if actual_tree != expected_tree:
         if patch:
             subprocess.run(
                 [*command, "--reverse"], input=patch, check=True, timeout=300
             )
+            if tracked:
+                subprocess.run(
+                    [
+                        "git",
+                        "--literal-pathspecs",
+                        "-C",
+                        str(root),
+                        "rm",
+                        "--cached",
+                        "-f",
+                        "--pathspec-from-file=-",
+                        "--pathspec-file-nul",
+                    ],
+                    input=tracked,
+                    check=True,
+                    capture_output=True,
+                    timeout=300,
+                )
         raise RuntimeError(
             "workspace verification failed after applying sandbox changes"
         )
@@ -2048,12 +2128,12 @@ def apply_remote_workspace_patch(
         if is_unix(profile):
             command = f"""set -eu
 trap 'rm -f {shlex.quote(remote_path)}' EXIT
-git -C {shlex.quote(root)} apply --binary --whitespace=nowarn {shlex.quote(remote_path)}
+git -C {shlex.quote(root)} apply --index --binary --whitespace=nowarn {shlex.quote(remote_path)}
 """
         else:
             command = f"""$ErrorActionPreference = 'Stop'
 try {{
-  git -C {powershell_literal(root)} apply --binary --whitespace=nowarn {powershell_literal(remote_path)}
+  git -C {powershell_literal(root)} apply --index --binary --whitespace=nowarn {powershell_literal(remote_path)}
   if ($LASTEXITCODE -ne 0) {{ throw 'git apply failed' }}
 }} finally {{
   Remove-Item -Force -ErrorAction SilentlyContinue {powershell_literal(remote_path)}
