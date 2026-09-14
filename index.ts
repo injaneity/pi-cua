@@ -237,6 +237,7 @@ type BackendResult = {
   remote_cwd?: string;
   workspace_state?: WorkspaceState;
   runtime_digest?: string;
+  timings?: Record<string, number>;
   config_paths?: Record<string, string>;
   config_warnings?: string[];
   reconciled?: boolean;
@@ -1551,6 +1552,12 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         );
         result = await runBackend(request, signal, onStatus);
       }
+      if (result.timings)
+        pi.appendEntry("cua-backend-timing", {
+          name: destination.name,
+          executionId,
+          timings: result.timings,
+        });
       if (
         typeof result.remote_cwd !== "string" ||
         typeof result.address !== "string" ||
@@ -2055,6 +2062,9 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     if (enteringEnvironment)
       throw new Error("another sandbox entry is in progress");
     enteringEnvironment = true;
+    const started = performance.now();
+    const timings: Record<string, number> = {};
+    let success = false;
     try {
       intent ??= saveConnectionIntent(destination);
       const source = target.kind === "sandbox" ? target : undefined;
@@ -2064,16 +2074,29 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
         ctx,
         reconnecting ? { inheritExecution: false, resume: source } : undefined,
       );
+      timings.prepare_ms = performance.now() - started;
       if (!ownsConnectionIntent(ctx, intent))
         throw new Error("sandbox entry was superseded");
+      const connecting = performance.now();
       await activate(prepared, ctx);
+      timings.connect_ms = performance.now() - connecting;
       clearConnectionIntent(ctx, intent);
+      const cleaning = performance.now();
       if (source && !reconnecting) await cleanupTarget(source, ctx, ctx.signal);
+      timings.cleanup_ms = performance.now() - cleaning;
+      success = true;
     } catch (error) {
       if (!runtimeClosed) clearConnectionIntent(ctx, intent);
       throw error;
     } finally {
+      timings.total_ms = performance.now() - started;
       enteringEnvironment = false;
+      if (!runtimeClosed)
+        pi.appendEntry("cua-entry-timing", {
+          name: destination.name,
+          success,
+          timings,
+        });
     }
   }
 

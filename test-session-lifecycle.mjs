@@ -416,7 +416,10 @@ for (const failure of [false, true]) {
   test(`shared sandbox entry preserves original transfer and cleanup behavior: failure=${failure}`, async () => {
     const order = [];
     const source = { kind: "sandbox", name: "linux-1" };
+    const records = [];
     const scope = {
+      performance,
+      pi: { appendEntry: (type, data) => records.push({ type, data }) },
       target: source,
       enteringEnvironment: false,
       runtimeClosed: false,
@@ -447,6 +450,9 @@ for (const failure of [false, true]) {
         : ["prepare", "activate", "clear", "cleanup"],
     );
     assert.equal(scope.enteringEnvironment, false);
+    assert.equal(records[0].type, "cua-entry-timing");
+    assert.equal(records[0].data.success, !failure);
+    assert.ok(records[0].data.timings.total_ms >= 0);
   });
 }
 

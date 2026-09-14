@@ -2030,7 +2030,7 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
                 "prepare_workspace",
                 AsyncMock(return_value="/remote/workspace"),
             ) as prepare,
-            patch.object(backend, "restore_sandbox_workspace") as restore,
+            patch.object(backend, "transfer_workspace_objects") as restore,
         ):
             result = await backend.activate_execution(
                 "linux-1", "/local", "session-1", self.source
@@ -2094,7 +2094,7 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
                 "prepare_workspace",
                 AsyncMock(return_value="/remote/workspace"),
             ),
-            patch.object(backend, "restore_sandbox_workspace"),
+            patch.object(backend, "transfer_workspace_objects"),
         ):
             await backend.activate_execution(
                 "linux-1", "/local", "session-1", self.source
@@ -2212,7 +2212,7 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
                 "prepare_workspace",
                 AsyncMock(return_value="/remote/workspace"),
             ) as prepare,
-            patch.object(backend, "restore_sandbox_workspace"),
+            patch.object(backend, "transfer_workspace_objects"),
         ):
             result = await backend.activate_execution(
                 "linux-1", "/local", "session-1", resume=self.source
@@ -2540,6 +2540,111 @@ class ControllerStateTests(unittest.TestCase):
         command = backend.cloud_worker_command({"action": "ensure", "name": "linux-1"})
         self.assertEqual(command[:4], ["uv", "run", "--quiet", "--no-project"])
         self.assertIn("cua-sandbox==0.4.3", command)
+
+
+class GitObjectTransferTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tree = "a" * 40
+        self.state = backend.WorkspaceState(
+            version=1,
+            localRoot="/local",
+            commit="c" * 40,
+            commitTree="b" * 40,
+            baselineTree=self.tree,
+        )
+        self.repository = backend.WorkspaceRepository(
+            Path("/local"), Path("."), "https://example.invalid/repo", "c" * 40
+        )
+        self.source = backend.SandboxWorkspaceSource(
+            address="100.64.0.1", os="linux", remoteCwd="/source", state=self.state
+        )
+        self.transfer = backend.WorkspaceTransfer(
+            self.state, b"", self.tree, [[self.tree, 1]], True
+        )
+
+    def invoke(self) -> None:
+        backend.transfer_workspace_objects(
+            "100.64.0.2",
+            "linux",
+            "/target",
+            self.repository,
+            self.transfer,
+            self.source,
+            "a" * 32,
+            {},
+            exclude=self.state["commitTree"],
+        )
+
+    def test_unknown_destination_object_is_not_requested_from_source(self) -> None:
+        with (
+            patch.object(
+                backend,
+                "git_object_rpc",
+                return_value=json.dumps({"missing": ["f" * 40]}).encode(),
+            ) as rpc,
+            self.assertRaisesRegex(RuntimeError, "unknown Git object"),
+        ):
+            self.invoke()
+        self.assertEqual(rpc.call_count, 1)
+
+    def test_oversized_objects_stop_before_packing(self) -> None:
+        self.transfer = backend.WorkspaceTransfer(
+            self.state, b"", self.tree, [[self.tree, 201 * 1024 * 1024]], True
+        )
+        with (
+            patch.object(
+                backend,
+                "git_object_rpc",
+                return_value=json.dumps({"missing": [self.tree]}).encode(),
+            ) as rpc,
+            self.assertRaisesRegex(RuntimeError, "exceed 200 MiB"),
+        ):
+            self.invoke()
+        self.assertEqual(rpc.call_count, 1)
+
+    def test_import_response_must_match_source_tree(self) -> None:
+        with (
+            patch.object(
+                backend,
+                "git_object_rpc",
+                side_effect=[
+                    b'{"missing":[]}',
+                    json.dumps({"tree": "f" * 40}).encode(),
+                ],
+            ) as rpc,
+            self.assertRaisesRegex(RuntimeError, "verification failed"),
+        ):
+            self.invoke()
+        self.assertEqual(rpc.call_count, 2)
+
+    def test_connection_reuse_is_private_request_scoped_and_strict(self) -> None:
+        with patch.object(backend.subprocess, "run") as run:
+            with backend.ssh_session():
+                directory = backend.SSH_CONTROL_DIR
+                self.assertIsNotNone(directory)
+                self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
+                options = backend.ssh_options("linux")
+                self.assertIn("StrictHostKeyChecking=yes", options)
+                self.assertIn("ControlPersist=30", options)
+                self.assertIn("-T", options)
+                (directory / "fixture").touch()
+            self.assertIsNone(backend.SSH_CONTROL_DIR)
+            self.assertFalse(directory.exists())
+            self.assertIn("exit", run.call_args.args[0])
+
+    def test_connection_cleanup_does_not_mask_operation_failure(self) -> None:
+        with (
+            patch.object(
+                backend.subprocess,
+                "run",
+                side_effect=subprocess.TimeoutExpired("ssh", 5),
+            ),
+            self.assertRaisesRegex(RuntimeError, "original failure"),
+            backend.ssh_session(),
+        ):
+            (backend.SSH_CONTROL_DIR / "fixture").touch()
+            raise RuntimeError("original failure")
+        self.assertIsNone(backend.SSH_CONTROL_DIR)
 
 
 if __name__ == "__main__":

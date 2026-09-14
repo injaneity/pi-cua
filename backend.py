@@ -1686,6 +1686,8 @@ class WorkspaceTransfer:
     state: WorkspaceState
     patch: bytes
     final_tree: str
+    objects: list[list[Any]] | None = None
+    baseline_in_source: bool = False
 
 
 WORKSPACE_OBJECT_FIELDS = ("commit", "commitTree", "baselineTree")
@@ -2197,8 +2199,46 @@ def powershell_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+SSH_CONTROL_DIR: Path | None = None
+
+
+@contextmanager
+def ssh_session() -> Iterator[None]:
+    global SSH_CONTROL_DIR
+    with tempfile.TemporaryDirectory(prefix="cua-ssh-", dir="/tmp") as directory:
+        previous = SSH_CONTROL_DIR
+        SSH_CONTROL_DIR = Path(directory)
+        try:
+            yield
+        finally:
+            SSH_CONTROL_DIR = previous
+            for socket in Path(directory).iterdir():
+                try:
+                    subprocess.run(
+                        [
+                            "ssh",
+                            "-F",
+                            "/dev/null",
+                            "-S",
+                            str(socket),
+                            "-O",
+                            "exit",
+                            "unused",
+                        ],
+                        capture_output=True,
+                        check=False,
+                        timeout=5,
+                    )
+                except subprocess.TimeoutExpired:
+                    progress(
+                        "ssh.cleanup",
+                        "connection cleanup timed out; idle master expires after 30 seconds",
+                    )
+
+
 def ssh_options(profile: str) -> list[str]:
     options = [
+        "-T",
         "-o",
         "BatchMode=yes",
         "-o",
@@ -2208,6 +2248,15 @@ def ssh_options(profile: str) -> list[str]:
         "-o",
         "ConnectTimeout=10",
     ]
+    if SSH_CONTROL_DIR is not None:
+        options += [
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            "ControlPersist=30",
+            "-o",
+            f"ControlPath={SSH_CONTROL_DIR}/%C",
+        ]
     if profile == "windows":
         options[:0] = ["-i", str(ensure_windows_identity())]
     elif profile == "macos":
@@ -2848,7 +2897,9 @@ def cleanup_sandbox_workspace(source: SandboxWorkspaceSource) -> dict[str, Any]:
     return {"removed": True}
 
 
-def capture_local_workspace(repository: WorkspaceRepository) -> WorkspaceTransfer:
+def capture_local_workspace(
+    repository: WorkspaceRepository, *, include_patch: bool = True
+) -> WorkspaceTransfer:
     local_root, baseline_tree = workspace_tree(repository.root)
     commit_tree = git_output(local_root, "rev-parse", "HEAD^{tree}")
     state = WorkspaceState(
@@ -2860,7 +2911,9 @@ def capture_local_workspace(repository: WorkspaceRepository) -> WorkspaceTransfe
     )
     return WorkspaceTransfer(
         state=state,
-        patch=workspace_patch(local_root, commit_tree, baseline_tree),
+        patch=workspace_patch(local_root, commit_tree, baseline_tree)
+        if include_patch
+        else b"",
         final_tree=baseline_tree,
     )
 
@@ -2941,9 +2994,212 @@ def capture_sandbox_patch(
     return patch, final_tree
 
 
-def capture_sandbox_workspace(source: SandboxWorkspaceSource) -> WorkspaceTransfer:
+def capture_sandbox_workspace(
+    source: SandboxWorkspaceSource,
+    *,
+    include_patch: bool = True,
+    exclude: str | None = None,
+) -> WorkspaceTransfer:
+    if not include_patch:
+        snapshot = json.loads(
+            git_object_rpc(
+                source["remoteCwd"],
+                "snapshot",
+                guest=(source["address"], source["os"]),
+                exclude=exclude,
+                baseline=source["state"]["baselineTree"],
+                filterScript=WORKSPACE_FILTER_CHECK,
+            )
+        )
+        if not isinstance(snapshot.get("tree"), str) or not re.fullmatch(
+            r"[a-f0-9]{40}|[a-f0-9]{64}", snapshot["tree"]
+        ):
+            raise RuntimeError("invalid source snapshot tree")
+        return WorkspaceTransfer(
+            source["state"],
+            b"",
+            snapshot["tree"],
+            snapshot["objects"],
+            snapshot.get("baselineAvailable") is True,
+        )
     patch, final_tree = capture_sandbox_patch(source, source["state"]["commitTree"])
     return WorkspaceTransfer(state=source["state"], patch=patch, final_tree=final_tree)
+
+
+@contextmanager
+def measure_phase(timings: dict[str, float], phase: str) -> Iterator[None]:
+    started = time.monotonic()
+    progress(phase, "started")
+    try:
+        yield
+    finally:
+        elapsed = round((time.monotonic() - started) * 1000, 1)
+        timings[phase] = elapsed
+        progress(phase, f"completed in {elapsed / 1000:.2f}s", duration_ms=elapsed)
+
+
+def git_object_rpc(
+    root: str,
+    action: str,
+    content: bytes = b"",
+    *,
+    guest: tuple[str, str] | None = None,
+    **options: Any,
+) -> bytes:
+    script = Path(__file__).with_name("git-transfer.cjs").read_text()
+    encoded = base64.b64encode(json.dumps({"root": root, **options}).encode()).decode()
+    if guest:
+        name, profile = guest
+        literal = shlex.quote if is_unix(profile) else powershell_literal
+        node = (
+            "/usr/local/bin/node"
+            if profile == "macos"
+            else "node"
+            if profile == "linux"
+            else "& 'C:\\cua\\node\\node.exe'"
+        )
+        command = f"{node} -e {literal(script)} {literal(action)} {literal(encoded)}"
+        argv = ["ssh", *ssh_options(profile), ssh_destination(name, profile), command]
+    else:
+        argv = ["node", "-e", script, action, encoded]
+    result = subprocess.run(
+        argv, input=content, capture_output=True, check=False, timeout=90
+    )
+    if result.returncode:
+        raise RuntimeError(
+            f"Git object {action} failed: {result.stderr.decode(errors='replace')[-2000:]}"
+        )
+    if len(result.stdout) > 200 * 1024 * 1024:
+        raise RuntimeError("Git object response exceeds 200 MiB")
+    return result.stdout
+
+
+def transfer_workspace_objects(
+    name: str,
+    profile: str,
+    root: str,
+    repository: WorkspaceRepository,
+    transfer: WorkspaceTransfer,
+    source: SandboxWorkspaceSource | None,
+    reference: str,
+    timings: dict[str, float],
+    *,
+    exclude: str | None = None,
+) -> None:
+    origins: list[tuple[str, tuple[str, str] | None, str]] = []
+    if source:
+        origins.append(
+            (
+                source["remoteCwd"],
+                (source["address"], source["os"]),
+                transfer.final_tree,
+            )
+        )
+    else:
+        origins.append((str(repository.root), None, transfer.final_tree))
+    if not transfer.baseline_in_source and (
+        source or transfer.final_tree != transfer.state["baselineTree"]
+    ):
+        origins.append((str(repository.root), None, transfer.state["baselineTree"]))
+    if exclude is None and transfer.state["commitTree"] not in {
+        tree for _, _, tree in origins
+    }:
+        origins.append((str(repository.root), None, transfer.state["commitTree"]))
+    manifests = []
+    with measure_phase(timings, "workspace.objects.inventory"):
+        for origin, guest, tree in origins:
+            rows = (
+                transfer.objects
+                if guest and transfer.objects is not None
+                else json.loads(
+                    git_object_rpc(
+                        origin, "inventory", guest=guest, tree=tree, exclude=exclude
+                    )
+                )
+            )
+            if not isinstance(rows, list) or len(rows) > 200000:
+                raise RuntimeError("invalid Git object inventory")
+            entries = {}
+            for object_id, size in rows:
+                if (
+                    not isinstance(object_id, str)
+                    or not re.fullmatch(r"[a-f0-9]{40}|[a-f0-9]{64}", object_id)
+                    or type(size) is not int
+                    or size < 0
+                ):
+                    raise RuntimeError("invalid Git object inventory entry")
+                entries[object_id] = size
+            manifests.append(entries)
+    combined = {key: value for entries in manifests for key, value in entries.items()}
+    key = hashlib.sha256(repository.remote_url.encode()).hexdigest()[:20]
+    cache = (
+        f"{guest_home(profile)}/.cache/cua-pi/git/{key}.git"
+        if is_unix(profile)
+        else rf"C:\cua\cache\git\{key}.git"
+    )
+    with measure_phase(timings, "workspace.objects.missing"):
+        response = json.loads(
+            git_object_rpc(
+                root,
+                "missing",
+                json.dumps(list(combined.items())).encode(),
+                guest=(name, profile),
+                cache=cache,
+                exclude=exclude,
+            )
+        )
+        missing = response.get("missing")
+        if not isinstance(missing, list) or any(
+            not isinstance(item, str) or item not in combined for item in missing
+        ):
+            raise RuntimeError("destination requested an unknown Git object")
+        needed = set(missing)
+        if sum(combined[item] for item in needed) > 200 * 1024 * 1024:
+            raise RuntimeError("missing Git objects exceed 200 MiB")
+        progress(
+            "workspace.objects.missing",
+            f"{len(needed)} of {len(combined)} objects required",
+            refreshed=response.get("refreshed"),
+            refresh_failed=response.get("refreshFailed"),
+        )
+    framed = bytearray()
+    with measure_phase(timings, "workspace.objects.pack"):
+        for (origin, guest, _), entries in zip(origins, manifests, strict=True):
+            selected = sorted(needed.intersection(entries))
+            if selected:
+                packed = git_object_rpc(
+                    origin,
+                    "pack",
+                    json.dumps(
+                        {"missing": selected, "have": sorted(set(entries) - needed)}
+                    ).encode(),
+                    guest=guest,
+                    exclude=exclude,
+                )
+                framed.extend(len(packed).to_bytes(4, "big"))
+                framed.extend(packed)
+                needed.difference_update(selected)
+        if needed or len(framed) > 200 * 1024 * 1024:
+            raise RuntimeError("invalid or oversized workspace object transfer")
+    timings["workspace.object_bytes"] = len(framed)
+    with measure_phase(timings, "workspace.objects.apply"):
+        applied = json.loads(
+            git_object_rpc(
+                root,
+                "apply",
+                bytes(framed),
+                guest=(name, profile),
+                tree=transfer.final_tree,
+                baseline=transfer.state["baselineTree"],
+                commitTree=transfer.state["commitTree"],
+                reference=reference,
+                filterScript=WORKSPACE_FILTER_CHECK,
+            )
+        )
+        if applied.get("tree") != transfer.final_tree:
+            raise RuntimeError(
+                "workspace verification failed after importing Git objects"
+            )
 
 
 def restore_sandbox_workspace(
@@ -3020,6 +3276,8 @@ async def activate_execution(
     skill_files: tuple[str, ...] = (),
     project_trusted: bool = False,
 ) -> dict[str, Any]:
+    started = time.monotonic()
+    timings: dict[str, float] = {}
     states = {item["name"]: item for item in managed_sandboxes()}
     if name not in states:
         raise ValueError(f"unknown managed sandbox: {name}")
@@ -3074,7 +3332,9 @@ async def activate_execution(
         Path(source_cwd).expanduser().resolve() if project_trusted else None,
     )
     guest_digest = runtime_digest(config_files)
+    timings["configuration"] = round((time.monotonic() - started) * 1000, 1)
     configuration = {
+        "timings": timings,
         "runtime_digest": guest_digest,
         "config_paths": json.loads(config_files["cua-config-paths.json"]),
         "config_warnings": json.loads(config_files["cua-config-report.json"]),
@@ -3168,13 +3428,14 @@ async def activate_execution(
         }
 
     progress("sandbox.preflight", "checking health, configuration, disk, and cache")
-    preflight = guest_preflight(
-        candidate,
-        profile,
-        repository.remote_url,
-        repository.commit,
-        guest_digest,
-    )
+    with measure_phase(timings, "preflight"):
+        preflight = guest_preflight(
+            candidate,
+            profile,
+            repository.remote_url,
+            repository.commit,
+            guest_digest,
+        )
     if preflight is None:
         raise SandboxRepairRequired(f"sandbox repair required: {name}")
 
@@ -3187,11 +3448,18 @@ async def activate_execution(
     runtime_content = (
         guest_runtime_archive(config_files) if not preflight.runtime_available else None
     )
-    transfer = (
-        capture_sandbox_workspace(source)
-        if source
-        else capture_local_workspace(repository)
-    )
+    with measure_phase(timings, "workspace.capture"):
+        transfer = (
+            capture_sandbox_workspace(
+                source,
+                include_patch=False,
+                exclude=source["state"]["commitTree"]
+                if preflight.repository_available
+                else None,
+            )
+            if source
+            else capture_local_workspace(repository, include_patch=False)
+        )
     runtime_install = (
         asyncio.create_task(
             asyncio.to_thread(
@@ -3222,15 +3490,27 @@ async def activate_execution(
         else rf"C:\cua\workspaces\{workspace_id}"
     )
     try:
-        remote_cwd = await prepare_workspace(
+        with measure_phase(timings, "workspace.prepare"):
+            remote_cwd = await prepare_workspace(
+                address,
+                profile,
+                repository,
+                workspace_id,
+                repository_available=preflight.repository_available,
+            )
+        transfer_workspace_objects(
             address,
             profile,
+            workspace_root,
             repository,
-            workspace_id,
-            repository_available=preflight.repository_available,
+            transfer,
+            source,
+            reference,
+            timings,
+            exclude=transfer.state["commitTree"]
+            if preflight.repository_available
+            else None,
         )
-        progress("workspace.baseline", "reconstructing the destination workspace")
-        restore_sandbox_workspace(address, profile, workspace_root, transfer, reference)
         if runtime_install:
             await runtime_install
     except BaseException:
@@ -3245,6 +3525,7 @@ async def activate_execution(
                 f"cleanup failed: {error_text(cleanup_error)}",
             )
         raise
+    timings["backend_total"] = round((time.monotonic() - started) * 1000, 1)
     return {
         "name": name,
         "os": profile,
@@ -3364,7 +3645,7 @@ def main() -> None:
         locks = request_lock_paths(request)
         if locks:
             progress("lock", "waiting for operation slot")
-            with operation_locks(locks):
+            with operation_locks(locks), ssh_session():
                 progress("lock", "acquired operation slot")
                 result = asyncio.run(dispatch(request))
         else:

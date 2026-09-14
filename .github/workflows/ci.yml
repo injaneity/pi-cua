@@ -18,11 +18,24 @@ jobs:
           node-version: 22.20.0
       - run: npm install --no-save typescript@5.9.3 prettier @types/node @earendil-works/pi-coding-agent @earendil-works/pi-ai @earendil-works/pi-tui @earendil-works/pi-server typebox
       - run: node --input-type=module -e 'await import("@earendil-works/pi-coding-agent")'
-      - run: uvx ruff format --check backend.py pi_config.py test_backend.py test_pi_config.py
-      - run: uvx ruff check backend.py pi_config.py test_backend.py test_pi_config.py
+      - run: uvx ruff format --check backend.py pi_config.py test_backend.py test_pi_config.py smoke-git-transfer.py
+      - run: uvx ruff check backend.py pi_config.py test_backend.py test_pi_config.py smoke-git-transfer.py
       - run: uvx vulture backend.py pi_config.py --min-confidence 90
       - run: python3 -m unittest -q test_backend.py test_pi_config.py
-      - run: node --test test-tool-broker.mjs test-session-lifecycle.mjs test-tool-host-worker.mjs
-      - run: npx prettier --check index.ts tool-host.mjs tool-broker.mjs test-tool-broker.mjs test-session-lifecycle.mjs test-tool-host-worker.mjs smoke-pi-config.mjs README.md
+      - run: node --test test-tool-broker.mjs test-session-lifecycle.mjs test-tool-host-worker.mjs test-git-transfer.mjs
+      - run: npx prettier --check index.ts tool-host.mjs tool-broker.mjs test-tool-broker.mjs test-session-lifecycle.mjs test-tool-host-worker.mjs smoke-pi-config.mjs git-transfer.cjs test-git-transfer.mjs benchmark-entry.mjs README.md
       - run: node --check smoke-pi-config.mjs
+      - run: node --check benchmark-entry.mjs
       - run: npx tsc --noEmit --target ES2023 --module NodeNext --moduleResolution NodeNext --strict --skipLibCheck --types node index.ts
+
+  git-transfer:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22.20.0
+      - run: node --test test-git-transfer.mjs
