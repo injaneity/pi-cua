@@ -35,6 +35,7 @@ const rpc = (root, action, input = Buffer.alloc(0), options = {}) => {
     maxBuffer: 8 * 1024 * 1024,
   };
   if (process.platform === "win32") {
+    args[1] = `eval(Buffer.from('${Buffer.from(script).toString("base64")}','base64').toString('utf8'))`;
     const quote = (value) => "'" + value.replaceAll("'", "''") + "'";
     return execFileSync(
       "powershell.exe",

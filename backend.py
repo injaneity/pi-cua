@@ -3051,6 +3051,9 @@ def git_object_rpc(
     if guest:
         name, profile = guest
         literal = shlex.quote if is_unix(profile) else powershell_literal
+        if profile == "windows":
+            payload = base64.b64encode(script.encode()).decode()
+            script = f"eval(Buffer.from('{payload}','base64').toString('utf8'))"
         node = (
             "/usr/local/bin/node"
             if profile == "macos"

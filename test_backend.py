@@ -2617,6 +2617,23 @@ class GitObjectTransferTests(unittest.TestCase):
             self.invoke()
         self.assertEqual(rpc.call_count, 2)
 
+    def test_windows_object_rpc_encodes_the_program_before_powershell(self) -> None:
+        result = subprocess.CompletedProcess([], 0, stdout=b"[]", stderr=b"")
+        with (
+            patch.object(backend, "ssh_options", return_value=[]),
+            patch.object(backend.subprocess, "run", return_value=result) as run,
+        ):
+            backend.git_object_rpc(
+                r"C:\fixture",
+                "inventory",
+                guest=("100.64.0.2", "windows"),
+                tree=self.tree,
+            )
+        command = run.call_args.args[0][-1]
+        self.assertIn("eval(Buffer.from(", command)
+        self.assertNotIn('require("node:child_process")', command)
+        self.assertLess(len(command), 30000)
+
     def test_connection_reuse_is_private_request_scoped_and_strict(self) -> None:
         with patch.object(backend.subprocess, "run") as run:
             with backend.ssh_session():
