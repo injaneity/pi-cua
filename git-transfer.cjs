@@ -2,7 +2,7 @@ const { execFileSync } = require("node:child_process");
 const fs = require("node:fs");
 const canonical = (value) =>
   process.platform === "win32"
-    ? fs.realpathSync(value).toLowerCase()
+    ? fs.realpathSync.native(value).toLowerCase()
     : fs.realpathSync(value);
 const [action, encoded] = process.argv.slice(-2);
 const options = JSON.parse(Buffer.from(encoded, "base64").toString("utf8"));
