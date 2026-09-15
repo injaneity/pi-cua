@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, mkdtempSync, rmSync, existsSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
 import { EventEmitter } from "node:events";
@@ -413,47 +413,59 @@ test("model entry forwards cancellation and uses the existing shared entry funct
 });
 
 for (const failure of [false, true]) {
-  test(`shared sandbox entry preserves original transfer and cleanup behavior: failure=${failure}`, async () => {
-    const order = [];
-    const source = { kind: "sandbox", name: "linux-1" };
-    const records = [];
-    const scope = {
-      performance,
-      pi: { appendEntry: (type, data) => records.push({ type, data }) },
-      target: source,
-      enteringEnvironment: false,
-      runtimeClosed: false,
-      saveConnectionIntent: () => ({ id: "intent" }),
-      materializeTarget: async () => {
-        order.push("prepare");
-        if (failure) throw new Error("failed setup");
-        return { kind: "sandbox", name: "windows-1" };
-      },
-      ownsConnectionIntent: () => true,
-      activate: async () => order.push("activate"),
-      clearConnectionIntent: () => order.push("clear"),
-      cleanupTarget: async (value) => {
-        assert.equal(value, source);
-        order.push("cleanup");
-      },
-    };
-    const pending = handler("enterSandbox", scope)(
-      { kind: "sandbox", name: "windows-1", os: "windows" },
-      {},
-    );
-    if (failure) await assert.rejects(pending, /failed setup/);
-    else await pending;
-    assert.deepEqual(
-      order,
-      failure
-        ? ["prepare", "clear"]
-        : ["prepare", "activate", "clear", "cleanup"],
-    );
-    assert.equal(scope.enteringEnvironment, false);
-    assert.equal(records[0].type, "cua-entry-timing");
-    assert.equal(records[0].data.success, !failure);
-    assert.ok(records[0].data.timings.total_ms >= 0);
-  });
+  for (const cleanupFailure of [false, true])
+    test(`shared sandbox entry preserves original transfer and cleanup behavior: failure=${failure}, cleanupFailure=${cleanupFailure}`, async () => {
+      const order = [];
+      const source = { kind: "sandbox", name: "linux-1" };
+      const records = [];
+      const closedScopes = [];
+      const warnings = [];
+      const scope = {
+        mkdtempSync,
+        rmSync,
+        closeSSHScope: (directory, mode) => {
+          closedScopes.push({ directory, mode });
+          if (cleanupFailure) throw new Error("cleanup failed");
+        },
+        performance,
+        pi: { appendEntry: (type, data) => records.push({ type, data }) },
+        target: source,
+        enteringEnvironment: false,
+        runtimeClosed: false,
+        saveConnectionIntent: () => ({ id: "intent" }),
+        materializeTarget: async () => {
+          order.push("prepare");
+          if (failure) throw new Error("failed setup");
+          return { kind: "sandbox", name: "windows-1" };
+        },
+        ownsConnectionIntent: () => true,
+        activate: async () => order.push("activate"),
+        clearConnectionIntent: () => order.push("clear"),
+        cleanupTarget: async (value) => {
+          assert.equal(value, source);
+          order.push("cleanup");
+        },
+      };
+      const pending = handler("enterSandbox", scope)(
+        { kind: "sandbox", name: "windows-1", os: "windows" },
+        { ui: { notify: (message) => warnings.push(message) } },
+      );
+      if (failure) await assert.rejects(pending, /failed setup/);
+      else await pending;
+      assert.deepEqual(
+        order,
+        failure
+          ? ["prepare", "clear"]
+          : ["prepare", "activate", "clear", "cleanup"],
+      );
+      assert.equal(scope.enteringEnvironment, false);
+      assert.equal(records[0].type, "cua-entry-timing");
+      assert.equal(records[0].data.success, !failure);
+      assert.ok(records[0].data.timings.total_ms >= 0);
+      assert.equal(closedScopes[0].mode, failure ? "exit" : "stop");
+      assert.equal(existsSync(closedScopes[0].directory), false);
+      assert.equal(warnings.length, cleanupFailure ? 1 : 0);
+    });
 }
 
 test("mixed environment batches are blocked before any tool dispatch", () => {

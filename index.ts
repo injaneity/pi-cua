@@ -30,7 +30,13 @@ import {
 } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { homedir, tmpdir } from "node:os";
-import { existsSync, readFileSync } from "node:fs";
+import {
+  existsSync,
+  readFileSync,
+  mkdtempSync,
+  readdirSync,
+  rmSync,
+} from "node:fs";
 import { dirname, join, parse, posix } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -406,8 +412,18 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'\"'\"'`)}'`;
 }
 
+function closeSSHScope(directory: string, mode: "stop" | "exit"): void {
+  for (const socket of readdirSync(directory))
+    spawnSync(
+      "ssh",
+      ["-F", "/dev/null", "-S", join(directory, socket), "-O", mode, "unused"],
+      { timeout: 5000, stdio: "ignore" },
+    );
+}
+
 function sshArgs(
   target: Extract<ExecutionTarget, { kind: "sandbox" }>,
+  sshControlDir?: string,
 ): string[] {
   return [
     ...(target.os === "windows"
@@ -423,6 +439,9 @@ function sshArgs(
     `UserKnownHostsFile=${sandboxKnownHosts}`,
     "-o",
     "ConnectTimeout=10",
+    ...(sshControlDir
+      ? ["-o", "ControlMaster=no", "-o", `ControlPath=${sshControlDir}/%C`]
+      : []),
     "-o",
     "ServerAliveInterval=15",
     "-o",
@@ -493,6 +512,7 @@ class ToolBridge {
   constructor(
     private readonly target: Extract<ExecutionTarget, { kind: "sandbox" }>,
     private readonly expectedTools: string[],
+    private sshControlDir?: string,
   ) {}
 
   private send(message: Record<string, unknown>): void {
@@ -543,10 +563,12 @@ class ToolBridge {
         this.expectedTools,
         this.target.runtimeDigest,
       );
+      const connectionArgs = sshArgs(this.target, this.sshControlDir);
+      this.sshControlDir = undefined;
       const child = spawn(
         "ssh",
         [
-          ...sshArgs(this.target),
+          ...connectionArgs,
           ...(this.target.os !== "windows"
             ? [hostCommand(this.target, manifest)]
             : []),
@@ -1493,6 +1515,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       inheritExecution?: boolean;
       resume?: Extract<StoredExecutionTarget, { kind: "sandbox" }>;
       forceReconcile?: boolean;
+      sshControlDir?: string;
       source?: Extract<ExecutionTarget, { kind: "sandbox" }>;
     } = {},
   ): Promise<Extract<ExecutionTarget, { kind: "sandbox" }>> {
@@ -1511,6 +1534,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     reportTargetProgress(destination, ctx);
     const request = {
       action: "activate_execution",
+      ssh_control_dir: options.sshControlDir,
       name: destination.name,
       source_cwd: resume?.localCwd ?? options.source?.localCwd ?? ctx.cwd,
       execution_id: executionId,
@@ -1545,6 +1569,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
           error.errorType !== "SandboxRepairRequired"
         )
           throw error;
+        if (options.sshControlDir) closeSSHScope(options.sshControlDir, "exit");
         await runBackend(
           { action: "ensure", name: destination.name },
           signal,
@@ -1628,11 +1653,15 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     active: Extract<ExecutionTarget, { kind: "sandbox" }>,
     ctx: UIContext,
     signal?: AbortSignal,
+    sshControlDir?: string,
   ): Promise<void> {
     const source = workspaceSource(active);
     if (!source) return;
     try {
-      await runBackend({ action: "cleanup_workspace", source }, signal);
+      await runBackend(
+        { action: "cleanup_workspace", source, ssh_control_dir: sshControlDir },
+        signal,
+      );
     } catch (error) {
       ctx.ui.notify(
         `workspace cleanup failed on ${active.name}: ${error instanceof Error ? error.message : String(error)}`,
@@ -1819,7 +1848,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
   async function activate(
     next: ExecutionTarget,
     ctx: UIContext,
-    options: { persist?: boolean } = {},
+    options: { persist?: boolean; sshControlDir?: string } = {},
   ): Promise<void> {
     if (runtimeClosed)
       throw new Error(
@@ -1833,7 +1862,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
     let resolved = next;
     let nextBridge =
       resolved.kind === "sandbox"
-        ? new ToolBridge(resolved, expectedTools)
+        ? new ToolBridge(resolved, expectedTools, options.sshControlDir)
         : undefined;
     if (resolved.kind === "sandbox") {
       ctx.ui.setStatus(
@@ -1857,6 +1886,7 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
       } catch (error) {
         if (resolved.kind !== "sandbox" || resolved.reconciled) throw error;
         nextBridge?.close(true);
+        if (options.sshControlDir) closeSSHScope(options.sshControlDir, "exit");
         resolved = await materializeTarget(
           { kind: "sandbox", name: resolved.name, os: resolved.os },
           ctx,
@@ -1864,9 +1894,14 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
             inheritExecution: false,
             resume: resolved,
             forceReconcile: true,
+            sshControlDir: options.sshControlDir,
           },
         );
-        nextBridge = new ToolBridge(resolved, expectedTools);
+        nextBridge = new ToolBridge(
+          resolved,
+          expectedTools,
+          options.sshControlDir,
+        );
         await nextBridge.connect();
       }
       if (runtimeClosed)
@@ -2061,36 +2096,51 @@ export default function cuaSandbox(pi: ExtensionAPI): void {
   ): Promise<void> {
     if (enteringEnvironment)
       throw new Error("another sandbox entry is in progress");
-    enteringEnvironment = true;
     const started = performance.now();
+    const sshControlDir = mkdtempSync("/tmp/cua-entry-");
+    enteringEnvironment = true;
     const timings: Record<string, number> = {};
     let success = false;
+    let activated = false;
     try {
       intent ??= saveConnectionIntent(destination);
       const source = target.kind === "sandbox" ? target : undefined;
       const reconnecting = source?.name === destination.name;
-      const prepared = await materializeTarget(
-        destination,
-        ctx,
-        reconnecting ? { inheritExecution: false, resume: source } : undefined,
-      );
+      const prepared = await materializeTarget(destination, ctx, {
+        ...(reconnecting ? { inheritExecution: false, resume: source } : {}),
+        sshControlDir,
+      });
       timings.prepare_ms = performance.now() - started;
       if (!ownsConnectionIntent(ctx, intent))
         throw new Error("sandbox entry was superseded");
       const connecting = performance.now();
-      await activate(prepared, ctx);
+      await activate(prepared, ctx, { sshControlDir });
+      activated = true;
       timings.connect_ms = performance.now() - connecting;
       clearConnectionIntent(ctx, intent);
       const cleaning = performance.now();
-      if (source && !reconnecting) await cleanupTarget(source, ctx, ctx.signal);
+      if (source && !reconnecting)
+        await cleanupTarget(source, ctx, ctx.signal, sshControlDir);
       timings.cleanup_ms = performance.now() - cleaning;
       success = true;
     } catch (error) {
       if (!runtimeClosed) clearConnectionIntent(ctx, intent);
       throw error;
     } finally {
-      timings.total_ms = performance.now() - started;
       enteringEnvironment = false;
+      try {
+        try {
+          closeSSHScope(sshControlDir, activated ? "stop" : "exit");
+        } finally {
+          rmSync(sshControlDir, { recursive: true, force: true });
+        }
+      } catch (error) {
+        ctx.ui.notify(
+          `ssh scope cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
+          "warning",
+        );
+      }
+      timings.total_ms = performance.now() - started;
       if (!runtimeClosed)
         pi.appendEntry("cua-entry-timing", {
           name: destination.name,

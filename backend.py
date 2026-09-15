@@ -2203,8 +2203,29 @@ SSH_CONTROL_DIR: Path | None = None
 
 
 @contextmanager
-def ssh_session() -> Iterator[None]:
+def ssh_session(shared_directory: object = None) -> Iterator[None]:
     global SSH_CONTROL_DIR
+    if shared_directory is not None:
+        if not isinstance(shared_directory, str):
+            raise TypeError("SSH entry scope must be a directory path")
+        directory = Path(shared_directory)
+        if (
+            directory.parent != Path("/tmp")
+            or not directory.name.startswith("cua-entry-")
+            or directory.is_symlink()
+            or not directory.is_dir()
+        ):
+            raise ValueError("invalid SSH entry scope")
+        metadata = directory.stat()
+        if metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:
+            raise ValueError("SSH entry scope must be private and controller-owned")
+        previous = SSH_CONTROL_DIR
+        SSH_CONTROL_DIR = directory
+        try:
+            yield
+        finally:
+            SSH_CONTROL_DIR = previous
+        return
     with tempfile.TemporaryDirectory(prefix="cua-ssh-", dir="/tmp") as directory:
         previous = SSH_CONTROL_DIR
         SSH_CONTROL_DIR = Path(directory)
@@ -2892,8 +2913,17 @@ def cleanup_workspace_root(name: str, profile: str, root: str) -> None:
 
 
 def cleanup_sandbox_workspace(source: SandboxWorkspaceSource) -> dict[str, Any]:
-    root, _ = workspace_location(source["address"], source["os"], source["remoteCwd"])
-    cleanup_workspace_root(source["address"], source["os"], root)
+    root = saved_workspace_root(source["os"], source["remoteCwd"])
+    result = json.loads(
+        git_object_rpc(
+            source["remoteCwd"],
+            "cleanup",
+            guest=(source["address"], source["os"]),
+            expectedRoot=root,
+        )
+    )
+    if result.get("removed") is not True:
+        raise RuntimeError("sandbox did not confirm workspace cleanup")
     return {"removed": True}
 
 
@@ -3088,6 +3118,7 @@ def transfer_workspace_objects(
     timings: dict[str, float],
     *,
     exclude: str | None = None,
+    prepare: bool = False,
 ) -> None:
     origins: list[tuple[str, tuple[str, str] | None, str]] = []
     if source:
@@ -3144,13 +3175,18 @@ def transfer_workspace_objects(
         response = json.loads(
             git_object_rpc(
                 root,
-                "missing",
+                "prepare" if prepare else "missing",
                 json.dumps(list(combined.items())).encode(),
                 guest=(name, profile),
                 cache=cache,
+                commit=repository.commit,
+                remoteUrl=repository.remote_url,
                 exclude=exclude,
             )
         )
+        base_commit = response.get("baseCommit")
+        if base_commit is not None and base_commit != repository.commit:
+            raise RuntimeError("destination returned an unknown Git base commit")
         missing = response.get("missing")
         if not isinstance(missing, list) or any(
             not isinstance(item, str) or item not in combined for item in missing
@@ -3167,7 +3203,7 @@ def transfer_workspace_objects(
         )
     framed = bytearray()
     with measure_phase(timings, "workspace.objects.pack"):
-        for (origin, guest, _), entries in zip(origins, manifests, strict=True):
+        for (origin, guest, tree), entries in zip(origins, manifests, strict=True):
             selected = sorted(needed.intersection(entries))
             if selected:
                 packed = git_object_rpc(
@@ -3178,6 +3214,10 @@ def transfer_workspace_objects(
                     ).encode(),
                     guest=guest,
                     exclude=exclude,
+                    trees=[tree, transfer.state["baselineTree"]]
+                    if guest and transfer.baseline_in_source
+                    else [tree],
+                    baseCommit=base_commit,
                 )
                 framed.extend(len(packed).to_bytes(4, "big"))
                 framed.extend(packed)
@@ -3431,14 +3471,37 @@ async def activate_execution(
         }
 
     progress("sandbox.preflight", "checking health, configuration, disk, and cache")
-    with measure_phase(timings, "preflight"):
-        preflight = guest_preflight(
-            candidate,
-            profile,
-            repository.remote_url,
-            repository.commit,
-            guest_digest,
-        )
+
+    def inspect_destination() -> GuestPreflight | None:
+        with measure_phase(timings, "preflight"):
+            return guest_preflight(
+                candidate,
+                profile,
+                repository.remote_url,
+                source["state"]["commit"] if source else repository.commit,
+                guest_digest,
+            )
+
+    def capture_origin() -> WorkspaceTransfer:
+        with measure_phase(timings, "workspace.capture"):
+            return (
+                capture_sandbox_workspace(
+                    source, include_patch=False, exclude=source["state"]["commitTree"]
+                )
+                if source
+                else capture_local_workspace(repository, include_patch=False)
+            )
+
+    inspected = await asyncio.gather(
+        asyncio.to_thread(inspect_destination),
+        asyncio.to_thread(capture_origin),
+        return_exceptions=True,
+    )
+    for outcome in inspected:
+        if isinstance(outcome, BaseException):
+            raise outcome
+    preflight = cast(GuestPreflight | None, inspected[0])
+    transfer = cast(WorkspaceTransfer, inspected[1])
     if preflight is None:
         raise SandboxRepairRequired(f"sandbox repair required: {name}")
 
@@ -3451,18 +3514,26 @@ async def activate_execution(
     runtime_content = (
         guest_runtime_archive(config_files) if not preflight.runtime_available else None
     )
-    with measure_phase(timings, "workspace.capture"):
-        transfer = (
-            capture_sandbox_workspace(
-                source,
-                include_patch=False,
-                exclude=source["state"]["commitTree"]
-                if preflight.repository_available
-                else None,
+    if source and not preflight.repository_available:
+        with measure_phase(timings, "workspace.full-inventory"):
+            objects = json.loads(
+                git_object_rpc(
+                    source["remoteCwd"],
+                    "inventory",
+                    guest=(source["address"], source["os"]),
+                    tree=transfer.final_tree,
+                    baseline=transfer.state["baselineTree"]
+                    if transfer.baseline_in_source
+                    else None,
+                )
             )
-            if source
-            else capture_local_workspace(repository, include_patch=False)
-        )
+            transfer = WorkspaceTransfer(
+                transfer.state,
+                transfer.patch,
+                transfer.final_tree,
+                objects,
+                transfer.baseline_in_source,
+            )
     runtime_install = (
         asyncio.create_task(
             asyncio.to_thread(
@@ -3494,13 +3565,26 @@ async def activate_execution(
     )
     try:
         with measure_phase(timings, "workspace.prepare"):
-            remote_cwd = await prepare_workspace(
-                address,
-                profile,
-                repository,
-                workspace_id,
-                repository_available=preflight.repository_available,
-            )
+            if preflight.repository_available:
+                remote_cwd = (
+                    str(
+                        PurePosixPath(workspace_root)
+                        / repository.relative_cwd.as_posix()
+                    )
+                    if is_unix(profile)
+                    else str(
+                        PureWindowsPath(workspace_root)
+                        / PureWindowsPath(*repository.relative_cwd.parts)
+                    )
+                )
+            else:
+                remote_cwd = await prepare_workspace(
+                    address,
+                    profile,
+                    repository,
+                    workspace_id,
+                    repository_available=False,
+                )
         transfer_workspace_objects(
             address,
             profile,
@@ -3513,6 +3597,7 @@ async def activate_execution(
             exclude=transfer.state["commitTree"]
             if preflight.repository_available
             else None,
+            prepare=preflight.repository_available,
         )
         if runtime_install:
             await runtime_install
@@ -3648,7 +3733,7 @@ def main() -> None:
         locks = request_lock_paths(request)
         if locks:
             progress("lock", "waiting for operation slot")
-            with operation_locks(locks), ssh_session():
+            with operation_locks(locks), ssh_session(request.get("ssh_control_dir")):
                 progress("lock", "acquired operation slot")
                 result = asyncio.run(dispatch(request))
         else:

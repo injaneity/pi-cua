@@ -15,6 +15,11 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
 const fixture = JSON.parse(await readFile(process.argv[2], "utf8"));
+const budgetMs = Number(process.argv[3] ?? 30000);
+assert.ok(
+  Number.isFinite(budgetMs) && budgetMs > 0,
+  "budget must be positive milliseconds",
+);
 const base = dirname(fileURLToPath(import.meta.url));
 const cwd = fixture.state.localRoot;
 const agentDir =
@@ -34,6 +39,12 @@ const python = async (code, payload) => {
   );
   return result.stdout.trim();
 };
+const destination = JSON.parse(
+  await python(
+    "print(json.dumps(next(b for b in backend.managed_sandboxes() if b['name']=='linux-1')))",
+    {},
+  ),
+);
 const sourceRoot = await python(
   `identity=backend.execution_digest(data['executionId'])[:16]\nroot=backend.guest_home('macos')+'/workspaces/'+identity\ncommand='git clone --shared --no-checkout '+shlex.quote(data['mac_template'])+' '+shlex.quote(root)+' && git -C '+shlex.quote(root)+' read-tree --reset -u '+data['tree']\nbackend.run_guest_ssh(data['mac_address'],'macos',command,timeout=60,report=False)\nprint(root)`,
   { ...fixture, executionId },
@@ -98,6 +109,12 @@ try {
     .at(-1)?.data;
   assert.equal(target?.name, "linux-1");
   assert.equal(target.executionId, executionId);
+  assert.equal(target.sandboxGeneration, destination.generation);
+  const backendTimings = () =>
+    manager
+      .getEntries()
+      .filter((item) => item.customType === "cua-backend-timing").length;
+  const connectedCount = backendTimings();
   const bash = session.agent.state.tools.find((tool) => tool.name === "bash");
   const smoke = await bash.execute(
     crypto.randomUUID(),
@@ -109,6 +126,15 @@ try {
   assert.ok(!smoke.isError, JSON.stringify(smoke));
   assert.match(JSON.stringify(smoke), new RegExp(fixture.tree));
   assert.match(JSON.stringify(smoke), /fixture-present/);
+  assert.equal(
+    backendTimings(),
+    connectedCount,
+    "entry transport must survive scope cleanup without reconnecting",
+  );
+  await python(
+    "backend.run_guest_ssh(data['mac_address'], 'macos', 'test ! -e '+shlex.quote(data['sourceRoot']), timeout=15, report=False)",
+    { ...fixture, sourceRoot },
+  );
   const timings = manager
     .getEntries()
     .filter((item) =>
@@ -127,12 +153,16 @@ try {
       2,
     ),
   );
-  passed = elapsedMs < 30000;
+  passed = elapsedMs < budgetMs;
 } finally {
   await runtime?.dispose();
   await python(
-    `identity=backend.execution_digest(data['executionId'])[:16]\nfor name,profile in [('mac-studio','macos'),('linux-1','linux')]:\n box=next(b for b in backend.managed_sandboxes() if b['name']==name)\n root=backend.guest_home(profile)+'/workspaces/'+identity\n backend.cleanup_workspace_root(box['address'],profile,root)`,
-    { executionId },
+    `identity=backend.execution_digest(data['executionId'])[:16]\nfor address,profile in [(data['mac_address'],'macos'),(data['linux_address'],'linux')]:\n root=backend.guest_home(profile)+'/workspaces/'+identity\n backend.cleanup_workspace_root(address,profile,root)`,
+    {
+      executionId,
+      mac_address: fixture.mac_address,
+      linux_address: destination.address,
+    },
   );
 }
 if (!passed) process.exitCode = 1;

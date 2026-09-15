@@ -7,6 +7,7 @@ import json
 import subprocess
 import tarfile
 import tempfile
+import threading
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
@@ -2015,6 +2016,26 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         transfer = backend.WorkspaceTransfer(self.state, b"final", "2" * 40)
         preflight = backend.GuestPreflight("100.64.0.2", 2**30, True, True)
+        captured = threading.Event()
+        self.repository = backend.WorkspaceRepository(
+            self.repository.root,
+            self.repository.relative_cwd,
+            self.repository.remote_url,
+            "f" * 40,
+        )
+
+        def capture(*args, **kwargs):
+            captured.set()
+            return transfer
+
+        def inspect(*args):
+            self.assertTrue(
+                captured.wait(5),
+                "read-only capture must not wait for destination preflight",
+            )
+            self.assertEqual(args[3], self.state["commit"])
+            return preflight
+
         with (
             patch.object(
                 backend,
@@ -2022,8 +2043,8 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
                 return_value=[{"name": "linux-1", "os": "linux"}],
             ),
             patch.object(backend, "inspect_workspace", return_value=self.repository),
-            patch.object(backend, "capture_sandbox_workspace", return_value=transfer),
-            patch.object(backend, "guest_preflight", return_value=preflight),
+            patch.object(backend, "capture_sandbox_workspace", side_effect=capture),
+            patch.object(backend, "guest_preflight", side_effect=inspect),
             patch.object(backend, "install_guest_runtime") as sync_config,
             patch.object(
                 backend,
@@ -2037,8 +2058,9 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(result["workspace_state"], self.state)
-        self.assertEqual(prepare.await_args.args[2].commit, self.state["commit"])
-        self.assertTrue(prepare.await_args.kwargs["repository_available"])
+        prepare.assert_not_awaited()
+        self.assertEqual(restore.call_args.args[3].commit, self.state["commit"])
+        self.assertTrue(restore.call_args.kwargs["prepare"])
         sync_config.assert_not_called()
         restore.assert_called_once()
 
@@ -2218,8 +2240,8 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
                 "linux-1", "/local", "session-1", resume=self.source
             )
 
-        self.assertEqual(result["remote_cwd"], "/remote/workspace")
-        prepare.assert_awaited_once()
+        self.assertEqual(result["remote_cwd"], "/home/cua/workspaces/84097828fc31a8c8")
+        prepare.assert_not_awaited()
 
     async def test_activate_execution_removes_an_incomplete_destination(self) -> None:
         transfer = backend.WorkspaceTransfer(self.state, b"final", "2" * 40)
@@ -2235,8 +2257,8 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
             patch.object(backend, "guest_preflight", return_value=preflight),
             patch.object(
                 backend,
-                "prepare_workspace",
-                AsyncMock(side_effect=RuntimeError("clone failed")),
+                "transfer_workspace_objects",
+                side_effect=RuntimeError("clone failed"),
             ),
             patch.object(backend, "cleanup_workspace_root") as cleanup,
             self.assertRaisesRegex(RuntimeError, "clone failed"),
@@ -2575,6 +2597,19 @@ class GitObjectTransferTests(unittest.TestCase):
             exclude=self.state["commitTree"],
         )
 
+    def test_unknown_destination_base_is_rejected_before_packing(self) -> None:
+        with (
+            patch.object(
+                backend,
+                "git_object_rpc",
+                return_value=json.dumps(
+                    {"missing": [], "baseCommit": "f" * 40}
+                ).encode(),
+            ),
+            self.assertRaisesRegex(RuntimeError, "unknown Git base commit"),
+        ):
+            self.invoke()
+
     def test_unknown_destination_object_is_not_requested_from_source(self) -> None:
         with (
             patch.object(
@@ -2648,6 +2683,24 @@ class GitObjectTransferTests(unittest.TestCase):
             self.assertIsNone(backend.SSH_CONTROL_DIR)
             self.assertFalse(directory.exists())
             self.assertIn("exit", run.call_args.args[0])
+
+    def test_entry_owner_retains_its_connections_after_backend_return(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="cua-entry-", dir="/tmp") as name:
+            with backend.ssh_session(name):
+                self.assertIn(f"ControlPath={name}/%C", backend.ssh_options("linux"))
+                self.assertIn("StrictHostKeyChecking=yes", backend.ssh_options("linux"))
+            self.assertIsNone(backend.SSH_CONTROL_DIR)
+            self.assertTrue(Path(name).is_dir())
+
+    def test_shared_connections_reject_non_private_entry_scope(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="cua-entry-", dir="/tmp") as name:
+            Path(name).chmod(0o755)
+            with (
+                self.assertRaisesRegex(ValueError, "private"),
+                backend.ssh_session(name),
+            ):
+                self.fail("scope accepted")
+        self.assertIsNone(backend.SSH_CONTROL_DIR)
 
     def test_connection_cleanup_does_not_mask_operation_failure(self) -> None:
         with (

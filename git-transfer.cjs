@@ -1,5 +1,9 @@
 const { execFileSync } = require("node:child_process");
 const fs = require("node:fs");
+const canonical = (value) =>
+  process.platform === "win32"
+    ? fs.realpathSync(value).toLowerCase()
+    : fs.realpathSync(value);
 const [action, encoded] = process.argv.slice(-2);
 const options = JSON.parse(Buffer.from(encoded, "base64").toString("utf8"));
 const limit = 200 * 1024 * 1024;
@@ -48,6 +52,28 @@ const list = (values) => {
     throw new Error("Invalid Git object list");
   return values.map(oid);
 };
+const matchingCommit = (commit, tree) => {
+  if (!commit || !tree) return undefined;
+  const id = oid(commit);
+  if (
+    git(["cat-file", "--batch-check=%(objecttype)"], id + "\n")
+      .toString()
+      .trim() !== "commit"
+  )
+    return undefined;
+  return git(["rev-parse", id + "^{tree}"])
+    .toString()
+    .trim() === oid(tree)
+    ? id
+    : undefined;
+};
+const snapshotCommit = (tree, parent) =>
+  git(
+    ["hash-object", "-t", "commit", "-w", "--stdin"],
+    `tree ${oid(tree)}\nparent ${oid(parent)}\nauthor pi-cua <pi-cua@localhost> 0 +0000\ncommitter pi-cua <pi-cua@localhost> 0 +0000\n\npi-cua transfer\n`,
+  )
+    .toString()
+    .trim();
 const json = (value) => process.stdout.write(JSON.stringify(value));
 const inventory = (tree) => {
   const ids = git([
@@ -108,7 +134,10 @@ const snapshot = () => {
   }
 };
 if (action === "inventory") {
-  json(inventory(options.tree));
+  json([
+    ...inventory(options.tree),
+    ...(options.baseline ? inventory(options.baseline) : []),
+  ]);
 } else if (action === "snapshot") {
   const tree = snapshot();
   let baselineAvailable = false;
@@ -124,7 +153,32 @@ if (action === "inventory") {
     ...(baselineAvailable ? inventory(options.baseline) : []),
   ];
   json({ tree, objects, baselineAvailable });
-} else if (action === "missing") {
+} else if (action === "missing" || action === "prepare") {
+  if (action === "prepare") {
+    const path = require("node:path");
+    const commit = oid(options.commit);
+    git(["cat-file", "-e", commit + "^{commit}"], undefined, options.cache);
+    fs.mkdirSync(path.dirname(options.root), { recursive: true });
+    if (!fs.existsSync(path.join(options.root, ".git"))) {
+      git(
+        ["clone", "--shared", "--no-checkout", options.cache, options.root],
+        undefined,
+        options.cache,
+      );
+      git(["update-ref", "--no-deref", "HEAD", commit]);
+    } else {
+      if (
+        !fs.lstatSync(options.root).isDirectory() ||
+        !fs.lstatSync(path.join(options.root, ".git")).isDirectory() ||
+        canonical(git(["rev-parse", "--show-toplevel"]).toString().trim()) !==
+          canonical(options.root)
+      )
+        throw new Error("Invalid destination workspace root");
+      git(["checkout", "--detach", "--force", commit]);
+      git(["clean", "-ffd"]);
+    }
+    git(["remote", "set-url", "origin", options.remoteUrl]);
+  }
   const entries = JSON.parse(input.toString());
   const ids = list(entries.map(([id]) => id));
   if (entries.some(([, size]) => !Number.isSafeInteger(size) || size < 0))
@@ -178,23 +232,52 @@ if (action === "inventory") {
     }
     absent = missing();
   }
-  json({ missing: absent, refreshed, refreshFailed });
+  json({
+    missing: absent,
+    refreshed,
+    refreshFailed,
+    baseCommit: matchingCommit(options.commit, options.exclude),
+  });
 } else if (action === "pack") {
   const request = JSON.parse(input.toString());
   const ids = list(request.missing);
   const have = list(request.have);
   if (!ids.length) throw new Error("Empty pack request");
+  const base = options.trees
+    ? matchingCommit(options.baseCommit, options.exclude)
+    : undefined;
+  const roots = list(options.trees ?? ids);
   const revisions = [
-    ...ids,
+    ...roots.map((tree) => (base ? snapshotCommit(tree, base) : tree)),
     ...have.map((id) => "^" + id),
-    ...(options.exclude ? ["^" + oid(options.exclude)] : []),
+    ...(base || options.exclude ? ["^" + oid(base ?? options.exclude)] : []),
   ];
   process.stdout.write(
     git(
-      ["pack-objects", "--stdout", "--revs", "--thin", "--compression=1"],
+      [
+        "pack-objects",
+        "--stdout",
+        "--revs",
+        "--thin",
+        "--no-reuse-object",
+        "--compression=6",
+      ],
       revisions.join("\n") + "\n",
     ),
   );
+} else if (action === "cleanup") {
+  const path = require("node:path");
+  const expected = path.resolve(options.expectedRoot);
+  if (
+    !/^[a-f0-9]{16}$/i.test(path.basename(expected)) ||
+    fs.lstatSync(expected).isSymbolicLink()
+  )
+    throw new Error("Invalid cleanup workspace");
+  const actual = git(["rev-parse", "--show-toplevel"]).toString().trim();
+  if (canonical(actual) !== canonical(expected))
+    throw new Error("Source workspace root mismatch");
+  fs.rmSync(expected, { recursive: true });
+  json({ removed: true });
 } else if (action === "apply") {
   const tree = oid(options.tree);
   const baseline = oid(options.baseline);
