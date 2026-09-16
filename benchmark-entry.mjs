@@ -16,6 +16,7 @@ import {
 import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
 const fixture = JSON.parse(await readFile(process.argv[2], "utf8"));
 const budgetMs = Number(process.argv[3] ?? 30000);
+const destinationName = process.argv[4] ?? "linux-1";
 assert.ok(
   Number.isFinite(budgetMs) && budgetMs > 0,
   "budget must be positive milliseconds",
@@ -41,8 +42,8 @@ const python = async (code, payload) => {
 };
 const destination = JSON.parse(
   await python(
-    "print(json.dumps(next(b for b in backend.managed_sandboxes() if b['name']=='linux-1')))",
-    {},
+    "print(json.dumps(next(b for b in backend.managed_sandboxes() if b['name']==data['name'])))",
+    { name: destinationName },
   ),
 );
 const sourceRoot = await python(
@@ -67,6 +68,15 @@ try {
     cwd,
     agentDir,
     settingsManager,
+    additionalExtensionPaths: [join(base, "index.ts")],
+    extensionsOverride: (loaded) => ({
+      ...loaded,
+      extensions: loaded.extensions.filter(
+        (extension) =>
+          extension.path === join(base, "index.ts") ||
+          !extension.tools.has("enter_environment"),
+      ),
+    }),
   });
   const modelRuntime = await ModelRuntime.create({
     credentials: new InMemoryCredentialStore(),
@@ -76,6 +86,15 @@ try {
     modelsStorePath: join(tmpdir(), `cua-benchmark-models-${executionId}.json`),
   });
   await resourceLoader.reload();
+  assert.deepEqual(
+    resourceLoader
+      .getExtensions()
+      .extensions.filter((extension) =>
+        extension.tools.has("enter_environment"),
+      )
+      .map((extension) => extension.path),
+    [join(base, "index.ts")],
+  );
   runtime = await createAgentSessionRuntime(
     async ({ sessionManager, sessionStartEvent }) =>
       createAgentSession({
@@ -98,7 +117,7 @@ try {
   const started = performance.now();
   const result = await entry.execute(
     crypto.randomUUID(),
-    { os: "linux", name: "linux-1" },
+    { os: "linux", name: destinationName },
     AbortSignal.timeout(600000),
   );
   const elapsedMs = performance.now() - started;
@@ -107,7 +126,7 @@ try {
     .getEntries()
     .filter((item) => item.customType === "cua-execution-target")
     .at(-1)?.data;
-  assert.equal(target?.name, "linux-1");
+  assert.equal(target?.name, destinationName);
   assert.equal(target.executionId, executionId);
   assert.equal(target.sandboxGeneration, destination.generation);
   const backendTimings = () =>

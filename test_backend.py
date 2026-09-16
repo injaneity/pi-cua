@@ -1765,43 +1765,6 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
             )
         apply_patch.assert_not_called()
 
-    async def test_linux_workspace_borrows_from_the_shared_object_cache(self) -> None:
-        with patch.object(backend, "run_guest_ssh") as run:
-            await backend.prepare_workspace(
-                "100.64.0.2",
-                "linux",
-                self.repository,
-                "session",
-                repository_available=True,
-            )
-
-        command = run.call_args.args[2]
-        self.assertIn("git clone --shared --no-checkout", command)
-        self.assertIn("remote set-url origin", command)
-        self.assertNotIn("--dissociate", command)
-
-    async def test_windows_workspace_fetches_a_missing_cached_commit(self) -> None:
-        with patch.object(backend, "run_guest_ssh") as run:
-            await backend.prepare_workspace(
-                "100.64.0.2",
-                "windows",
-                self.repository,
-                "session",
-                repository_available=True,
-            )
-
-        encoded = run.call_args.args[2].rsplit(" ", 1)[-1]
-        script = backend.base64.b64decode(encoded).decode("utf-16le")
-        self.assertIn("function Test-GitCommit", script)
-        self.assertIn(
-            "elseif (-not (Test-GitCommit $cache 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'))",
-            script,
-        )
-        self.assertIn("git -C $cache fetch --quiet origin", script)
-        self.assertIn("--shared --no-checkout $cache $root", script)
-        self.assertNotIn("--dissociate", script)
-        self.assertNotIn("git -C $cache cat-file -e", script.split("$root =", 1)[1])
-
     async def test_activate_execution_without_git_uses_thread_directory(self) -> None:
         execution_id = hashlib.sha256(b"session-1").hexdigest()[:16]
         for profile, remote_cwd in (
@@ -1821,7 +1784,7 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
                         backend, "guest_runtime_preflight", return_value=preflight
                     ),
                     patch.object(backend, "guest_preflight") as full_preflight,
-                    patch.object(backend, "prepare_workspace") as prepare,
+                    patch.object(backend, "prepare_snapshot_workspace") as prepare,
                     patch.object(
                         backend,
                         "run_guest_ssh",
@@ -2048,7 +2011,7 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
             patch.object(backend, "install_guest_runtime") as sync_config,
             patch.object(
                 backend,
-                "prepare_workspace",
+                "prepare_snapshot_workspace",
                 AsyncMock(return_value="/remote/workspace"),
             ) as prepare,
             patch.object(backend, "transfer_workspace_objects") as restore,
@@ -2113,7 +2076,7 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
             patch.object(backend, "install_guest_runtime") as sync_config,
             patch.object(
                 backend,
-                "prepare_workspace",
+                "prepare_snapshot_workspace",
                 AsyncMock(return_value="/remote/workspace"),
             ),
             patch.object(backend, "transfer_workspace_objects"),
@@ -2137,7 +2100,7 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
             patch.object(backend, "inspect_workspace", return_value=self.repository),
             patch.object(backend, "capture_sandbox_workspace", return_value=transfer),
             patch.object(backend, "guest_preflight", return_value=preflight),
-            patch.object(backend, "prepare_workspace") as prepare,
+            patch.object(backend, "prepare_snapshot_workspace") as prepare,
             patch.object(backend, "cleanup_workspace_root") as cleanup,
             self.assertRaisesRegex(RuntimeError, "requires 1 GiB free"),
         ):
@@ -2164,7 +2127,7 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
             ) as resume_probe,
             patch.object(backend, "install_guest_runtime") as install,
             patch.object(backend, "capture_local_workspace") as capture,
-            patch.object(backend, "prepare_workspace") as prepare,
+            patch.object(backend, "prepare_snapshot_workspace") as prepare,
         ):
             result = await backend.activate_execution(
                 "linux-1", "/local", "session-1", resume=self.source
@@ -2231,7 +2194,7 @@ class WorkspaceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
             patch.object(backend, "capture_local_workspace", return_value=transfer),
             patch.object(
                 backend,
-                "prepare_workspace",
+                "prepare_snapshot_workspace",
                 AsyncMock(return_value="/remote/workspace"),
             ) as prepare,
             patch.object(backend, "transfer_workspace_objects"),

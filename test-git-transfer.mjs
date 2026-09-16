@@ -9,6 +9,7 @@ import {
   rmSync,
   chmodSync,
   existsSync,
+  readdirSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -60,8 +61,59 @@ const frame = (pack) => {
   size.writeUInt32BE(pack.length);
   return Buffer.concat([size, pack]);
 };
-for (const prepare of [false, true])
-  test(`object transfer preserves ignored files, modes, deletions, binary data and dirty baseline (prepare=${prepare})`, () => {
+for (const mode of [
+  "cold-unreachable",
+  "cold-missing-commit",
+  "warm-missing-commit",
+])
+  test(`failed cache preparation preserves the workspace (${mode})`, () => {
+    const directory = mkdtempSync(join(tmpdir(), "cua-cache-failure-"));
+    try {
+      const source = join(directory, "source");
+      const target = join(directory, "target");
+      const cache = join(directory, "cache", "mirror.git");
+      mkdirSync(source);
+      git(source, "init", "-q");
+      git(source, "config", "user.name", "test");
+      git(source, "config", "user.email", "test@example.invalid");
+      writeFileSync(join(source, "keep.txt"), "committed\n");
+      git(source, "add", ".");
+      git(source, "commit", "-qm", "base");
+      git(directory, "clone", "--no-local", source, target);
+      if (mode === "warm-missing-commit")
+        git(directory, "clone", "--mirror", "--no-local", source, cache);
+      writeFileSync(join(target, "keep.txt"), "uncommitted work\n");
+      const before = JSON.parse(rpc(target, "snapshot")).tree;
+      const commit = git(source, "rev-parse", "HEAD").toString().trim();
+      assert.throws(
+        () =>
+          rpc(target, "prepare", json([]), {
+            cache,
+            commit: mode === "cold-unreachable" ? commit : "a".repeat(40),
+            remoteUrl:
+              mode === "cold-unreachable" ? join(directory, "absent") : source,
+          }),
+        /Command failed/,
+      );
+      assert.equal(JSON.parse(rpc(target, "snapshot")).tree, before);
+      assert.equal(git(target, "rev-parse", "HEAD").toString().trim(), commit);
+      assert.equal(existsSync(cache), mode === "warm-missing-commit");
+      if (existsSync(cache))
+        assert.equal(git(cache, "rev-parse", "HEAD").toString().trim(), commit);
+      assert.deepEqual(
+        readdirSync(join(directory, "cache")).filter((name) =>
+          name.startsWith(".incoming-"),
+        ),
+        [],
+      );
+    } finally {
+      rmSync(directory, { recursive: true });
+    }
+  });
+
+for (const mode of ["existing", "warm", "cold", "stale"])
+  test(`object transfer preserves ignored files, modes, deletions, binary data and dirty baseline (${mode})`, () => {
+    const prepare = mode !== "existing";
     const directory = mkdtempSync(join(tmpdir(), "cua-git-test-"));
     try {
       const source = join(directory, "source"),
@@ -74,12 +126,22 @@ for (const prepare of [false, true])
       writeFileSync(join(source, "deleted.txt"), "delete me\n");
       git(source, "add", ".");
       git(source, "commit", "-qm", "base");
+      const cache = join(directory, "cache", "mirror.git");
+      if (mode !== "cold")
+        execFileSync(
+          "git",
+          ["clone", "--mirror", "--no-local", source, cache],
+          {
+            stdio: "pipe",
+          },
+        );
+      if (mode === "stale") {
+        writeFileSync(join(source, "new-commit.txt"), "published later\n");
+        git(source, "add", ".");
+        git(source, "commit", "-qm", "published after cache creation");
+      }
       const base = git(source, "rev-parse", "HEAD^{tree}").toString().trim();
       const commit = git(source, "rev-parse", "HEAD").toString().trim();
-      const cache = join(directory, "cache.git");
-      execFileSync("git", ["clone", "--mirror", "--no-local", source, cache], {
-        stdio: "pipe",
-      });
       if (!prepare)
         execFileSync("git", ["clone", "--no-local", cache, target], {
           stdio: "pipe",
@@ -119,7 +181,10 @@ for (const prepare of [false, true])
           exclude: base,
           cache,
           commit,
-          remoteUrl: "https://example.invalid/repo",
+          remoteUrl:
+            mode === "cold" || mode === "stale"
+              ? source
+              : join(directory, "unavailable-origin"),
         }),
       ).missing;
       assert.equal(git(target, "rev-parse", "HEAD").toString().trim(), commit);
@@ -142,6 +207,10 @@ for (const prepare of [false, true])
       );
       assert.equal(result.tree, snapshot.tree);
       assert.equal(JSON.parse(rpc(target, "snapshot")).tree, snapshot.tree);
+      assert.throws(
+        () => git(cache, "cat-file", "-e", snapshot.tree),
+        /Command failed/,
+      );
       assert.equal(
         git(target, "show", baseline + ":local.txt").toString(),
         "original local baseline\n",

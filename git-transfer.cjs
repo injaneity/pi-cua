@@ -52,6 +52,46 @@ const list = (values) => {
     throw new Error("Invalid Git object list");
   return values.map(oid);
 };
+const prepareCache = (commit) => {
+  const path = require("node:path");
+  const requireCommit = (root) => {
+    try {
+      git(["cat-file", "-e", commit + "^{commit}"], undefined, root);
+    } catch {
+      git(
+        ["fetch", "--no-tags", "--", options.remoteUrl, commit],
+        undefined,
+        root,
+        300000,
+      );
+      git(["cat-file", "-e", commit + "^{commit}"], undefined, root);
+    }
+  };
+  if (!fs.existsSync(options.cache)) {
+    const parent = path.dirname(options.cache);
+    fs.mkdirSync(parent, { recursive: true });
+    const staging = fs.mkdtempSync(path.join(parent, ".incoming-"));
+    try {
+      git(
+        ["clone", "--mirror", "--no-local", "--", options.remoteUrl, staging],
+        undefined,
+        parent,
+        300000,
+      );
+      requireCommit(staging);
+      try {
+        fs.renameSync(staging, options.cache);
+      } catch (error) {
+        if (!["EEXIST", "ENOTEMPTY"].includes(error.code)) throw error;
+      }
+    } finally {
+      fs.rmSync(staging, { recursive: true, force: true });
+    }
+  }
+  if (!fs.lstatSync(options.cache).isDirectory())
+    throw new Error("Invalid Git cache directory");
+  requireCommit(options.cache);
+};
 const matchingCommit = (commit, tree) => {
   if (!commit || !tree) return undefined;
   const id = oid(commit);
@@ -157,7 +197,7 @@ if (action === "inventory") {
   if (action === "prepare") {
     const path = require("node:path");
     const commit = oid(options.commit);
-    git(["cat-file", "-e", commit + "^{commit}"], undefined, options.cache);
+    prepareCache(commit);
     fs.mkdirSync(path.dirname(options.root), { recursive: true });
     if (!fs.existsSync(path.join(options.root, ".git"))) {
       git(

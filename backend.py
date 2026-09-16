@@ -2710,43 +2710,23 @@ def git_snapshot(root: Path, commit: str) -> bytes:
     ).stdout
 
 
-async def prepare_workspace(
+async def prepare_snapshot_workspace(
     name: str,
     profile: str,
     source: WorkspaceRepository,
     workspace_id: str,
-    *,
-    repository_available: bool,
 ) -> str:
-    progress(f"workspace.{name}.baseline", f"preparing {source.root}")
-    repository_key = hashlib.sha256(source.remote_url.encode()).hexdigest()[:20]
+    progress(
+        f"workspace.{name}.snapshot",
+        "origin is unavailable; sending a local commit snapshot",
+    )
     if is_unix(profile):
         home = guest_home(profile)
         workspace_root = f"{home}/workspaces/{workspace_id}"
-        repository_cache = f"{home}/.cache/cua-pi/git/{repository_key}.git"
         snapshot_path = f"/tmp/cua-snapshot-{workspace_id}.tgz"
-        if not repository_available:
-            progress(
-                f"workspace.{name}.snapshot",
-                "origin is unavailable; sending a local commit snapshot",
-            )
-            copy_guest_file(
-                name, profile, git_snapshot(source.root, source.commit), snapshot_path
-            )
-        remote_setup = f"""if [ ! -d {shlex.quote(repository_cache)} ]; then
-  git clone --mirror --progress {shlex.quote(source.remote_url)} {shlex.quote(repository_cache)}
-elif ! git -C {shlex.quote(repository_cache)} cat-file -e {shlex.quote(source.commit + "^{commit}")} 2>/dev/null; then
-  git -C {shlex.quote(repository_cache)} fetch --progress origin {shlex.quote(source.commit)}
-fi
-if [ ! -d {shlex.quote(workspace_root)}/.git ]; then
-  git clone --shared --no-checkout {shlex.quote(repository_cache)} {shlex.quote(workspace_root)}
-  git -C {shlex.quote(workspace_root)} remote set-url origin {shlex.quote(source.remote_url)}
-fi
-if ! git -C {shlex.quote(workspace_root)} cat-file -e {shlex.quote(source.commit + "^{commit}")} 2>/dev/null; then
-  git -C {shlex.quote(workspace_root)} fetch --depth=1 --progress origin {shlex.quote(source.commit)}
-fi
-git -C {shlex.quote(workspace_root)} checkout --detach --force {shlex.quote(source.commit)}
-git -C {shlex.quote(workspace_root)} clean -ffd"""
+        copy_guest_file(
+            name, profile, git_snapshot(source.root, source.commit), snapshot_path
+        )
         snapshot_setup = f"""mkdir -p {shlex.quote(workspace_root)}
 if [ -d {shlex.quote(workspace_root)}/.git ]; then
   git -C {shlex.quote(workspace_root)} rm -rf --ignore-unmatch -- .
@@ -2766,8 +2746,8 @@ else
 fi
 rm -f {shlex.quote(snapshot_path)}"""
         command = f"""set -eu
-mkdir -p {shlex.quote(home + "/workspaces")} {shlex.quote(home + "/.cache/cua-pi/git")}
-{remote_setup if repository_available else snapshot_setup}
+mkdir -p {shlex.quote(home + "/workspaces")}
+{snapshot_setup}
 """
         run_guest_ssh(
             name,
@@ -2782,21 +2762,10 @@ mkdir -p {shlex.quote(home + "/workspaces")} {shlex.quote(home + "/.cache/cua-pi
         )
 
     workspace_root = rf"C:\cua\workspaces\{workspace_id}"
-    repository_cache = rf"C:\cua\cache\git\{repository_key}.git"
     snapshot_path = rf"C:\Windows\Temp\cua-snapshot-{workspace_id}.tgz"
-    if not repository_available:
-        progress(
-            f"workspace.{name}.snapshot",
-            "origin is unavailable; sending a local commit snapshot",
-        )
-        copy_guest_file(
-            name, profile, git_snapshot(source.root, source.commit), snapshot_path
-        )
-    remote_setup = f"""if (-not (Test-Path $cache)) {{ git clone --quiet --mirror {powershell_literal(source.remote_url)} $cache }} elseif (-not (Test-GitCommit $cache '{source.commit}')) {{ git -C $cache fetch --quiet origin {source.commit} }}
-if (-not (Test-Path "$root\\.git")) {{ git clone --quiet --shared --no-checkout $cache $root; git -C $root remote set-url origin {powershell_literal(source.remote_url)} }}
-if (-not (Test-GitCommit $root '{source.commit}')) {{ git -C $root fetch --quiet --depth=1 origin {source.commit} }}
-git -C $root checkout --quiet --detach --force {source.commit}
-git -C $root clean -ffd"""
+    copy_guest_file(
+        name, profile, git_snapshot(source.root, source.commit), snapshot_path
+    )
     snapshot_setup = f"""New-Item -ItemType Directory -Force -Path $root | Out-Null
 if (Test-Path "$root\\.git") {{
   git -C $root rm -rf --ignore-unmatch -- .
@@ -2813,20 +2782,9 @@ git -C $root remote get-url origin 2>$null | Out-Null
 if ($LASTEXITCODE -eq 0) {{ git -C $root remote set-url origin {powershell_literal(source.remote_url)} }} else {{ git -C $root remote add origin {powershell_literal(source.remote_url)} }}
 Remove-Item -Force {powershell_literal(snapshot_path)}"""
     script = f"""$ErrorActionPreference = 'Stop'
-function Test-GitCommit([string]$Repository, [string]$Commit) {{
-  $previousErrorActionPreference = $ErrorActionPreference
-  $ErrorActionPreference = 'Continue'
-  try {{
-    git -C $Repository cat-file -e "${{Commit}}^{{commit}}" 2>$null
-    return $LASTEXITCODE -eq 0
-  }} finally {{
-    $ErrorActionPreference = $previousErrorActionPreference
-  }}
-}}
 $root = {powershell_literal(workspace_root)}
-$cache = {powershell_literal(repository_cache)}
-New-Item -ItemType Directory -Force -Path 'C:\\cua\\workspaces','C:\\cua\\cache\\git' | Out-Null
-{remote_setup if repository_available else snapshot_setup}
+New-Item -ItemType Directory -Force -Path 'C:\\cua\\workspaces' | Out-Null
+{snapshot_setup}
 """
     encoded_script = base64.b64encode(script.encode("utf-16le")).decode()
     run_guest_ssh(
@@ -3096,7 +3054,11 @@ def git_object_rpc(
     else:
         argv = ["node", "-e", script, action, encoded]
     result = subprocess.run(
-        argv, input=content, capture_output=True, check=False, timeout=90
+        argv,
+        input=content,
+        capture_output=True,
+        check=False,
+        timeout=660 if action == "prepare" else 90,
     )
     if result.returncode:
         raise RuntimeError(
@@ -3578,12 +3540,11 @@ async def activate_execution(
                     )
                 )
             else:
-                remote_cwd = await prepare_workspace(
+                remote_cwd = await prepare_snapshot_workspace(
                     address,
                     profile,
                     repository,
                     workspace_id,
-                    repository_available=False,
                 )
         transfer_workspace_objects(
             address,
