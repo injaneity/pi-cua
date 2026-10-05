@@ -15,13 +15,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 const script = readFileSync(
-  new URL("git-transfer.cjs", import.meta.url),
+  new URL("../git-transfer.cjs", import.meta.url),
   "utf8",
 );
-const backend = readFileSync(new URL("backend.py", import.meta.url), "utf8");
-const filterScript = backend.match(
-  /WORKSPACE_FILTER_CHECK = r"""([\s\S]*?)"""/,
-)[1];
+const { filterCheck: filterScript } = await import("../workspace.ts");
 const git = (root, ...args) => execFileSync("git", ["-C", root, ...args]);
 const rpc = (root, action, input = Buffer.alloc(0), options = {}) => {
   const args = [

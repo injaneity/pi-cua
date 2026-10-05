@@ -1,13 +1,13 @@
 {
   "name": "pi-cua",
   "version": "0.1.0",
-  "description": "Run local Pi sessions against persistent CUA sandboxes and external macOS hosts",
+  "description": "Run local Pi sessions against Cua Spaces",
   "type": "module",
   "keywords": [
     "pi-package",
     "pi-extension",
     "cua",
-    "sandbox"
+    "spaces"
   ],
   "author": "Zane Chee",
   "license": "MIT",
@@ -27,8 +27,13 @@
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-server": "*",
     "@earendil-works/pi-tui": "*",
     "typebox": "*"
+  },
+  "scripts": {
+    "test": "node --experimental-transform-types --no-warnings --test test/*.test.ts test/*.test.mjs"
+  },
+  "dependencies": {
+    "@trycua/cua": "^0.4.1"
   }
 }

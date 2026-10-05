@@ -1,77 +1,50 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
-import { StringDecoder } from "node:string_decoder";
-import { PassThrough, Writable } from "node:stream";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { realpathSync } from "node:fs";
+import { constants } from "node:os";
 import { join, resolve } from "node:path";
+import { StringDecoder } from "node:string_decoder";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
-const protocolVersion = 3;
-const maxProtocolLine = 1024 * 1024;
+const protocolVersion = 5;
+const maxLine = 64 * 1024 * 1024;
 
-if (process.platform === "win32") {
-  const nodeDirectory = process.execPath.slice(
-    0,
-    Math.max(process.execPath.lastIndexOf("\\"), 0),
-  );
-  process.env.Path = `${nodeDirectory};${process.env.Path || ""}`;
-} else {
-  const home = process.env.HOME || "/home/cua";
-  process.env.PATH = `${join(home, ".cargo", "bin")}:/usr/local/bin:${process.env.PATH || ""}`;
-  process.env.npm_config_cache = join(home, ".cua-pi", "npm-cache");
-}
+const home = process.env.HOME || "/tmp";
+process.env.PATH = `${join(home, ".cargo", "bin")}:/usr/local/bin:/opt/homebrew/bin:${process.env.PATH || ""}`;
+process.env.npm_config_cache = join(home, ".cua-pi", "npm-cache");
 
-const piRoot =
-  process.platform === "win32"
-    ? join(process.env.ProgramData || "C:\\ProgramData", "npm", "node_modules")
-    : "/usr/local/lib/node_modules";
-const pi = await import(
-  pathToFileURL(
-    join(piRoot, "@earendil-works", "pi-coding-agent", "dist", "index.js"),
-  ).href
-);
-
-// stdout is the protocol. Diagnostics belong on stderr.
+const protocolOut = process.stdout;
 console.log = (...values) => console.error(...values);
 console.info = (...values) => console.error(...values);
 console.warn = (...values) => console.error(...values);
 
-export async function createToolHost({ cwd, agentDir, encodedManifest }) {
-  if (!cwd || !agentDir || !encodedManifest) {
-    throw new Error("tool host requires cwd, agent directory, and manifest");
-  }
-  process.env.PI_CODING_AGENT_DIR = agentDir;
-  const decodedManifest = JSON.parse(
-    Buffer.from(encodedManifest, "base64").toString("utf8"),
+export async function createToolHost({ cwd, agentDir, piRoot, encodedManifest }) {
+  if (!cwd || !agentDir || !piRoot || !encodedManifest)
+    throw new Error("tool host requires cwd, agent directory, Pi root, and manifest");
+  const pi = await import(
+    pathToFileURL(join(piRoot, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "index.js")).href
   );
-  const tools = decodedManifest?.tools;
-  const runtimeDigest = decodedManifest?.runtimeDigest;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  const manifest = JSON.parse(Buffer.from(encodedManifest, "base64").toString("utf8"));
   if (
-    !Array.isArray(tools) ||
-    tools.some((name) => typeof name !== "string") ||
-    typeof runtimeDigest !== "string" ||
-    !/^[0-9a-f]{20}$/.test(runtimeDigest)
-  ) {
+    !Array.isArray(manifest?.tools) ||
+    manifest.tools.some((name) => typeof name !== "string") ||
+    typeof manifest.runtimeDigest !== "string" ||
+    !/^[0-9a-f]{20}$/.test(manifest.runtimeDigest)
+  )
     throw new Error("tool host received an invalid execution manifest");
-  }
-  const requiredTools = new Set(tools);
-  const createRuntime = async ({ cwd, sessionManager, sessionStartEvent }) => {
-    const services = await pi.createAgentSessionServices({ cwd, agentDir });
-    return {
-      ...(await pi.createAgentSessionFromServices({
+  const runtime = await pi.createAgentSessionRuntime(
+    async ({ cwd, sessionManager, sessionStartEvent }) => {
+      const services = await pi.createAgentSessionServices({ cwd, agentDir });
+      return {
+        ...(await pi.createAgentSessionFromServices({ services, sessionManager, sessionStartEvent })),
         services,
-        sessionManager,
-        sessionStartEvent,
-      })),
-      services,
-      diagnostics: services.diagnostics,
-    };
-  };
-  const runtime = await pi.createAgentSessionRuntime(createRuntime, {
-    cwd,
-    agentDir,
-    sessionManager: pi.SessionManager.inMemory(cwd),
-  });
+        diagnostics: services.diagnostics,
+      };
+    },
+    { cwd, agentDir, sessionManager: pi.SessionManager.inMemory(cwd) },
+  );
   const session = runtime.session;
   try {
     await session.bindExtensions({ mode: "rpc" });
@@ -80,35 +53,25 @@ export async function createToolHost({ cwd, agentDir, encodedManifest }) {
     throw error;
   }
   session.setActiveToolsByName(session.getAllTools().map((tool) => tool.name));
-  const availableTools = new Set(
-    session.getAllTools().map((tool) => tool.name),
-  );
-  const missingTools = [...requiredTools].filter(
-    (name) => !availableTools.has(name),
-  );
-  if (missingTools.length > 0) {
+  const available = new Set(session.getAllTools().map((tool) => tool.name));
+  const missing = manifest.tools.filter((name) => !available.has(name));
+  if (missing.length > 0) {
     await runtime.dispose();
-    const diagnostics = runtime.diagnostics
-      .map((item) => item.message)
-      .filter(Boolean)
-      .join("; ");
-    const error = new Error(
-      `remote tool host is missing: ${missingTools.join(", ")}${diagnostics ? `; diagnostics: ${diagnostics}` : ""}`,
-    );
-    error.code = "ERR_CUA_MISSING_TOOLS";
-    throw error;
+    const diagnostics = runtime.diagnostics.map((item) => item.message).filter(Boolean).join("; ");
+    throw new Error(`remote tool host is missing: ${missing.join(", ")}${diagnostics ? `; diagnostics: ${diagnostics}` : ""}`);
   }
 
-  const tool = (name) =>
-    session.agent.state.tools.find((candidate) => candidate.name === name);
-  const manifest = () =>
-    session.getAllTools().map((item) => {
+  const tool = (name) => session.agent.state.tools.find((candidate) => candidate.name === name);
+  const describe = () => ({
+    type: "ready",
+    protocol: protocolVersion,
+    runtimeDigest: manifest.runtimeDigest,
+    tools: session.getAllTools().map((item) => {
       const definition = session.getToolDefinition(item.name);
-      const active = tool(item.name);
       return {
         name: item.name,
         sourceInfo: item.sourceInfo,
-        label: active?.label ?? item.name,
+        label: tool(item.name)?.label ?? item.name,
         description: definition?.description ?? item.description,
         promptSnippet: definition?.promptSnippet,
         promptGuidelines: definition?.promptGuidelines,
@@ -117,326 +80,149 @@ export async function createToolHost({ cwd, agentDir, encodedManifest }) {
         renderShell: definition?.renderShell,
         executionMode: definition?.executionMode,
       };
-    });
+    }),
+  });
 
-  let activeDetach;
-  let disposed = false;
+  const controllers = new Map();
 
-  async function attach({ input, output, initialInput = Buffer.alloc(0) }) {
-    if (disposed) throw new Error("remote tool host is disposed");
-    if (activeDetach) throw new Error("remote tool host is already attached");
-
-    const controllers = new Map();
-    const children = new Map();
-    const inflight = new Set();
-    const write = (message) => {
-      if (output.writable) output.write(`${JSON.stringify(message)}\n`);
-    };
-
-    async function execute(request) {
-      const selected = tool(request.tool);
-      if (!selected) {
-        write({
-          type: "error",
-          id: request.id,
-          error: `remote tool not found: ${request.tool}`,
-        });
-        return;
-      }
-      const controller = new AbortController();
-      controllers.set(request.id, controller);
-      try {
-        const prepared = selected.prepareArguments
-          ? selected.prepareArguments(request.input)
-          : request.input;
-        const result = await selected.execute(
-          request.id,
-          prepared,
-          controller.signal,
-          (update) => write({ type: "update", id: request.id, update }),
-        );
-        write({ type: "result", id: request.id, result });
-      } catch (error) {
-        write({
-          type: "error",
-          id: request.id,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      } finally {
-        controllers.delete(request.id);
-      }
+  async function execute(request, write) {
+    const selected = tool(request.tool);
+    if (!selected) return write({ type: "error", id: request.id, error: `remote tool not found: ${request.tool}` });
+    const controller = new AbortController();
+    controllers.set(request.id, controller);
+    try {
+      const prepared = selected.prepareArguments ? selected.prepareArguments(request.input) : request.input;
+      const result = await selected.execute(request.id, prepared, controller.signal, (update) =>
+        write({ type: "update", id: request.id, update }),
+      );
+      write({ type: "result", id: request.id, result });
+    } catch (error) {
+      write({ type: "error", id: request.id, error: error instanceof Error ? error.message : String(error) });
+    } finally {
+      controllers.delete(request.id);
     }
+  }
 
-    function killChildTree(child) {
-      if (!child.pid) return;
-      if (process.platform === "win32") {
-        const killer = spawn(
-          "taskkill.exe",
-          ["/PID", String(child.pid), "/T", "/F"],
-          { stdio: "ignore", windowsHide: true },
-        );
-        killer.unref();
-        return;
-      }
+  function bash(request, write) {
+    const controller = new AbortController();
+    controllers.set(request.id, controller);
+    const child = spawn("/bin/bash", ["-lc", request.command], { cwd, stdio: ["ignore", "pipe", "pipe"], detached: true });
+    const kill = () => {
       try {
         process.kill(-child.pid, "SIGKILL");
       } catch {
         child.kill("SIGKILL");
       }
-    }
-
-    function bash(request) {
-      const controller = new AbortController();
-      controllers.set(request.id, controller);
-      const windows = process.platform === "win32";
-      const command = windows
-        ? ["powershell.exe", ["-NoProfile", "-Command", request.command]]
-        : ["/bin/bash", ["-lc", request.command]];
-      const child = spawn(command[0], command[1], {
-        cwd,
-        stdio: ["ignore", "pipe", "pipe"],
-        detached: !windows,
+    };
+    controller.signal.addEventListener("abort", kill, { once: true });
+    let timedOut = false;
+    const timer = request.timeout
+      ? setTimeout(() => {
+          timedOut = true;
+          kill();
+        }, request.timeout * 1000)
+      : undefined;
+    const update = (data) => write({ type: "bash_update", id: request.id, data: Buffer.from(data).toString("base64") });
+    child.stdout.on("data", update);
+    child.stderr.on("data", update);
+    return new Promise((resolve) => {
+      let spawnError;
+      child.on("error", (error) => {
+        spawnError = error;
       });
-      children.set(request.id, child);
-      let timedOut = false;
-      const timer = request.timeout
-        ? setTimeout(() => {
-            timedOut = true;
-            killChildTree(child);
-          }, request.timeout * 1000)
-        : undefined;
-      const update = (data) =>
-        write({
-          type: "bash_update",
-          id: request.id,
-          data: Buffer.from(data).toString("base64"),
-        });
-      child.stdout.on("data", update);
-      child.stderr.on("data", update);
-      return new Promise((resolve) => {
-        let spawnError;
-        child.on("error", (error) => {
-          spawnError = error;
-        });
-        child.on("close", (code) => {
-          if (timer) clearTimeout(timer);
-          controllers.delete(request.id);
-          children.delete(request.id);
-          if (spawnError) {
-            write({ type: "error", id: request.id, error: spawnError.message });
-          } else {
-            write({
-              type: "bash_result",
-              id: request.id,
-              exitCode: code,
-              timedOut,
-              aborted: controller.signal.aborted,
-            });
-          }
-          resolve();
-        });
+      child.on("close", (code, signal) => {
+        if (timer) clearTimeout(timer);
+        controllers.delete(request.id);
+        if (spawnError) write({ type: "error", id: request.id, error: spawnError.message });
+        else
+          write({
+            type: "bash_result",
+            id: request.id,
+            exitCode: code ?? (signal ? 128 + (constants.signals[signal] ?? 0) : 1),
+            timedOut,
+            aborted: controller.signal.aborted,
+          });
+        resolve();
       });
-      controller.signal.addEventListener("abort", () => killChildTree(child), {
-        once: true,
-      });
-    }
-
-    let detached = false;
-    let disposeRequested = false;
-    let resolveDetached;
-    const closed = new Promise((resolve) => {
-      resolveDetached = resolve;
     });
-    const detach = () => {
-      if (detached) return;
-      detached = true;
-      input.off("data", onData);
+  }
+
+  return {
+    describe,
+    execute,
+    bash,
+    cancel: (id) => controllers.get(id)?.abort(),
+    dispose: async () => {
       for (const controller of controllers.values()) controller.abort();
-      resolveDetached();
-    };
-    activeDetach = detach;
+      await runtime.dispose();
+    },
+  };
+}
 
-    function handle(request) {
-      if (
-        !request ||
-        typeof request !== "object" ||
-        typeof request.type !== "string"
-      )
-        return;
-      if (
-        request.type === "execute" &&
-        typeof request.id === "string" &&
-        typeof request.tool === "string"
-      ) {
-        const operation = execute(request);
-        inflight.add(operation);
-        void operation.finally(() => inflight.delete(operation));
-        return;
-      }
-      if (
-        request.type === "bash" &&
-        typeof request.id === "string" &&
-        typeof request.command === "string" &&
-        (request.timeout === undefined ||
-          (typeof request.timeout === "number" && request.timeout > 0))
-      ) {
-        const operation = bash(request);
-        inflight.add(operation);
-        void operation.finally(() => inflight.delete(operation));
-        return;
-      }
-      if (request.type === "cancel" && typeof request.id === "string") {
-        controllers.get(request.id)?.abort();
-        const child = children.get(request.id);
-        if (child) killChildTree(child);
-        return;
-      }
-      if (request.type === "detach" || request.type === "shutdown") {
-        disposeRequested = request.type === "shutdown";
-        detach();
-        return;
-      }
-      write({ type: "protocol_error", error: "invalid protocol request" });
-    }
-
-    const decoder = new StringDecoder("utf8");
-    let buffer = Buffer.from(initialInput).toString("utf8");
-    const onData = (chunk) => {
+export async function serve(options, input = process.stdin, output = protocolOut) {
+  const write = (message) => {
+    if (output.writable) output.write(`${JSON.stringify(message)}\n`);
+  };
+  let host;
+  try {
+    host = await createToolHost(options);
+  } catch (error) {
+    write({ type: "open_error", error: error instanceof Error ? error.message : String(error) });
+    return;
+  }
+  const inflight = new Set();
+  const track = (operation) => {
+    inflight.add(operation);
+    void operation.finally(() => inflight.delete(operation));
+  };
+  write(host.describe());
+  const decoder = new StringDecoder("utf8");
+  let buffer = "";
+  await new Promise((done) => {
+    input.on("data", (chunk) => {
       buffer += decoder.write(chunk);
-      if (buffer.length > maxProtocolLine && !buffer.includes("\n")) {
-        write({
-          type: "protocol_error",
-          error: "protocol line limit exceeded",
-        });
-        detach();
+      if (buffer.length > maxLine && !buffer.includes("\n")) {
+        write({ type: "protocol_error", error: "protocol line limit exceeded" });
+        done();
         return;
       }
-      for (;;) {
-        const index = buffer.indexOf("\n");
-        if (index < 0) break;
-        const line = buffer.slice(0, index).replace(/\r$/, "");
+      for (let index = buffer.indexOf("\n"); index >= 0; index = buffer.indexOf("\n")) {
+        const line = buffer.slice(0, index);
         buffer = buffer.slice(index + 1);
-        if (!line) continue;
-        if (line.length > maxProtocolLine) {
-          write({
-            type: "protocol_error",
-            error: "protocol line limit exceeded",
-          });
-          detach();
-          return;
-        }
+        if (!line.trim()) continue;
+        let request;
         try {
-          handle(JSON.parse(line));
+          request = JSON.parse(line);
         } catch (error) {
-          write({
-            type: "protocol_error",
-            error: error instanceof Error ? error.message : String(error),
-          });
+          write({ type: "protocol_error", error: error instanceof Error ? error.message : String(error) });
+          continue;
         }
+        if (request?.type === "execute" && typeof request.id === "string" && typeof request.tool === "string")
+          track(host.execute(request, write));
+        else if (
+          request?.type === "bash" &&
+          typeof request.id === "string" &&
+          typeof request.command === "string" &&
+          (request.timeout === undefined || (typeof request.timeout === "number" && request.timeout > 0))
+        )
+          track(host.bash(request, write));
+        else if (request?.type === "cancel" && typeof request.id === "string") host.cancel(request.id);
+        else write({ type: "protocol_error", error: "invalid protocol request" });
       }
-    };
-
-    input.on("data", onData);
-    input.once("end", detach);
-    input.once("close", detach);
-    input.once("error", detach);
-    write({
-      type: "ready",
-      protocol: protocolVersion,
-      runtimeDigest,
-      tools: manifest(),
     });
-    onData(Buffer.alloc(0));
-    input.resume?.();
-    await closed;
-    await Promise.allSettled([...inflight]);
-    if (activeDetach === detach) activeDetach = undefined;
-    return { disposeRequested };
-  }
-
-  async function dispose() {
-    if (disposed) return;
-    disposed = true;
-    activeDetach?.();
-    await runtime.dispose();
-  }
-
-  return { attach, dispose };
+    input.once("end", done);
+    input.once("close", done);
+  });
+  await host.dispose();
+  await Promise.allSettled([...inflight]);
 }
 
 const invokedDirectly =
-  process.argv[1] &&
-  resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+  process.argv[1] && realpathSync(resolve(process.argv[1])) === realpathSync(fileURLToPath(import.meta.url));
 if (invokedDirectly) {
-  const cwd = process.argv[2];
-  const agentDir = process.argv[3];
-  const encodedManifest = process.argv[4];
-  if (!cwd || !agentDir || !encodedManifest) {
-    throw new Error(
-      "usage: cua-pi-tool-host <cwd> <agent-dir> <execution-manifest-base64>",
-    );
-  }
-  if (process.send) {
-    let host;
-    process.on("disconnect", () => {
-      void Promise.resolve(host?.dispose()).finally(() => process.exit(0));
-    });
-    try {
-      host = await createToolHost({ cwd, agentDir, encodedManifest });
-      let input;
-      process.on("message", (message) => {
-        if (message.type === "attach") {
-          if (input) {
-            process.send({ type: "failure", error: "host already attached" });
-            return;
-          }
-          input = new PassThrough();
-          const output = new Writable({
-            write(chunk, _encoding, callback) {
-              process.send(
-                { type: "data", data: chunk.toString("base64") },
-                callback,
-              );
-            },
-          });
-          void host
-            .attach({
-              input,
-              output,
-              initialInput: Buffer.from(message.initialInput, "base64"),
-            })
-            .then(
-              (result) => {
-                input = undefined;
-                output.end();
-                process.send({ type: "detached", result });
-              },
-              (error) => {
-                input = undefined;
-                output.end();
-                process.send({
-                  type: "failure",
-                  error: error.message,
-                  code: error.code,
-                });
-              },
-            );
-        } else if (message.type === "input")
-          input?.write(Buffer.from(message.data, "base64"));
-        else if (message.type === "end") input?.end();
-        else if (message.type === "dispose")
-          void host.dispose().finally(() => process.exit(0));
-      });
-      process.send({ type: "initialized" });
-    } catch (error) {
-      process.send(
-        { type: "failure", error: error.message, code: error.code },
-        () => process.exit(1),
-      );
-    }
-  } else {
-    const host = await createToolHost({ cwd, agentDir, encodedManifest });
-    await host.attach({ input: process.stdin, output: process.stdout });
-    await host.dispose();
-  }
+  const [, , cwd, agentDir, piRoot, encodedManifest] = process.argv;
+  if (!cwd || !agentDir || !piRoot || !encodedManifest)
+    throw new Error("usage: cua-tool-host <cwd> <agent-dir> <pi-root> <manifest-base64>");
+  await serve({ cwd, agentDir, piRoot, encodedManifest });
+  process.exit(0);
 }

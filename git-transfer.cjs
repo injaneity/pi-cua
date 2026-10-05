@@ -305,6 +305,28 @@ if (action === "inventory") {
       revisions.join("\n") + "\n",
     ),
   );
+} else if (action === "tree") {
+  json({ tree: snapshot() });
+} else if (action === "diff") {
+  process.stdout.write(
+    git(
+      ["diff", "--binary", "--full-index", oid(options.from), oid(options.to), "--"],
+      undefined,
+      options.root,
+      600000,
+    ),
+  );
+} else if (action === "numstat") {
+  let additions = 0;
+  let deletions = 0;
+  for (const line of git(["diff", "--numstat", oid(options.from), oid(options.to), "--"])
+    .toString()
+    .split("\n")) {
+    const [added, deleted] = line.split("\t");
+    if (/^\d+$/.test(added ?? "")) additions += Number(added);
+    if (/^\d+$/.test(deleted ?? "")) deletions += Number(deleted);
+  }
+  json({ additions, deletions });
 } else if (action === "cleanup") {
   const path = require("node:path");
   const expected = path.resolve(options.expectedRoot);
