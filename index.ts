@@ -544,18 +544,17 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
     await ctx.reload();
   }
 
-  async function search(ctx: UIContext, options: Array<{ value: string; label: string; description?: string; create?: boolean }>): Promise<string | undefined> {
+  async function search(ctx: UIContext, options: Array<{ value: string; label: string; description?: string }>): Promise<string | undefined> {
     const input =
       ctx.mode === "tui"
         ? await ctx.ui.custom<string | null>((tui, theme, _keybindings, done) => {
-            const createLabels = options.filter((option) => option.create).map((option) => option.label);
-            const row = (text: string, colour: "accent" | "mdHeading") => {
+            const row = (text: string) => {
               const columns = text.match(/^(.*\S)(\s{2,})(\S.*)$/);
-              return columns ? theme.fg(colour, columns[1]!) + theme.fg("muted", columns[2]! + columns[3]!) : theme.fg(colour, text);
+              return columns ? theme.fg("accent", columns[1]!) + theme.fg("muted", columns[2]! + columns[3]!) : theme.fg("accent", text);
             };
             const listTheme = {
               selectedPrefix: (text: string) => theme.fg("accent", text),
-              selectedText: (text: string) => row(text, createLabels.some((value) => text.includes(value)) ? "mdHeading" : "accent"),
+              selectedText: row,
               description: (text: string) => theme.fg("muted", text),
               scrollInfo: (text: string) => theme.fg("muted", text),
               noMatch: (text: string) => theme.fg("muted", text),
