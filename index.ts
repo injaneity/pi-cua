@@ -14,7 +14,6 @@ import {
   VERSION,
   type WriteToolInput,
 } from "@earendil-works/pi-coding-agent";
-import { StringEnum } from "@earendil-works/pi-ai";
 import { Editor, Key, matchesKey, SelectList, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { spawnSync } from "node:child_process";
@@ -43,7 +42,7 @@ import {
 
 const extensionDir = dirname(fileURLToPath(import.meta.url));
 const placementEntry = "cua-space-placement";
-const localTools = new Set(["enter_space", "report_papercut", "web_search"]);
+const localTools = new Set(["space", "report_papercut", "web_search"]);
 
 type SpacePlace = {
   kind: "space";
@@ -566,16 +565,16 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
     }
   }
 
-  async function deleteSpace(name: string, ctx: UIContext): Promise<void> {
+  async function deleteSpace(name: string, ctx: UIContext): Promise<string> {
     const item = (await listSpaces(ctx.signal)).find((candidate) => candidate.name === name || candidate.id === name);
     if (!item) throw new Error(`unknown Space: ${name}`);
     if (target.kind === "space" && target.spaceId === item.id)
       throw new Error(`move this session off ${item.name} with /space local before deleting it`);
     if (!ctx.hasUI || !(await ctx.ui.confirm(`delete ${item.name}?`, "this permanently removes the Space and its files.")))
-      return;
+      return "deletion was declined";
     await spaces().remove(item.id, ctx.signal);
     void listSpaces().catch(() => undefined);
-    ctx.ui.notify(`deleted ${item.name}`, "info");
+    return `deleted ${item.name}`;
   }
 
   async function search(ctx: UIContext, options: Array<{ value: string; label: string; description?: string; create?: boolean }>): Promise<string | undefined> {
@@ -635,43 +634,77 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
     return input === undefined || input === null ? undefined : input.trim();
   }
 
-  async function pick(ctx: UIContext): Promise<SpaceItem | "local" | undefined> {
-    if (!ctx.hasUI) return undefined;
-    let items = await listSpaces(ctx.signal);
-    if (!items.length) {
-      const who = await spaces().signIn(
-        (url, code) => ctx.ui.notify(`sign in to Cua: open ${url}${code ? ` and enter ${code}` : ""}`, "info"),
-        ctx.signal,
-      );
-      if (who) {
-        ctx.ui.notify(`signed in as ${who}`, "info");
-        items = await listSpaces(ctx.signal);
-      }
-    }
+  function describe(item: SpaceItem): string {
+    const status = !item.online
+      ? `offline${item.reason ? `: ${item.reason.slice(0, 80)}` : ""}`
+      : target.kind === "space" && target.spaceId === item.id
+        ? "current"
+        : "online";
+    return `${item.os || "unknown"} • ${item.provider} • ${status}`;
+  }
+
+  async function available(ctx: UIContext): Promise<SpaceItem[]> {
+    const items = await listSpaces(ctx.signal);
+    if (items.length || !ctx.hasUI) return items;
+    const who = await spaces().signIn(
+      (url, code) => ctx.ui.notify(`sign in to Cua: open ${url}${code ? ` and enter ${code}` : ""}`, "info"),
+      ctx.signal,
+    );
+    if (!who) return items;
+    ctx.ui.notify(`signed in as ${who}`, "info");
+    return listSpaces(ctx.signal);
+  }
+
+  async function pick(ctx: UIContext): Promise<string | undefined> {
+    const items = await available(ctx);
     const options = [
-      ...(target.kind === "space"
-        ? [{ value: "local", label: target.workspaceState ? "sync back to local directory" : "return to local execution" }]
-        : []),
-      ...items.map((item) => ({
-        value: item.id,
-        label: item.name,
-        description: `${item.os || "unknown"} • ${item.provider} • ${
-          !item.online
-            ? `offline${item.reason ? `: ${item.reason.slice(0, 80)}` : ""}`
-            : target.kind === "space" && target.spaceId === item.id
-              ? "current; reconnect"
-              : "online"
-        }`,
-      })),
+      ...(target.kind === "space" ? [{ value: "local", label: target.workspaceState ? "sync back to local directory" : "return to local execution" }] : []),
+      ...items.map((item) => ({ value: item.id, label: item.name, description: describe(item) })),
     ];
     if (!options.length) throw new Error("your Cua account has no Spaces; add a machine from the Cua Spaces app or use /space create");
-    const value = await search(ctx, options);
-    if (!value) return undefined;
-    if (value === "local") return "local";
-    const item = items.find((candidate) => candidate.id === value || candidate.name === value);
+    return search(ctx, options);
+  }
+
+  async function space(argument: string, ctx: UIContext): Promise<string | undefined> {
+    const value = argument.trim();
+    if (!value) {
+      const items = await available(ctx);
+      return items.length
+        ? items.map((item) => `${item.name}\t${describe(item)}`).join("\n")
+        : "no Spaces are available; the user can sign in or add one with /space";
+    }
+    if (value === "local") {
+      if (target.kind !== "space") return "already running locally";
+      if (!("reload" in ctx)) {
+        pi.sendUserMessage("/space local", { expandPromptTemplates: true, deliverAs: "followUp" });
+        return "returning to local execution once this turn ends";
+      }
+      await enterLocal(ctx);
+      return undefined;
+    }
+    if (value === "create" || value.startsWith("create ")) {
+      const created = await createSpace(value.slice("create".length).trim(), ctx);
+      if (!created) return "creation was declined";
+      await enter(created, ctx);
+      return entered(created);
+    }
+    if (value === "delete" || value.startsWith("delete ")) {
+      const name = value.slice("delete".length).trim();
+      if (!name) throw new Error("usage: /space delete <name>");
+      return deleteSpace(name, ctx);
+    }
+    const item = (await listSpaces(ctx.signal)).find((candidate) => candidate.name === value || candidate.id === value);
     if (!item) throw new Error(`unknown Space: ${value}`);
     if (!item.online) throw new Error(`${item.name} is offline`);
-    return item;
+    if (!(target.kind === "space" && target.spaceId === item.id && attachment)) await enter(item, ctx);
+    return entered(item);
+  }
+
+  function entered(item: SpaceItem): string {
+    const warnings = attachment?.runtime.warnings ?? [];
+    return `execution environment: ${item.name} (${attachment?.place.os ?? item.os}). Subsequent tools run there.${
+      warnings.length ? `\nPi configuration transfer notes:\n${warnings.join("\n")}` : ""
+    }`;
   }
 
   async function refreshDiff(): Promise<void> {
@@ -692,89 +725,37 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
     }
   }
 
+  const usage = "<name> enters a Space · local returns · create [name] [cpus memory_mb] · delete <name> · nothing lists Spaces";
+
   pi.registerTool({
-    name: "enter_space",
-    label: "Enter Space",
-    description:
-      "Move this session's tool execution to an existing Cua Space, by name or OS. Call with no arguments to list Spaces. Never creates Spaces or returns to local execution.",
-    promptGuidelines: [
-      "Call enter_space alone in its tool batch. Creating or deleting Spaces and returning to local execution are user actions (/space).",
-    ],
-    parameters: Type.Object({
-      name: Type.Optional(Type.String({ description: "Space name, such as mac-studio" })),
-      os: Type.Optional(StringEnum(["linux", "macos"] as const)),
-    }),
+    name: "space",
+    label: "Space",
+    description: `Choose where this session's tools run, with the same arguments as /space: ${usage}. Creating and deleting ask the user to confirm.`,
+    promptGuidelines: ["Call space alone in its tool batch."],
+    parameters: Type.Object({ argument: Type.Optional(Type.String({ description: usage })) }),
     executionMode: "sequential",
     async execute(_id, input, signal, _onUpdate, ctx) {
       const context = Object.create(ctx, { signal: { value: signal ?? ctx.signal } }) as UIContext;
-      const items = await listSpaces(context.signal);
-      if (!input.name && !input.os)
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: items.length
-                ? items.map((item) => `${item.name}\t${item.os || "unknown"}\t${item.online ? "online" : "offline"}${target.kind === "space" && target.spaceId === item.id ? "\tcurrent" : ""}`).join("\n")
-                : "no Spaces are available; ask the user to run /space to sign in to Cua or add one",
-            },
-          ],
-          details: { spaces: items },
-        };
-      const candidates = items
-        .filter((item) => item.online && (!input.name || item.name === input.name) && (!input.os || item.os === input.os))
-        .sort((a, b) => a.name.localeCompare(b.name));
-      const selected = candidates.find((item) => target.kind === "space" && item.id === target.spaceId) ?? candidates[0];
-      if (!selected)
-        throw new Error(`no online Space matches${input.name ? ` name=${input.name}` : ""}${input.os ? ` os=${input.os}` : ""}; no Space was created`);
-      if (!(target.kind === "space" && target.spaceId === selected.id && attachment)) await enter(selected, context);
-      const warnings = attachment?.runtime.warnings ?? [];
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `execution environment: ${selected.name} (${selected.os}). Subsequent tools run there. The user returns to local execution with /space local.${warnings.length ? `\nPi configuration transfer notes:\n${warnings.join("\n")}` : ""}`,
-          },
-        ],
-        details: { name: selected.name, os: selected.os },
-      };
+      const text = (await space(input.argument ?? "", context)) ?? "done";
+      return { content: [{ type: "text" as const, text }], details: { argument: input.argument ?? "" } };
     },
   });
 
   pi.on("message_end", (event) => {
     if (event.message.role !== "assistant") return;
     const calls = event.message.content.filter((item) => item.type === "toolCall");
-    mixedBatch = calls.length > 1 && calls.some((item) => item.type === "toolCall" && item.name === "enter_space");
+    mixedBatch = calls.length > 1 && calls.some((item) => item.type === "toolCall" && item.name === "space");
   });
 
   pi.registerCommand("space", {
-    description: "Choose, create or delete the Cua Space this session executes in",
+    description: `Choose where this session's tools run: ${usage}`,
     handler: async (args, ctx) => {
       try {
         await ctx.waitForIdle();
-        const value = args.trim();
-        if (value.startsWith("create")) {
-          const created = await createSpace(value.slice("create".length).trim(), ctx);
-          if (created) await enter(created, ctx);
-          return;
-        }
-        if (value.startsWith("delete")) {
-          const name = value.slice("delete".length).trim();
-          if (!name) throw new Error("usage: /space delete <name>");
-          await deleteSpace(name, ctx);
-          return;
-        }
-        let choice: SpaceItem | "local" | undefined;
-        if (!value) choice = await pick(ctx);
-        else if (value === "local") choice = "local";
-        else {
-          const item = (await listSpaces(ctx.signal)).find((candidate) => candidate.name === value || candidate.id === value);
-          if (!item) throw new Error(`unknown Space: ${value}`);
-          if (!item.online) throw new Error(`${item.name} is offline`);
-          choice = item;
-        }
-        if (!choice) return;
-        if (choice === "local") await enterLocal(ctx);
-        else await enter(choice, ctx);
+        const value = args.trim() || (ctx.hasUI ? await pick(ctx) : "");
+        if (value === undefined) return;
+        const text = await space(value, ctx);
+        if (text && !closed) ctx.ui.notify(text, "info");
       } catch (error) {
         if (!closed) ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
       }
@@ -836,7 +817,7 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
 
   pi.on("tool_call", (event) => {
     if (mixedBatch)
-      return { block: true, reason: "enter_space must be the only tool call in its batch; no tools dispatched" };
+      return { block: true, reason: "space must be the only tool call in its batch; no tools dispatched" };
     if (entering) return { block: true, reason: "a Space entry is in progress; no tool dispatched" };
     if (target.kind !== "space" || localTools.has(event.toolName)) return;
     const reason = routes().unavailable.get(event.toolName);

@@ -12,16 +12,17 @@ A Space needs `node` 22+, `npm` and `git`. pi-cua checks for them on first entry
 
 ## use
 
-| action | how |
-|---|---|
-| choose a Space, reconnect, or go back to local | `/space` |
-| enter a Space by name | `/space mac-studio` |
-| bring the work back into your checkout | `/space local` |
-| create a Space on this machine and enter it | `/space create [name] [cpus memory_mb]` |
-| delete a Space | `/space delete <name>` |
-| let the agent move itself | the `enter_space` tool (no arguments lists Spaces) |
+`/space` and the agent's `space` tool take the same argument:
 
-The agent can only enter Spaces that already exist. Creating, deleting and returning to local are user actions. Resume never substitutes a different machine: if the saved Space is gone or reports a different machine identity, pi stops and asks you to choose.
+| argument | does |
+|---|---|
+| _(none)_ | lists Spaces; `/space` opens a picker |
+| `<name>` | enters that Space |
+| `local` | brings the work back into your checkout and runs locally again |
+| `create [name] [cpus memory_mb]` | creates a Space on this machine and enters it |
+| `delete <name>` | deletes a Space |
+
+Creating and deleting always ask you to confirm, whoever asks. Resume never substitutes a different machine: if the saved Space is gone or reports a different machine identity, pi stops and asks you to choose.
 
 ## what entering does
 
@@ -32,7 +33,7 @@ enter(space)
   3. route     tools → the Space, save placement, retire the previous place
 ```
 
-- **pi runtime.** `~/.cua-pi/pi/<version>` holds the exact pi version you run locally. `~/.cua-pi/runtimes/<hash>` holds your portable configuration (settings, skills, prompts, themes) and the extension packages your tools come from. The hash covers every file, so an unchanged setup is reused. Credentials, `auth.json`, env files, private keys and absolute-path settings stay local; transfer notes are listed when you enter.
+- **pi runtime.** `~/.cua-pi/pi/<version>` holds the exact pi version you run locally. `~/.cua-pi/runtimes/<hash>` holds your portable configuration (settings, skills, prompts, themes) and the extension packages your tools come from. The hash covers every file, so an unchanged setup is reused. Package install scripts are skipped on the Space, so a package's own setup runs on first use instead of blocking entry. Credentials, `auth.json`, env files, private keys and absolute-path settings stay local; transfer notes are listed when you enter.
 - **workspace.** For a Git repository with a network `origin`, pi-cua copies your working tree, including uncommitted and untracked files, into `~/.cua-pi/work/<execution>`. It sends only the Git objects the Space is missing and verifies the full tree before use. If the Space cannot reach `origin`, it starts from a commit snapshot instead. Moving between Spaces transfers objects through your machine; `/space local` applies one tree diff to your checkout, merging non-conflicting local edits. The source workspace is removed only after the destination has verified its copy. Directories outside Git get a separate empty execution directory and are not synchronized.
 - **tool host.** One headless pi per session runs on the Space as a spacesd process, speaking JSON lines over its stdin and stdout. Tool output streams back as it is produced, cancelling kills the command on the Space, and closing pi stops the host. It has no model or conversation.
 

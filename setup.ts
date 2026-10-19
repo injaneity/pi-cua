@@ -128,7 +128,7 @@ trap 'rm -rf "$staging"' EXIT
 rm -rf "$staging"
 mkdir -p "$staging"
 node -e ${sh(extractScript)} "$staging"
-PI_CODING_AGENT_DIR="$staging/agent" npm_config_cache=${sh(paths.npmCache)} npm_config_omit=dev npm_config_legacy_peer_deps=true node ${sh(`${piRoot}/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js`)} update --extensions --no-approve >&2
+PI_CODING_AGENT_DIR="$staging/agent" npm_config_cache=${sh(paths.npmCache)} npm_config_omit=dev npm_config_legacy_peer_deps=true npm_config_ignore_scripts=true node ${sh(`${piRoot}/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js`)} update --extensions --no-approve >&2
 CUA_RUNTIME_STAGE="$staging" CUA_PI_ROOT=${sh(piRoot)} node --input-type=module -e ${sh(validation)} >&2
 printf '%s\\n' ${sh(runtime.hash)} > "$staging/complete"
 ${publish.trim()} "$staging" "$root"`,
