@@ -33,7 +33,6 @@ export type ProcessHandle = {
 };
 
 export type CreateOptions = {
-  on: "local" | "cloud";
   name?: string;
   cpus?: number;
   memoryMb?: number;
@@ -50,6 +49,7 @@ export interface SpacesClient {
   killTag(spaceId: string, tag: string, signal?: AbortSignal): Promise<void>;
   create(options: CreateOptions, signal?: AbortSignal): Promise<SpaceItem>;
   remove(spaceId: string, signal?: AbortSignal): Promise<void>;
+  signIn(show: (url: string, code?: string) => void, signal?: AbortSignal): Promise<string | undefined>;
   close(): void;
 }
 
@@ -212,6 +212,13 @@ export class WorkerSpacesClient implements SpacesClient {
 
   async remove(spaceId: string, signal?: AbortSignal): Promise<void> {
     await this.call("delete", [spaceId], signal);
+  }
+
+  async signIn(show: (url: string, code?: string) => void, signal?: AbortSignal): Promise<string | undefined> {
+    if (await this.call<boolean>("signedIn", [], signal)) return undefined;
+    const { url, code } = await this.call<{ url: string; code?: string }>("beginLogin", [], signal);
+    show(url, code);
+    return this.call("finishLogin", [], signal);
   }
 
   close(): void {

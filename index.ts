@@ -545,22 +545,19 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
   }
 
   async function createSpace(args: string, ctx: UIContext): Promise<SpaceItem | undefined> {
-    const match = args.match(/^(local|cloud)(?:\s+([a-z0-9][a-z0-9-]*))?(?:\s+([1-9]\d*)\s+([1-9]\d*))?$/);
-    if (!match) throw new Error("usage: /space create <local|cloud> [name] [cpus memory_mb]");
-    const [, on, name, cpus, memory] = match;
+    const match = args.match(/^([a-z0-9][a-z0-9-]*)?(?:\s*([1-9]\d*)\s+([1-9]\d*))?$/);
+    if (!match) throw new Error("usage: /space create [name] [cpus memory_mb]");
+    const [, name, cpus, memory] = match;
     if (!ctx.hasUI) throw new Error("creating a Space needs an interactive session");
     const confirmed = await ctx.ui.confirm(
-      `create a ${on} Space${name ? ` named ${name}` : ""}?`,
-      [
-        cpus ? `${cpus} CPUs and ${memory} MiB of memory.` : "default resources.",
-        on === "cloud" ? "this incurs cost." : "this runs on this machine.",
-      ].join("\n"),
+      `create a Space${name ? ` named ${name}` : ""} on this machine?`,
+      cpus ? `${cpus} CPUs and ${memory} MiB of memory.` : "default resources.",
     );
     if (!confirmed) return undefined;
-    progress(ctx, name ?? `${on} Space`, "create", "creating");
+    progress(ctx, name ?? "new Space", "create", "creating");
     try {
       return await spaces().create(
-        { on: on as "local" | "cloud", name, cpus: cpus ? Number(cpus) : undefined, memoryMb: memory ? Number(memory) : undefined },
+        { name, cpus: cpus ? Number(cpus) : undefined, memoryMb: memory ? Number(memory) : undefined },
         ctx.signal,
       );
     } finally {
@@ -640,7 +637,17 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
 
   async function pick(ctx: UIContext): Promise<SpaceItem | "local" | undefined> {
     if (!ctx.hasUI) return undefined;
-    const items = await listSpaces(ctx.signal);
+    let items = await listSpaces(ctx.signal);
+    if (!items.length) {
+      const who = await spaces().signIn(
+        (url, code) => ctx.ui.notify(`sign in to Cua: open ${url}${code ? ` and enter ${code}` : ""}`, "info"),
+        ctx.signal,
+      );
+      if (who) {
+        ctx.ui.notify(`signed in as ${who}`, "info");
+        items = await listSpaces(ctx.signal);
+      }
+    }
     const options = [
       ...(target.kind === "space"
         ? [{ value: "local", label: target.workspaceState ? "sync back to local directory" : "return to local execution" }]
@@ -657,7 +664,7 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
         }`,
       })),
     ];
-    if (!options.length) throw new Error("no Spaces are registered; add one with the cua CLI or /space create");
+    if (!options.length) throw new Error("your Cua account has no Spaces; add a machine from the Cua Spaces app or use /space create");
     const value = await search(ctx, options);
     if (!value) return undefined;
     if (value === "local") return "local";
@@ -708,7 +715,7 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
               type: "text" as const,
               text: items.length
                 ? items.map((item) => `${item.name}\t${item.os || "unknown"}\t${item.online ? "online" : "offline"}${target.kind === "space" && target.spaceId === item.id ? "\tcurrent" : ""}`).join("\n")
-                : "no Spaces are registered; ask the user to add or create one",
+                : "no Spaces are available; ask the user to run /space to sign in to Cua or add one",
             },
           ],
           details: { spaces: items },

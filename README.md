@@ -6,6 +6,8 @@ Run a local pi session's tools on a [Cua Space](https://cua.ai/docs). The TUI, a
 pi install git:github.com/injaneity/pi-cua
 ```
 
+Then run `/space` and pick a machine. If this computer has no Cua sign-in yet, `/space` shows a sign-in link first. Machines you added in the Cua Spaces app (or with `cua host setup`) are listed by name; there is nothing to configure.
+
 A Space needs `node` 22+, `npm` and `git`. pi-cua checks for them on first entry and installs nothing at the system level.
 
 ## use
@@ -15,7 +17,7 @@ A Space needs `node` 22+, `npm` and `git`. pi-cua checks for them on first entry
 | choose a Space, reconnect, or go back to local | `/space` |
 | enter a Space by name | `/space mac-studio` |
 | bring the work back into your checkout | `/space local` |
-| create a Space and enter it | `/space create <local\|cloud> [name] [cpus memory_mb]` |
+| create a Space on this machine and enter it | `/space create [name] [cpus memory_mb]` |
 | delete a Space | `/space delete <name>` |
 | let the agent move itself | the `enter_space` tool (no arguments lists Spaces) |
 

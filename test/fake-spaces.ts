@@ -73,6 +73,10 @@ export class FakeSpacesClient implements SpacesClient {
       } catch {}
   }
 
+  async signIn(): Promise<string | undefined> {
+    return undefined;
+  }
+
   async create(_options: CreateOptions): Promise<SpaceItem> {
     throw new Error("fake Spaces cannot be created");
   }
