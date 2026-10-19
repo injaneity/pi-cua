@@ -6,7 +6,7 @@ Run a local pi session's tools on a [Cua Space](https://cua.ai/docs). The TUI, a
 pi install git:github.com/injaneity/pi-cua
 ```
 
-pi-cua only connects to Spaces you already have. Setting a machine up is a one-time step outside pi:
+Signing in and adding your own machines is a one-time step with the `cua` CLI or the Cua Spaces app:
 
 ```sh
 curl -fsSL https://cua.ai/install.sh | sh -s -- --cli-only --yes   # on this computer
@@ -16,7 +16,7 @@ cua auth login
 curl -fsSL https://cua.ai/install.sh | sh -s -- --only host --yes
 ```
 
-`cua spaces ls` shows what pi-cua will see. Creating, stopping and deleting Spaces stay in `cua spaces` and the Cua Spaces app.
+Then run `/space`. Your machines are listed by name; `/space create` makes a new Space on this computer. There is nothing to configure.
 
 A Space needs `node` 22+, `npm` and `git`. pi-cua checks for them on first entry and installs nothing at the system level.
 
@@ -29,8 +29,10 @@ A Space needs `node` 22+, `npm` and `git`. pi-cua checks for them on first entry
 | _(none)_ | lists Spaces; `/space` opens a picker |
 | `<name>` | enters that Space |
 | `local` | brings the work back into your checkout and runs locally again |
+| `create [name] [cpus memory_mb]` | creates a Space on this machine and enters it |
+| `delete <name>` | deletes a Space |
 
-Resume never substitutes a different machine: if the saved Space is gone or reports a different machine identity, pi stops and asks you to choose.
+Creating and deleting always ask you to confirm, whoever asks. Resume never substitutes a different machine: if the saved Space is gone or reports a different machine identity, pi stops and asks you to choose.
 
 ## what entering does
 

@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import type { Exit, ProcessHandle, ProcessSpec, SpaceItem, SpacesClient } from "../spaces.ts";
+import type { CreateOptions, Exit, ProcessHandle, ProcessSpec, SpaceItem, SpacesClient } from "../spaces.ts";
 
 export type FakeSpace = SpaceItem & { home: string };
 
@@ -71,6 +71,14 @@ export class FakeSpacesClient implements SpacesClient {
       try {
         process.kill(-child.pid, "SIGKILL");
       } catch {}
+  }
+
+  async create(_options: CreateOptions): Promise<SpaceItem> {
+    throw new Error("fake Spaces cannot be created");
+  }
+
+  async remove(): Promise<void> {
+    throw new Error("fake Spaces cannot be deleted");
   }
 
   close(): void {}

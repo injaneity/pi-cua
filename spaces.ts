@@ -32,6 +32,12 @@ export type ProcessHandle = {
   exited: Promise<Exit>;
 };
 
+export type CreateOptions = {
+  name?: string;
+  cpus?: number;
+  memoryMb?: number;
+};
+
 export interface SpacesClient {
   list(signal?: AbortSignal): Promise<SpaceItem[]>;
   spawn(
@@ -41,6 +47,8 @@ export interface SpacesClient {
     signal?: AbortSignal,
   ): Promise<ProcessHandle>;
   killTag(spaceId: string, tag: string, signal?: AbortSignal): Promise<void>;
+  create(options: CreateOptions, signal?: AbortSignal): Promise<SpaceItem>;
+  remove(spaceId: string, signal?: AbortSignal): Promise<void>;
   close(): void;
 }
 
@@ -195,6 +203,14 @@ export class WorkerSpacesClient implements SpacesClient {
 
   async killTag(spaceId: string, tag: string, signal?: AbortSignal): Promise<void> {
     await this.call("killTag", [spaceId, tag], signal);
+  }
+
+  create(options: CreateOptions, signal?: AbortSignal): Promise<SpaceItem> {
+    return this.call("create", [options], signal);
+  }
+
+  async remove(spaceId: string, signal?: AbortSignal): Promise<void> {
+    await this.call("delete", [spaceId], signal);
   }
 
   close(): void {

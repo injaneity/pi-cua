@@ -1,4 +1,5 @@
 import { Cua, CuaConfig, ProcessEventKind, ReplayMode, SpacesdCommand } from "@trycua/cua";
+import { SpaceCreateOptions } from "@trycua/cua/spaces";
 
 const cua = Cua.auto(CuaConfig.create({ fleetFromSession: true }));
 const spaces = cua.spaces();
@@ -115,6 +116,29 @@ async function dispatch({ method, args }, signal) {
     try {
       await (await env.attach(undefined, tag, ReplayMode.None.new())).kill();
     } catch {}
+    return true;
+  }
+  if (method === "create") {
+    const [options] = args;
+    const result = await spaces.create(
+      SpaceCreateOptions.create({
+        on: "local",
+        name: options.name,
+        cpus: options.cpus,
+        memoryMb: options.memoryMb === undefined ? undefined : BigInt(options.memoryMb),
+        wait: true,
+        reuse: false,
+        env: new Map(),
+        services: new Map(),
+      }),
+      { signal },
+    );
+    if (!result.space) throw new Error("Space creation did not finish; check `cua spaces list`");
+    return summary(result.space, true);
+  }
+  if (method === "delete") {
+    await spaces.delete_(args[0], { signal });
+    clients.delete(args[0]);
     return true;
   }
   throw new Error(`unknown Spaces operation: ${method}`);

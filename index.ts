@@ -42,7 +42,7 @@ import {
 
 const extensionDir = dirname(fileURLToPath(import.meta.url));
 const placementEntry = "cua-space-placement";
-const noSpaces = "no Spaces are available; set one up with the cua CLI or the Cua Spaces app (see the pi-cua README)";
+const noSpaces = "no Spaces are available; create one with /space create, or sign in and add machines with the cua CLI (see the pi-cua README)";
 const localTools = new Set(["space", "report_papercut", "web_search"]);
 
 type SpacePlace = {
@@ -544,6 +544,40 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
     await ctx.reload();
   }
 
+  async function createSpace(args: string, ctx: UIContext): Promise<SpaceItem | undefined> {
+    const match = args.match(/^([a-z0-9][a-z0-9-]*)?(?:\s*([1-9]\d*)\s+([1-9]\d*))?$/);
+    if (!match) throw new Error("usage: /space create [name] [cpus memory_mb]");
+    const [, name, cpus, memory] = match;
+    if (!ctx.hasUI) throw new Error("creating a Space needs an interactive session");
+    const confirmed = await ctx.ui.confirm(
+      `create a Space${name ? ` named ${name}` : ""} on this machine?`,
+      cpus ? `${cpus} CPUs and ${memory} MiB of memory.` : "default resources.",
+    );
+    if (!confirmed) return undefined;
+    progress(ctx, name ?? "new Space", "create", "creating");
+    try {
+      return await spaces().create(
+        { name, cpus: cpus ? Number(cpus) : undefined, memoryMb: memory ? Number(memory) : undefined },
+        ctx.signal,
+      );
+    } finally {
+      ctx.ui.setStatus("cua-session", undefined);
+      void listSpaces().catch(() => undefined);
+    }
+  }
+
+  async function deleteSpace(name: string, ctx: UIContext): Promise<string> {
+    const item = (await listSpaces(ctx.signal)).find((candidate) => candidate.name === name || candidate.id === name);
+    if (!item) throw new Error(`unknown Space: ${name}`);
+    if (target.kind === "space" && target.spaceId === item.id)
+      throw new Error(`move this session off ${item.name} with /space local before deleting it`);
+    if (!ctx.hasUI || !(await ctx.ui.confirm(`delete ${item.name}?`, "this permanently removes the Space and its files.")))
+      return "deletion was declined";
+    await spaces().remove(item.id, ctx.signal);
+    void listSpaces().catch(() => undefined);
+    return `deleted ${item.name}`;
+  }
+
   async function search(ctx: UIContext, options: Array<{ value: string; label: string; description?: string }>): Promise<string | undefined> {
     const input =
       ctx.mode === "tui"
@@ -634,6 +668,17 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
       await enterLocal(ctx);
       return undefined;
     }
+    if (value === "create" || value.startsWith("create ")) {
+      const created = await createSpace(value.slice("create".length).trim(), ctx);
+      if (!created) return "creation was declined";
+      await enter(created, ctx);
+      return entered(created);
+    }
+    if (value === "delete" || value.startsWith("delete ")) {
+      const name = value.slice("delete".length).trim();
+      if (!name) throw new Error("usage: /space delete <name>");
+      return deleteSpace(name, ctx);
+    }
     const item = (await listSpaces(ctx.signal)).find((candidate) => candidate.name === value || candidate.id === value);
     if (!item) throw new Error(`unknown Space: ${value}`);
     if (!item.online) throw new Error(`${item.name} is offline`);
@@ -666,12 +711,12 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
     }
   }
 
-  const usage = "<name> enters a Space · local returns · nothing lists Spaces";
+  const usage = "<name> enters a Space · local returns · create [name] [cpus memory_mb] · delete <name> · nothing lists Spaces";
 
   pi.registerTool({
     name: "space",
     label: "Space",
-    description: `Choose where this session's tools run, with the same arguments as /space: ${usage}.`,
+    description: `Choose where this session's tools run, with the same arguments as /space: ${usage}. Creating and deleting ask the user to confirm.`,
     promptGuidelines: ["Call space alone in its tool batch."],
     parameters: Type.Object({ argument: Type.Optional(Type.String({ description: usage })) }),
     executionMode: "sequential",
