@@ -42,6 +42,7 @@ import {
 
 const extensionDir = dirname(fileURLToPath(import.meta.url));
 const placementEntry = "cua-space-placement";
+const noSpaces = "no Spaces are available; set one up with the cua CLI or the Cua Spaces app (see the pi-cua README)";
 const localTools = new Set(["space", "report_papercut", "web_search"]);
 
 type SpacePlace = {
@@ -543,40 +544,6 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
     await ctx.reload();
   }
 
-  async function createSpace(args: string, ctx: UIContext): Promise<SpaceItem | undefined> {
-    const match = args.match(/^([a-z0-9][a-z0-9-]*)?(?:\s*([1-9]\d*)\s+([1-9]\d*))?$/);
-    if (!match) throw new Error("usage: /space create [name] [cpus memory_mb]");
-    const [, name, cpus, memory] = match;
-    if (!ctx.hasUI) throw new Error("creating a Space needs an interactive session");
-    const confirmed = await ctx.ui.confirm(
-      `create a Space${name ? ` named ${name}` : ""} on this machine?`,
-      cpus ? `${cpus} CPUs and ${memory} MiB of memory.` : "default resources.",
-    );
-    if (!confirmed) return undefined;
-    progress(ctx, name ?? "new Space", "create", "creating");
-    try {
-      return await spaces().create(
-        { name, cpus: cpus ? Number(cpus) : undefined, memoryMb: memory ? Number(memory) : undefined },
-        ctx.signal,
-      );
-    } finally {
-      ctx.ui.setStatus("cua-session", undefined);
-      void listSpaces().catch(() => undefined);
-    }
-  }
-
-  async function deleteSpace(name: string, ctx: UIContext): Promise<string> {
-    const item = (await listSpaces(ctx.signal)).find((candidate) => candidate.name === name || candidate.id === name);
-    if (!item) throw new Error(`unknown Space: ${name}`);
-    if (target.kind === "space" && target.spaceId === item.id)
-      throw new Error(`move this session off ${item.name} with /space local before deleting it`);
-    if (!ctx.hasUI || !(await ctx.ui.confirm(`delete ${item.name}?`, "this permanently removes the Space and its files.")))
-      return "deletion was declined";
-    await spaces().remove(item.id, ctx.signal);
-    void listSpaces().catch(() => undefined);
-    return `deleted ${item.name}`;
-  }
-
   async function search(ctx: UIContext, options: Array<{ value: string; label: string; description?: string; create?: boolean }>): Promise<string | undefined> {
     const input =
       ctx.mode === "tui"
@@ -643,35 +610,21 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
     return `${item.os || "unknown"} • ${item.provider} • ${status}`;
   }
 
-  async function available(ctx: UIContext): Promise<SpaceItem[]> {
-    const items = await listSpaces(ctx.signal);
-    if (items.length || !ctx.hasUI) return items;
-    const who = await spaces().signIn(
-      (url, code) => ctx.ui.notify(`sign in to Cua: open ${url}${code ? ` and enter ${code}` : ""}`, "info"),
-      ctx.signal,
-    );
-    if (!who) return items;
-    ctx.ui.notify(`signed in as ${who}`, "info");
-    return listSpaces(ctx.signal);
-  }
-
   async function pick(ctx: UIContext): Promise<string | undefined> {
-    const items = await available(ctx);
+    const items = await listSpaces(ctx.signal);
     const options = [
       ...(target.kind === "space" ? [{ value: "local", label: target.workspaceState ? "sync back to local directory" : "return to local execution" }] : []),
       ...items.map((item) => ({ value: item.id, label: item.name, description: describe(item) })),
     ];
-    if (!options.length) throw new Error("your Cua account has no Spaces; add a machine from the Cua Spaces app or use /space create");
+    if (!options.length) throw new Error(noSpaces);
     return search(ctx, options);
   }
 
   async function space(argument: string, ctx: UIContext): Promise<string | undefined> {
     const value = argument.trim();
     if (!value) {
-      const items = await available(ctx);
-      return items.length
-        ? items.map((item) => `${item.name}\t${describe(item)}`).join("\n")
-        : "no Spaces are available; the user can sign in or add one with /space";
+      const items = await listSpaces(ctx.signal);
+      return items.length ? items.map((item) => `${item.name}\t${describe(item)}`).join("\n") : noSpaces;
     }
     if (value === "local") {
       if (target.kind !== "space") return "already running locally";
@@ -681,17 +634,6 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
       }
       await enterLocal(ctx);
       return undefined;
-    }
-    if (value === "create" || value.startsWith("create ")) {
-      const created = await createSpace(value.slice("create".length).trim(), ctx);
-      if (!created) return "creation was declined";
-      await enter(created, ctx);
-      return entered(created);
-    }
-    if (value === "delete" || value.startsWith("delete ")) {
-      const name = value.slice("delete".length).trim();
-      if (!name) throw new Error("usage: /space delete <name>");
-      return deleteSpace(name, ctx);
     }
     const item = (await listSpaces(ctx.signal)).find((candidate) => candidate.name === value || candidate.id === value);
     if (!item) throw new Error(`unknown Space: ${value}`);
@@ -725,12 +667,12 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
     }
   }
 
-  const usage = "<name> enters a Space · local returns · create [name] [cpus memory_mb] · delete <name> · nothing lists Spaces";
+  const usage = "<name> enters a Space · local returns · nothing lists Spaces";
 
   pi.registerTool({
     name: "space",
     label: "Space",
-    description: `Choose where this session's tools run, with the same arguments as /space: ${usage}. Creating and deleting ask the user to confirm.`,
+    description: `Choose where this session's tools run, with the same arguments as /space: ${usage}.`,
     promptGuidelines: ["Call space alone in its tool batch."],
     parameters: Type.Object({ argument: Type.Optional(Type.String({ description: usage })) }),
     executionMode: "sequential",

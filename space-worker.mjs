@@ -1,12 +1,10 @@
 import { Cua, CuaConfig, ProcessEventKind, ReplayMode, SpacesdCommand } from "@trycua/cua";
-import { SpaceCreateOptions } from "@trycua/cua/spaces";
 
 const cua = Cua.auto(CuaConfig.create({ fleetFromSession: true }));
 const spaces = cua.spaces();
 const clients = new Map();
 const processes = new Map();
 const requests = new Map();
-let login;
 
 const summary = (info, online, reason, os = info.os) => ({
   id: info.id,
@@ -117,39 +115,6 @@ async function dispatch({ method, args }, signal) {
     try {
       await (await env.attach(undefined, tag, ReplayMode.None.new())).kill();
     } catch {}
-    return true;
-  }
-  if (method === "create") {
-    const [options] = args;
-    const result = await spaces.create(
-      SpaceCreateOptions.create({
-        on: "local",
-        name: options.name,
-        cpus: options.cpus,
-        memoryMb: options.memoryMb === undefined ? undefined : BigInt(options.memoryMb),
-        wait: true,
-        reuse: false,
-        env: new Map(),
-        services: new Map(),
-      }),
-      { signal },
-    );
-    if (!result.space) throw new Error("Space creation did not finish; check `cua spaces list`");
-    return summary(result.space, true);
-  }
-  if (method === "signedIn") return cua.auth().status().loggedIn;
-  if (method === "beginLogin") {
-    login = await cua.auth().beginLogin(undefined, { signal });
-    return { url: login.url(), code: login.userCode() };
-  }
-  if (method === "finishLogin") {
-    const identity = await login.wait({ signal });
-    login = undefined;
-    return identity.display ?? identity.email ?? identity.username ?? "Cua";
-  }
-  if (method === "delete") {
-    await spaces.delete_(args[0], { signal });
-    clients.delete(args[0]);
     return true;
   }
   throw new Error(`unknown Spaces operation: ${method}`);
