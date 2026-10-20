@@ -23,6 +23,8 @@ export function layout(home: string) {
   };
 }
 
+const inlineLimit = 384 * 1024;
+
 export type CommandResult = { exitCode: number | null; timedOut: boolean; stdout: Buffer; stderr: string; error: string | null };
 
 export async function run(
@@ -30,11 +32,16 @@ export async function run(
   script: string,
   options: { timeoutMs?: number; signal?: AbortSignal; check?: boolean; label?: string; input?: Buffer } = {},
 ): Promise<CommandResult> {
+  const inline = options.input && options.input.length <= inlineLimit;
+  const encoded = inline ? options.input!.toString("base64").match(/.{1,65536}/g) ?? [] : [];
+  const args = inline
+    ? ["-c", `printf %s "$@" | base64 -d | /bin/sh -c ${sh(pathPrefix + script)}`, "sh", ...encoded]
+    : ["-c", `${pathPrefix}${script}`];
   const exit = await runProcess(
     remote.client,
     remote.spaceId,
-    { program: "/bin/sh", args: ["-c", `${pathPrefix}${script}`], timeoutMs: options.timeoutMs ?? 120_000 },
-    options.input,
+    { program: "/bin/sh", args, timeoutMs: options.timeoutMs ?? 120_000 },
+    inline ? undefined : options.input,
     options.signal,
   );
   const result = { exitCode: exit.code, timedOut: exit.timedOut === true, stdout: exit.stdout, stderr: exit.stderr, error: exit.error };

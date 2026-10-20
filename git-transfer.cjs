@@ -173,6 +173,56 @@ const snapshot = () => {
     fs.rmSync(directory, { recursive: true });
   }
 };
+const applyFrames = () => {
+  const tree = oid(options.tree);
+  const baseline = oid(options.baseline);
+  if (!/^[a-f0-9]{32}$/.test(options.reference))
+    throw new Error("Invalid snapshot reference");
+  let offset = 0;
+  while (offset < input.length) {
+    if (offset + 4 > input.length) throw new Error("Truncated pack frame");
+    const size = input.readUInt32BE(offset);
+    offset += 4;
+    if (size < 12 || offset + size > input.length)
+      throw new Error("Invalid pack frame");
+    git(
+      ["index-pack", "--stdin", "--fix-thin", "--strict"],
+      input.subarray(offset, offset + size),
+    );
+    offset += size;
+  }
+  for (const id of [
+    tree,
+    baseline,
+    ...(options.commitTree ? [oid(options.commitTree)] : []),
+  ]) {
+    if (git(["cat-file", "-t", id]).toString().trim() !== "tree")
+      throw new Error("Missing snapshot tree");
+  }
+  git(["read-tree", "--reset", "-u", tree]);
+  const actual = snapshot();
+  if (actual !== tree)
+    throw new Error(
+      "workspace verification failed after importing Git objects",
+    );
+  git([
+    "update-ref",
+    "refs/cua-pi/sync/" + options.reference + "/workspace",
+    tree,
+  ]);
+  git([
+    "update-ref",
+    "refs/cua-pi/sync/" + options.reference + "/baseline",
+    baseline,
+  ]);
+  if (options.commitTree)
+    git([
+      "update-ref",
+      "refs/cua-pi/sync/" + options.reference + "/origin",
+      oid(options.commitTree),
+    ]);
+  return tree;
+};
 if (action === "inventory") {
   json([
     ...inventory(options.tree),
@@ -341,54 +391,42 @@ if (action === "inventory") {
   fs.rmSync(expected, { recursive: true });
   json({ removed: true });
 } else if (action === "apply") {
-  const tree = oid(options.tree);
-  const baseline = oid(options.baseline);
-  if (!/^[a-f0-9]{32}$/.test(options.reference))
-    throw new Error("Invalid snapshot reference");
-  let offset = 0;
-  while (offset < input.length) {
-    if (offset + 4 > input.length) throw new Error("Truncated pack frame");
-    const size = input.readUInt32BE(offset);
-    offset += 4;
-    if (size < 12 || offset + size > input.length)
-      throw new Error("Invalid pack frame");
-    git(
-      ["index-pack", "--stdin", "--fix-thin", "--strict"],
-      input.subarray(offset, offset + size),
-    );
-    offset += size;
-  }
-  for (const id of [
-    tree,
-    baseline,
-    ...(options.commitTree ? [oid(options.commitTree)] : []),
-  ]) {
-    if (git(["cat-file", "-t", id]).toString().trim() !== "tree")
-      throw new Error("Missing snapshot tree");
-  }
-  git(["read-tree", "--reset", "-u", tree]);
-  const actual = snapshot();
-  if (actual !== tree)
+  json({ tree: applyFrames() });
+} else if (action === "enter") {
+  const path = require("node:path");
+  if (!options.aside.startsWith(options.root + ".stranded-"))
+    throw new Error("Invalid set-aside path");
+  fs.mkdirSync(path.dirname(options.root), { recursive: true });
+  const disk = fs.statfsSync(path.dirname(options.root));
+  const free = disk.bavail * disk.bsize;
+  if (free < 1073741824)
     throw new Error(
-      "workspace verification failed after importing Git objects",
+      `setup needs 1 GiB free; only ${Math.floor(free / 1048576)} MiB is available`,
     );
-  git([
-    "update-ref",
-    "refs/cua-pi/sync/" + options.reference + "/workspace",
-    tree,
-  ]);
-  git([
-    "update-ref",
-    "refs/cua-pi/sync/" + options.reference + "/baseline",
-    baseline,
-  ]);
-  if (options.commitTree)
-    git([
-      "update-ref",
-      "refs/cua-pi/sync/" + options.reference + "/origin",
-      oid(options.commitTree),
-    ]);
-  json({ tree });
+  let moved;
+  if (fs.existsSync(options.root)) {
+    fs.renameSync(options.root, options.aside);
+    moved = options.aside;
+  }
+  const commit = oid(options.commit);
+  let available = true;
+  try {
+    prepareCache(commit);
+  } catch {
+    available = false;
+  }
+  if (!available) {
+    json({ available, moved });
+  } else {
+    git(
+      ["clone", "--shared", "--no-checkout", options.cache, options.root],
+      undefined,
+      options.cache,
+    );
+    git(["update-ref", "--no-deref", "HEAD", commit]);
+    git(["remote", "set-url", "origin", options.remoteUrl]);
+    json({ available, moved, tree: applyFrames() });
+  }
 } else {
   throw new Error("Unknown Git transfer action");
 }

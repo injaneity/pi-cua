@@ -231,14 +231,19 @@ async function captureSpace(source: SpaceWorkspace, exclude: string | undefined,
   };
 }
 
-async function repositoryAvailable(remote: Remote, repository: Repository, commit: string, signal?: AbortSignal): Promise<boolean> {
+async function preflight(remote: Remote, repository: Repository, commit: string, root: string, progress?: Progress, signal?: AbortSignal): Promise<boolean> {
   const cache = layout(remote.home).repo(repositoryKey(repository.remoteUrl));
+  const aside = `${root}.stranded-${Date.now()}`;
   const result = await run(
     remote,
-    `git -C ${sh(cache)} cat-file -e ${sh(`${commit}^{commit}`)} 2>/dev/null || GIT_TERMINAL_PROMPT=0 git ls-remote --exit-code ${sh(repository.remoteUrl)} HEAD >/dev/null 2>&1`,
-    { check: false, timeoutMs: 60_000, signal, label: "repository check" },
+    `${freeSpaceCheck}
+if [ -e ${sh(root)} ]; then mv ${sh(root)} ${sh(aside)}; echo moved; fi
+if git -C ${sh(cache)} cat-file -e ${sh(`${commit}^{commit}`)} 2>/dev/null || GIT_TERMINAL_PROMPT=0 git ls-remote --exit-code ${sh(repository.remoteUrl)} HEAD >/dev/null 2>&1; then echo available; fi`,
+    { timeoutMs: 60_000, signal, label: "workspace check" },
   );
-  return result.exitCode === 0;
+  const output = result.stdout.toString("utf8");
+  if (output.includes("moved")) progress?.("workspace.preserve", `kept an earlier workspace at ${aside}`);
+  return output.includes("available");
 }
 
 function repositoryKey(remoteUrl: string): string {
@@ -375,6 +380,46 @@ async function transferObjects(
   });
 }
 
+async function enterFromLocal(
+  remote: Remote,
+  root: string,
+  repository: Repository,
+  capture: Capture,
+  reference: string,
+  timings: Timings,
+  progress?: Progress,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const { baselineTree, commitTree } = capture.state;
+  const roots = [...new Set([capture.finalTree, baselineTree])].filter((tree) => tree !== commitTree);
+  const pack = roots.length
+    ? git(repository.root, ["pack-objects", "--stdout", "--revs", "--thin", "--no-reuse-object", "--compression=6"], {
+        input: [...roots, `^${commitTree}`].join("\n") + "\n",
+      })
+    : Buffer.alloc(0);
+  const header = Buffer.alloc(4);
+  header.writeUInt32BE(pack.length);
+  const framed = pack.length ? Buffer.concat([header, pack]) : pack;
+  if (framed.length > limit) throw new Error("workspace changes exceed the 200 MiB limit");
+  timings["workspace.object_bytes"] = framed.length;
+  const result = await json<{ available: boolean; moved?: string; tree?: string }>(
+    transfer({ kind: "space", remote }, root, "enter", {
+      aside: `${root}.stranded-${Date.now()}`,
+      cache: layout(remote.home).repo(repositoryKey(repository.remoteUrl)),
+      commit: repository.commit,
+      remoteUrl: repository.remoteUrl,
+      tree: capture.finalTree,
+      baseline: baselineTree,
+      commitTree,
+      reference,
+      filterScript: filterCheck,
+    }, framed, { timeoutMs: 660_000, signal }),
+  );
+  if (result.moved) progress?.("workspace.preserve", `kept an earlier workspace at ${result.moved}`);
+  if (result.available && result.tree !== capture.finalTree) throw new Error("workspace verification failed after importing Git objects");
+  return result.available;
+}
+
 export type PreparedWorkspace = { root: string; cwd: string; state: WorkspaceState };
 
 export async function prepareWorkspace(
@@ -388,15 +433,26 @@ export async function prepareWorkspace(
 ): Promise<PreparedWorkspace> {
   const digest = executionDigest(executionKey);
   const workspaceRoot = layout(remote.home).work(digest.slice(0, 16));
-  await run(remote, freeSpaceCheck, { signal, label: "disk check" });
-  await setAsideExisting(remote, workspaceRoot, progress, signal);
   const commit = source ? source.state.commit : repository.commit;
-  const available = await measure(timings, "workspace.preflight", progress, () =>
-    repositoryAvailable(remote, repository, commit, signal),
-  );
-  let capture = await measure(timings, "workspace.capture", progress, async () =>
-    source ? captureSpace(source, source.state.commitTree, signal) : captureLocal(repository),
-  );
+  const cwd = repository.relativeCwd === "." ? workspaceRoot : `${workspaceRoot}/${repository.relativeCwd}`;
+  let available = false;
+  let capture: Capture;
+  if (source) {
+    available = await measure(timings, "workspace.preflight", progress, () =>
+      preflight(remote, repository, commit, workspaceRoot, progress, signal),
+    );
+    capture = await measure(timings, "workspace.capture", progress, () => captureSpace(source, source.state.commitTree, signal));
+  } else {
+    capture = await measure(timings, "workspace.capture", progress, async () => captureLocal(repository));
+    const reference = digest.slice(0, 32);
+    try {
+      if (await measure(timings, "workspace.objects", progress, () => enterFromLocal(remote, workspaceRoot, repository, capture, reference, timings, progress, signal)))
+        return { root: workspaceRoot, cwd, state: capture.state };
+    } catch (error) {
+      await removeWorkspace(remote, workspaceRoot).catch(() => undefined);
+      throw error;
+    }
+  }
   if (source && !available) {
     const objects = await measure(timings, "workspace.full-inventory", progress, () =>
       json<Array<[string, number]>>(
@@ -424,7 +480,6 @@ export async function prepareWorkspace(
     await removeWorkspace(remote, workspaceRoot).catch(() => undefined);
     throw error;
   }
-  const cwd = repository.relativeCwd === "." ? workspaceRoot : `${workspaceRoot}/${repository.relativeCwd}`;
   return { root: workspaceRoot, cwd, state: capture.state };
 }
 
@@ -437,16 +492,6 @@ export async function executionDirectory(remote: Remote, executionKey: string, s
 export async function workspaceExists(remote: Remote, root: string, cwd: string, signal?: AbortSignal): Promise<boolean> {
   const result = await run(remote, `test -d ${sh(`${root}/.git`)} && mkdir -p ${sh(cwd)}`, { check: false, signal });
   return result.exitCode === 0;
-}
-
-async function setAsideExisting(remote: Remote, root: string, progress?: Progress, signal?: AbortSignal): Promise<void> {
-  const aside = `${root}.stranded-${Date.now()}`;
-  const result = await run(
-    remote,
-    `if [ -e ${sh(root)} ]; then mv ${sh(root)} ${sh(aside)}; echo moved; fi`,
-    { signal, label: "workspace check" },
-  );
-  if (result.stdout.includes("moved")) progress?.("workspace.preserve", `kept an earlier workspace at ${aside}`);
 }
 
 function assertWorkspaceRoot(remote: Remote, root: string): void {
