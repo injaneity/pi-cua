@@ -1,4 +1,5 @@
-import { isSpaceOS, runProcess, type SpaceItem, type SpaceOS, type SpacesClient } from "./spaces.ts";
+import { isSpaceOS, runProcess, type ProcessSpec, type SpaceItem, type SpaceOS, type SpacesClient } from "./spaces.ts";
+import { probeWindows } from "./windows.ts";
 
 export type Remote = {
   client: SpacesClient;
@@ -6,6 +7,8 @@ export type Remote = {
   name: string;
   os: SpaceOS;
   home: string;
+  shell?: string;
+  nodeDirectory?: string;
 };
 
 export function sh(value: string): string {
@@ -13,6 +16,13 @@ export function sh(value: string): string {
 }
 
 export const pathPrefix = 'export PATH="$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"\n';
+
+export function shellCommand(remote: Remote, script: string): Pick<ProcessSpec, "program" | "args"> {
+  if (remote.os !== "windows") return { program: "/bin/sh", args: ["-c", pathPrefix + script] };
+  if (!remote.shell || !remote.nodeDirectory) throw new Error("Windows shell prerequisites have not been resolved");
+  const prefix = `export HOME=${sh(remote.home)}\nexport PATH="/usr/bin:/bin:/mingw64/bin:/mingw32/bin:$PATH"\nexport PATH="$(cygpath -u ${sh(remote.nodeDirectory)}):$PATH"\nexport MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1 MSYS=winsymlinks:nativestrict\n`;
+  return { program: remote.shell, args: ["--noprofile", "--norc", "-c", prefix + script] };
+}
 
 export function layout(home: string) {
   const root = `${home}/.cua-pi`;
@@ -32,15 +42,15 @@ export async function run(
   script: string,
   options: { timeoutMs?: number; signal?: AbortSignal; check?: boolean; label?: string; input?: Buffer } = {},
 ): Promise<CommandResult> {
-  const inline = options.input && options.input.length <= inlineLimit;
+  const inline = remote.os !== "windows" && options.input && options.input.length <= inlineLimit;
   const encoded = inline ? options.input!.toString("base64").match(/.{1,65536}/g) ?? [] : [];
-  const args = inline
-    ? ["-c", `printf %s "$@" | base64 -d | /bin/sh -c ${sh(pathPrefix + script)}`, "sh", ...encoded]
-    : ["-c", `${pathPrefix}${script}`];
+  const command = inline
+    ? { program: "/bin/sh", args: ["-c", `printf %s "$@" | base64 -d | /bin/sh -c ${sh(pathPrefix + script)}`, "sh", ...encoded] }
+    : shellCommand(remote, script);
   const exit = await runProcess(
     remote.client,
     remote.spaceId,
-    { program: "/bin/sh", args, timeoutMs: options.timeoutMs ?? 120_000 },
+    { ...command, timeoutMs: options.timeoutMs ?? 120_000 },
     inline ? undefined : options.input,
     options.signal,
   );
@@ -61,7 +71,12 @@ export async function probe(
   signal?: AbortSignal,
 ): Promise<{ remote: Remote; probe: Probe }> {
   if (!isSpaceOS(space.os))
-    throw new Error(`${space.name} runs ${space.os || "an unknown OS"}; pi-cua supports Linux and macOS Spaces`);
+    throw new Error(`${space.name} runs ${space.os || "an unknown OS"}; pi-cua supports Linux, macOS and experimental Windows Spaces`);
+  if (space.os === "windows") {
+    const windows = await probeWindows(client, space, signal);
+    await run(windows.remote, 'set -eu\nnode -e \'if (Number(process.versions.node.split(".")[0]) < 22) process.exit(1)\'\nfor tool in git tar cat mkdir mv rm df awk base64 cygpath; do command -v "$tool" >/dev/null; done', { signal, timeoutMs: 30_000, label: "Git Bash prerequisite check" });
+    return windows;
+  }
   const partial: Remote = { client, spaceId: space.id, name: space.name, os: space.os, home: "" };
   const machineId =
     space.os === "macos"

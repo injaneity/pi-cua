@@ -21,7 +21,7 @@
 
 Cua Spaces gives people and agents shared desktops on computers you own or rent: your computer, another computer you connect, or a VM in your own cloud account. A Space can be a container, a virtual machine, or a computer's own desktop—not a Cua-hosted computer. See [how Spaces works](https://cua.ai/docs/spaces/concepts/how-spaces-works).
 
-pi-cua connects pi to Linux and macOS Spaces. Keep pi, your extensions, skills, settings and model credentials local; run workspace tools on the selected Space and bring Git changes back when you return. Cua Spaces tools are also discoverable through `tool_search`.
+pi-cua connects pi to Linux and macOS Spaces, with experimental Windows support through Git for Windows Bash. Keep pi, your extensions, skills, settings and model credentials local; run workspace tools on the selected Space and bring Git changes back when you return. Cua Spaces tools are also discoverable through `tool_search`.
 
 ```mermaid
 flowchart LR
@@ -96,10 +96,20 @@ enter(space)
 
 ## Supported today
 
-- Cua Spaces supports macOS, Linux and Windows. pi-cua currently routes workspace tools to Linux and macOS Spaces; Windows execution and workspace transfer are not yet implemented in this integration.
+- Linux and macOS Spaces, plus experimental Windows Spaces using Git for Windows Bash. Windows support has not been runtime-tested.
 - Submodules, Git content filters and working-tree encodings are not transferred. Transfers are limited to 200 MiB.
 - Sessions on one Space share its user, files and logins. Use a dedicated Space when that matters.
 - Workspaces stay on the Space until you return with `/space local`.
+
+## Experimental Windows Spaces
+
+Install Node.js 22+ and Git for Windows on the Windows computer, with `node.exe` and `git.exe` on the PATH of the user running `cua-spacesd`. Restart spacesd after installation. Windows PowerShell (`powershell.exe`) is used to discover the user profile, machine identity and Git Bash location.
+
+`bash` and `!` commands run in Git for Windows Bash—not PowerShell or cmd.exe. Use workspace-relative paths or drive-qualified paths such as `C:/Users/name/project`. UNC paths and drive-relative paths such as `C:project` are not supported. Invoke `powershell.exe` explicitly for PowerShell commands.
+
+Workspace transfer uses the same Git object verification and snapshot fallback as other Spaces. Windows checkouts disable automatic CRLF conversion and require native symlinks rather than silently replacing links with files; repositories with symlinks need Windows Developer Mode or appropriate privileges. Windows filesystem restrictions still apply to filenames and paths.
+
+This implementation is unverified on Windows. Entry, file tools, cancellation, resume, cross-OS transfer and sync-back need validation before relying on it for important work.
 
 ## Development
 
