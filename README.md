@@ -1,6 +1,23 @@
-# pi-cua
+<p align="center">
+  <a href="https://cua.ai/">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="assets/cua-lockup-white.png">
+      <img src="assets/cua-lockup-black.png" alt="Cua" width="240">
+    </picture>
+  </a>
+</p>
 
-**Bring your pi coding sessions to [Cua Spaces](https://cua.ai/).**
+<h1 align="center">pi-cua</h1>
+<p align="center">Your pi coding sessions. Your computers. Cua Spaces.</p>
+<p align="center">
+  <a href="#get-started">Get started</a> ·
+  <a href="#choose-a-space">Choose a Space</a> ·
+  <a href="https://cua.ai/docs/spaces/concepts/how-spaces-works">Cua Spaces docs</a>
+</p>
+
+---
+
+## Local pi. Work on a Space.
 
 Cua Spaces gives people and agents shared desktops on computers you own or rent: your computer, another computer you connect, or a VM in your own cloud account. A Space can be a container, a virtual machine, or a computer's own desktop—not a Cua-hosted computer. See [how Spaces works](https://cua.ai/docs/spaces/concepts/how-spaces-works).
 
@@ -12,7 +29,7 @@ flowchart LR
   S -->|"Git changes on return"| W["Local checkout"]
 ```
 
-## install
+## Get started
 
 ```sh
 pi install git:github.com/injaneity/pi-cua
@@ -34,7 +51,7 @@ Then run `/space` in pi to choose from your available Spaces. `/space create` cr
 
 A Space needs `node` and `git`, which the canonical Cua images ship. pi-cua checks for them on entry.
 
-## use
+## Choose a Space
 
 `/space` and the agent's `space` tool take the same argument:
 
@@ -49,7 +66,7 @@ A Space needs `node` and `git`, which the canonical Cua images ship. pi-cua chec
 
 Creating and deleting always ask you to confirm, whoever asks. Resume never substitutes a different machine: if the saved Space is gone or reports a different machine identity, pi stops and asks you to choose.
 
-## sign-ins and pasted images
+## Your accounts stay yours
 
 Credentials stay on their own machine. Model and MCP sign-ins remain local; command-line tools on a Space use that Space's accounts. No OAuth tokens, SSH keys or credential files are copied or forwarded.
 
@@ -63,7 +80,7 @@ The picker shows online Spaces first, then those still being checked, then offli
 
 The tool catalogue exposed by the installed Cua Spaces SDK—including Space management, agents, sharing, Teleport and more—is registered as `cua_<tool>` at startup. Tool definitions stay out of the prompt until `tool_search` loads them. Availability depends on your SDK version and connected computers. Any tool the SDK marks destructive asks you to confirm first, whether you or the agent called it.
 
-## what entering does
+## From your checkout and back
 
 ```
 enter(space)
@@ -77,17 +94,21 @@ enter(space)
 
 `/new` and `/fork` inherit the Space with their own copy of the workspace.
 
-## limits
+## Supported today
 
 - Linux and macOS Spaces. Windows is not supported.
 - Submodules, Git content filters and working-tree encodings are not transferred. Transfers are limited to 200 MiB.
 - Sessions on one Space share its user, files and logins. Use a dedicated Space when that matters.
 - Workspaces stay on the Space until you return with `/space local`.
 
-## development
+## Development
 
 ```sh
 npm test
 ```
 
 The tests run the real workspace transfer and pi's own tools against local fake Spaces with their own home directories.
+
+---
+
+Cua marks are provided by [Cua's brand assets](https://cua.ai/branding). pi-cua is an integration for pi; Cua Spaces provides the connected desktops.
