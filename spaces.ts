@@ -11,6 +11,11 @@ export type SpaceItem = {
   reason?: string;
 };
 
+export function orderedSpaces(items: readonly SpaceItem[]): SpaceItem[] {
+  const rank = (item: SpaceItem) => item.online === true ? 0 : item.online === undefined ? 1 : 2;
+  return [...items].sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
+}
+
 export type SpaceCheck = { online: boolean; os: string; reason?: string };
 
 export type ProcessSpec = {

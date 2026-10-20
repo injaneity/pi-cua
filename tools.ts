@@ -1,6 +1,7 @@
-import { isAbsolute, posix } from "node:path";
+import { basename, dirname, isAbsolute, posix, resolve } from "node:path";
+import { tmpdir } from "node:os";
 import type { BashOperations, EditOperations, FindOperations, ReadOperations, WriteOperations } from "@earendil-works/pi-coding-agent";
-import { run, sh, type Remote } from "./remote.ts";
+import { pathPrefix, run, sh, type Remote } from "./remote.ts";
 import { runProcess } from "./spaces.ts";
 
 export type SpaceOperations = {
@@ -20,6 +21,10 @@ const imageTypes: Array<[string, number[]]> = [
   ["image/webp", [0x52, 0x49, 0x46, 0x46]],
 ];
 
+export function localClipboard(path: string): boolean {
+  return isAbsolute(path) && resolve(dirname(path)) === resolve(tmpdir()) && /^pi-clipboard-[\w-]+\.(png|jpg|jpeg|gif|webp)$/i.test(basename(path));
+}
+
 export function spaceOperations(remote: Remote, localCwd: string, remoteCwd: string): SpaceOperations {
   const remotePath = (path: string) => {
     const absolute = isAbsolute(path) ? posix.normalize(path) : posix.join(remoteCwd, path);
@@ -34,7 +39,10 @@ export function spaceOperations(remote: Remote, localCwd: string, remoteCwd: str
     if (!content) {
       content = shell(`cat -- ${sh(target)}`);
       pending.set(target, content);
-      content.then(() => setTimeout(() => pending.delete(target), 1000), () => pending.delete(target));
+      const expire = () => {
+        if (pending.get(target) === content) pending.delete(target);
+      };
+      content.then(() => setTimeout(expire, 1000).unref(), expire);
     }
     return content;
   };
@@ -69,7 +77,7 @@ export function spaceOperations(remote: Remote, localCwd: string, remoteCwd: str
         const exit = await runProcess(
           remote.client,
           remote.spaceId,
-          { program: "/bin/sh", args: ["-c", `cd ${sh(remotePath(cwd))} && ${command}`], timeoutMs: timeout ? timeout * 1000 : undefined },
+          { program: "/bin/sh", args: ["-c", `${pathPrefix}cd ${sh(remotePath(cwd))} && ${command}`], timeoutMs: timeout ? timeout * 1000 : undefined },
           undefined,
           signal,
           (_stream, data) => onData(data),

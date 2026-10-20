@@ -7,19 +7,22 @@ import {
   createReadToolDefinition,
   createWriteToolDefinition,
   DEFAULT_MAX_BYTES,
+  DynamicBorder,
+  getSelectListTheme,
+  keyHint,
   type ExtensionAPI,
   type ExtensionCommandContext,
   type ExtensionContext,
   SessionManager,
   truncateHead,
 } from "@earendil-works/pi-coding-agent";
-import { Editor, Key, matchesKey, SelectList, visibleWidth } from "@earendil-works/pi-tui";
+import { Input, SelectList, Text, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { probe, type Remote } from "./remote.ts";
-import { isSpaceOS, type SpaceItem, type SpaceOS, type SpacesClient, type SpaceTool, NativeSpacesClient } from "./spaces.ts";
-import { type SpaceOperations, spaceOperations } from "./tools.ts";
+import { probe, run, type Remote } from "./remote.ts";
+import { isSpaceOS, orderedSpaces, type SpaceItem, type SpaceOS, type SpacesClient, type SpaceTool, NativeSpacesClient } from "./spaces.ts";
+import { type SpaceOperations, spaceOperations, localClipboard } from "./tools.ts";
 import {
   cleanupWorkspace,
   diffStatus,
@@ -424,20 +427,12 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
     const options = choices();
     const input =
       ctx.mode === "tui"
-        ? await ctx.ui.custom<string | null>((tui, theme, _keybindings, done) => {
-            const row = (text: string) => {
-              const columns = text.match(/^(.*\S)(\s{2,})(\S.*)$/);
-              return columns ? theme.fg("accent", columns[1]!) + theme.fg("muted", columns[2]! + columns[3]!) : theme.fg("accent", text);
-            };
-            const listTheme = {
-              selectedPrefix: (text: string) => theme.fg("accent", text),
-              selectedText: row,
-              description: (text: string) => theme.fg("muted", text),
-              scrollInfo: (text: string) => theme.fg("muted", text),
-              noMatch: (text: string) => theme.fg("muted", text),
-            };
-            const editor = new Editor(tui, { borderColor: (text) => theme.fg("borderMuted", text), selectList: listTheme });
-            editor.disableSubmit = true;
+        ? await ctx.ui.custom<string | null>((tui, theme, keybindings, done) => {
+            const listTheme = getSelectListTheme();
+            const editor = new Input();
+            const border = new DynamicBorder();
+            const hint = new Text(`${keyHint("tui.select.confirm", "select")} · ${keyHint("tui.select.cancel", "cancel")}`, 0, 0);
+            const title = new Text(theme.fg("muted", "Choose execution environment"), 0, 0);
             let list: SelectList;
             let query = "";
             const rebuild = (text: string) => {
@@ -448,7 +443,7 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
               const width = Math.max(1, ...filtered.map((option) => visibleWidth(option.label))) + 4;
               list = new SelectList(
                 filtered.map(({ value, label, description }) => ({ value, label, description })),
-                Math.max(1, Math.min(filtered.length, 5)),
+                Math.max(1, Math.min(filtered.length, 10)),
                 listTheme,
                 { minPrimaryColumnWidth: width, maxPrimaryColumnWidth: width },
               );
@@ -457,7 +452,6 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
               if (index > 0) list.setSelectedIndex(index);
             };
             rebuild("");
-            editor.onChange = rebuild;
             redraw = () => {
               rebuild(query);
               tui.requestRender();
@@ -473,11 +467,14 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
                 editor.invalidate();
                 list.invalidate();
               },
-              render: (width: number) => [...editor.render(width), ...list.render(width)],
+              render: (width: number) => [...border.render(width), "", ...title.render(width), "", ...editor.render(width), "", ...list.render(width), "", ...hint.render(width), ...border.render(width)],
               handleInput(data: string) {
-                if (matchesKey(data, Key.escape)) return done(null);
-                if (matchesKey(data, Key.up) || matchesKey(data, Key.down) || matchesKey(data, Key.enter)) list.handleInput(data);
-                else editor.handleInput(data);
+                if (keybindings.matches(data, "tui.select.cancel")) return done(null);
+                if ((["tui.select.up", "tui.select.down", "tui.select.confirm"] as const).some((key) => keybindings.matches(data, key))) list.handleInput(data);
+                else {
+                  editor.handleInput(data);
+                  if (editor.getValue() !== query) rebuild(editor.getValue());
+                }
                 tui.requestRender();
               },
             };
@@ -502,7 +499,8 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
     else await listSpaces(ctx.signal);
     const choices = () => [
       ...(target.kind === "space" ? [{ value: "local", label: target.workspaceState ? "sync back to local directory" : "return to local execution" }] : []),
-      ...(known ?? []).map((item) => ({ value: item.id, label: item.name, description: describe(item) })),
+      ...orderedSpaces(known ?? [])
+        .map((item) => ({ value: item.id, label: item.name, description: describe(item) })),
     ];
     if (!choices().length) throw new Error(noSpaces);
     try {
@@ -517,6 +515,20 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
     if (!value) {
       const items = await Promise.all((await listSpaces(ctx.signal)).map(checked));
       return items.length ? items.map((item) => `${item.name}\t${describe(item)}`).join("\n") : noSpaces;
+    }
+    if (value === "auth") {
+      const active = onSpace();
+      if (!active || !attachment) return "credentials stay on this machine. enter a Space, then use /space auth to check its sign-ins.";
+      const result = await run(attachment.remote, `
+if ! command -v gh >/dev/null 2>&1; then
+  echo 'GitHub: install the gh CLI on this Space'
+elif gh auth status --active >/dev/null 2>&1; then
+  echo 'GitHub: authenticated'
+else
+  echo 'GitHub: authentication unavailable; run gh auth login in a terminal on this Space'
+fi
+`, { signal: ctx.signal, timeoutMs: 30_000 });
+      return `${attachment.place.name} sign-ins (credentials are not copied):\n${result.stdout.toString("utf8").trim()}\nchecks can fail because of connectivity or expired credentials. use gh auth setup-git on this Space for HTTPS Git access.`;
     }
     if (value === "local") {
       if (target.kind !== "space") return "already running locally";
@@ -573,7 +585,7 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
     ...createReadToolDefinition(process.cwd()),
     execute: (id, input, signal, onUpdate, ctx) => {
       const ops = onSpace();
-      return createReadToolDefinition(ctx.cwd, ops ? { operations: ops.read } : {}).execute(id, input, signal, onUpdate, ctx);
+      return createReadToolDefinition(ctx.cwd, ops && !localClipboard(input.path) ? { operations: ops.read } : {}).execute(id, input, signal, onUpdate, ctx);
     },
   });
   pi.registerTool({
@@ -661,7 +673,7 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
     return catalogue;
   }
 
-  const usage = "<name> enters a Space · local returns · create [name] · delete <name> · nothing lists Spaces";
+  const usage = "<name> enters a Space · local returns · create [name] · delete <name> · auth checks GitHub sign-in · nothing lists Spaces";
 
   pi.registerTool({
     name: "space",
@@ -690,8 +702,9 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
         await ctx.waitForIdle();
         const value = args.trim() || (ctx.hasUI ? await pick(ctx) : "");
         if (value === undefined) return;
+        const previous = label(target);
         const text = await space(value, ctx);
-        if (text && !closed) ctx.ui.notify(text, "info");
+        if (text && !closed && previous === label(target)) ctx.ui.notify(text, "info");
       } catch (error) {
         if (!closed) ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
       }
