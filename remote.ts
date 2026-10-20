@@ -1,4 +1,4 @@
-import { runProcess, type SpaceOS, type SpacesClient } from "./spaces.ts";
+import { isSpaceOS, runProcess, type SpaceItem, type SpaceOS, type SpacesClient } from "./spaces.ts";
 
 export type Remote = {
   client: SpacesClient;
@@ -18,13 +18,12 @@ export function layout(home: string) {
   const root = `${home}/.cua-pi`;
   return {
     root,
-    npmCache: `${root}/npm-cache`,
-    pi: (version: string) => `${root}/pi/${version}`,
-    runtime: (hash: string) => `${root}/runtimes/${hash}`,
     repo: (key: string) => `${root}/repos/${key}.git`,
     work: (executionId: string) => `${root}/work/${executionId}`,
   };
 }
+
+const inlineLimit = 384 * 1024;
 
 export type CommandResult = { exitCode: number | null; timedOut: boolean; stdout: Buffer; stderr: string; error: string | null };
 
@@ -33,11 +32,16 @@ export async function run(
   script: string,
   options: { timeoutMs?: number; signal?: AbortSignal; check?: boolean; label?: string; input?: Buffer } = {},
 ): Promise<CommandResult> {
+  const inline = options.input && options.input.length <= inlineLimit;
+  const encoded = inline ? options.input!.toString("base64").match(/.{1,65536}/g) ?? [] : [];
+  const args = inline
+    ? ["-c", `printf %s "$@" | base64 -d | /bin/sh -c ${sh(pathPrefix + script)}`, "sh", ...encoded]
+    : ["-c", `${pathPrefix}${script}`];
   const exit = await runProcess(
     remote.client,
     remote.spaceId,
-    { program: "/bin/sh", args: ["-c", `${pathPrefix}${script}`], timeoutMs: options.timeoutMs ?? 120_000 },
-    options.input,
+    { program: "/bin/sh", args, timeoutMs: options.timeoutMs ?? 120_000 },
+    inline ? undefined : options.input,
     options.signal,
   );
   const result = { exitCode: exit.code, timedOut: exit.timedOut === true, stdout: exit.stdout, stderr: exit.stderr, error: exit.error };
@@ -47,4 +51,51 @@ export async function run(
     throw new Error(`${options.label ?? "command"} on ${remote.name} ${status}${detail ? `: ${detail}` : ""}`);
   }
   return result;
+}
+
+export type Probe = { home: string; machineId: string; freeBytes: number };
+
+export async function probe(
+  client: SpacesClient,
+  space: SpaceItem,
+  signal?: AbortSignal,
+): Promise<{ remote: Remote; probe: Probe }> {
+  if (!isSpaceOS(space.os))
+    throw new Error(`${space.name} runs ${space.os || "an unknown OS"}; pi-cua supports Linux and macOS Spaces`);
+  const partial: Remote = { client, spaceId: space.id, name: space.name, os: space.os, home: "" };
+  const machineId =
+    space.os === "macos"
+      ? `ioreg -rd1 -c IOPlatformExpertDevice | awk -F'"' '/IOPlatformUUID/ { print $4 }'`
+      : "cat /etc/machine-id 2>/dev/null || cat /var/lib/dbus/machine-id";
+  const result = await run(
+    partial,
+    `missing=""
+for tool in node git; do command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"; done
+if [ -n "$missing" ]; then echo "missing:$missing" >&2; exit 20; fi
+printf 'home=%s\\n' "$HOME"
+mkdir -p "$HOME/.cua-pi"
+[ -s "$HOME/.cua-pi/machine-id" ] || node -e 'process.stdout.write(require("node:crypto").randomUUID())' > "$HOME/.cua-pi/machine-id"
+printf 'machine=%s/%s\\n' "$(${machineId})" "$(cat "$HOME/.cua-pi/machine-id")"
+printf 'free=%s\\n' "$(( $(df -Pk "$HOME" | awk 'NR == 2 { print $4 }') * 1024 ))"`,
+    { timeoutMs: 30_000, signal, label: "prerequisite check", check: false },
+  );
+  if (result.exitCode === 20)
+    throw new Error(
+      `${space.name} is missing${result.stderr.replace(/^missing:/, "").trim().replace(/^/, " ")}; install Node.js 22+ and git there, then try again`,
+    );
+  if (result.exitCode !== 0)
+    throw new Error(`prerequisite check on ${space.name} failed: ${(result.stderr || result.stdout.toString("utf8")).trim().slice(-500)}`);
+  const fields = Object.fromEntries(
+    result.stdout
+      .toString("utf8")
+      .trim()
+      .split("\n")
+      .map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]),
+  );
+  if (!fields.home?.startsWith("/") || !fields.machine || !/^\d+$/.test(fields.free ?? ""))
+    throw new Error(`invalid prerequisite response from ${space.name}`);
+  return {
+    remote: { ...partial, home: fields.home },
+    probe: { home: fields.home, machineId: fields.machine.trim(), freeBytes: Number(fields.free) },
+  };
 }
