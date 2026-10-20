@@ -31,8 +31,19 @@ A Space needs `node` and `git`, which the canonical Cua images ship. pi-cua chec
 | `local` | brings the work back into your checkout and runs locally again |
 | `create [name]` | creates a Space on this machine and enters it |
 | `delete <name>` | deletes a Space |
+| `auth` | checks GitHub authentication on the current Space |
 
 Creating and deleting always ask you to confirm, whoever asks. Resume never substitutes a different machine: if the saved Space is gone or reports a different machine identity, pi stops and asks you to choose.
+
+## sign-ins and pasted images
+
+Credentials stay on their own machine. Model and MCP sign-ins remain local; command-line tools on a Space use that Space's accounts. No OAuth tokens, SSH keys or credential files are copied or forwarded.
+
+After entering a Space, `/space auth` checks the GitHub CLI without displaying credentials. It reports whether `gh` is missing or authentication is unavailable and suggests the next step. Run interactive sign-in in a terminal on the Space (not pi's non-interactive `!` shell); browser/device-code flows can be approved from your own browser. GitHub HTTPS Git access may additionally need `gh auth setup-git`; SSH remotes need their own SSH authentication. There is no cross-environment GitHub action sharing yet.
+
+Pasted `pi-clipboard-*` images in pi's local temporary directory remain readable from your machine while workspace reads run remotely. This exception is read-only and does not route arbitrary local paths.
+
+The picker shows online Spaces first, then those still being checked, then offline Spaces. Availability updates preserve your filter and selected Space.
 
 ## Cua Spaces tools
 
