@@ -31,25 +31,30 @@ flowchart LR
 
 ## Get started
 
-```sh
-pi install git:github.com/injaneity/pi-cua
-```
+1. Set up [Cua Spaces](https://cua.ai/) and [connect a computer](https://cua.ai/docs/spaces/guides/add-a-computer), or create a local Space.
+2. Install the extension:
 
-Install the `cua` CLI, or use the [Cua Spaces app](https://cua.ai/). Local Spaces and direct connections do not require a Cua account. Sign in to reach your computers through the Cua relay:
+   ```sh
+   pi install git:github.com/injaneity/pi-cua
+   ```
+
+3. Open pi and run `/space`. If pi is already open, run `/reload` first.
+
+The destination needs Node.js 22+ and Git. [Windows additionally needs Git for Windows Bash](#experimental-windows-spaces). pi-cua checks prerequisites on entry; you do not install pi on the Space.
+
+Local Spaces and direct connections do not require a Cua account. Relay access uses Cua sign-in. `/space create` requires a supported local runtime.
+
+<details>
+<summary>Prefer the Cua CLI?</summary>
 
 ```sh
-curl -fsSL https://cua.ai/install.sh | sh -s -- --cli-only --yes   # on this computer
+curl -fsSL https://cua.ai/install.sh | sh -s -- --cli-only --yes
 cua auth login
-
-# on each computer you want to connect (or use the Cua Spaces app)
-curl -fsSL https://cua.ai/install.sh | sh -s -- --only host --yes
 ```
 
-Follow [Add a computer](https://cua.ai/docs/spaces/guides/add-a-computer) to connect another computer or let it host Spaces.
+Use the [Cua setup guide](https://cua.ai/docs/spaces/guides/add-a-computer) for the computers you want to connect. No custom pi-cua container image or separate tool-host package is required.
 
-Then run `/space` in pi to choose from your available Spaces. `/space create` creates and enters a Space on this computer; creation requires a supported local runtime.
-
-A Space needs `node` and `git`, which the canonical Cua images ship. pi-cua checks for them on entry.
+</details>
 
 ## Choose a Space
 
