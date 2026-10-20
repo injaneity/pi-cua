@@ -18,7 +18,7 @@ import { Type } from "typebox";
 import { randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { probe, type Remote } from "./remote.ts";
-import { isSpaceOS, type SpaceItem, type SpaceOS, type SpacesClient, type SpaceTool, WorkerSpacesClient } from "./spaces.ts";
+import { isSpaceOS, type SpaceItem, type SpaceOS, type SpacesClient, type SpaceTool, NativeSpacesClient } from "./spaces.ts";
 import { type SpaceOperations, spaceOperations } from "./tools.ts";
 import {
   cleanupWorkspace,
@@ -118,7 +118,7 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
   let known: SpaceItem[] | undefined;
   let listing: Promise<SpaceItem[]> | undefined;
 
-  const spaces = () => (client ??= new WorkerSpacesClient());
+  const spaces = () => (client ??= new NativeSpacesClient());
 
   function show(next?: string): void {
     activity = next;

@@ -119,11 +119,11 @@ export function inspectWorkspace(cwd: string): Repository | undefined {
   const commit = oid(gitText(root, ["rev-parse", "HEAD"]), "workspace HEAD");
   if (gitText(root, ["ls-files", "--stage"]).split("\n").some((line) => line.startsWith("160000 ")))
     throw new Error("workspace transfer does not yet support Git submodules");
-  try {
-    execFileSync("node", ["-e", filterCheck, root], { stdio: ["ignore", "pipe", "pipe"], timeout: 60_000 });
-  } catch (error) {
-    throw new Error(String((error as { stderr?: Buffer }).stderr ?? "workspace filter check failed").trim());
-  }
+  const paths = git(root, ["ls-files", "-z", "--cached", "--others", "--exclude-standard"]);
+  const fields = git(root, ["check-attr", "-z", "--stdin", "filter", "working-tree-encoding"], { input: paths }).toString("utf8").split("\0");
+  for (let i = 0; i + 2 < fields.length; i += 3)
+    if (!["", "unspecified", "unset"].includes(fields[i + 2]!))
+      throw new Error(`unsupported Git attribute: ${fields[i + 1]}=${fields[i + 2]} on ${fields[i]}`);
   return { root, relativeCwd: rel.split(sep).join("/") || ".", remoteUrl, commit };
 }
 
