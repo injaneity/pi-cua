@@ -111,36 +111,31 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
   let closed = false;
   let diffGeneration = 0;
   let catalogue: Promise<void> | undefined;
+  let ui: UIContext["ui"] | undefined;
+  let online = 0;
+  let diff = "";
+  let activity: string | undefined;
 
   const spaces = () => (client ??= new WorkerSpacesClient());
 
-  function emitTarget(value: Record<string, unknown>): void {
-    if (!closed) pi.events.emit("cua:execution-target-changed", value);
+  function show(next?: string): void {
+    activity = next;
+    if (closed || !ui) return;
+    const here = target.kind === "space" ? `${target.name} • connected${diff}` : `local${online ? ` • ${online} space${online === 1 ? "" : "s"} available` : ""}`;
+    ui.setStatus("cua-session", activity ?? here);
   }
 
-  function emitPlace(place: Place): void {
-    emitTarget(place.kind === "space" ? { kind: "sandbox", name: place.name, os: place.os } : { kind: "local" });
-  }
-
-  function progress(ctx: UIContext, name: string, phase?: string, message?: string): void {
-    if (closed) return;
-    const activity = phase?.startsWith("workspace.") ? "syncing workspace" : "connecting";
-    const detail = message && !["started", "completed"].includes(message) ? ` • ${message}` : "";
-    ctx.ui.setStatus("cua-session", `${name} (${activity})${detail}`);
-    emitTarget({ kind: "sandbox", name, state: "connecting", phase, message });
+  function progress(name: string, phase?: string, message?: string): void {
+    const doing = phase?.startsWith("workspace.") ? "syncing workspace" : phase === "create" ? "creating" : "connecting";
+    show(`${name} • ${doing}${message && !["started", "completed", "creating"].includes(message) ? ` • ${message}` : ""}`);
   }
 
   async function listSpaces(signal?: AbortSignal): Promise<SpaceItem[]> {
     const items = await spaces().list(signal);
-    pi.events.emit("cua:sandboxes-changed", {
-      sandboxes: items.map((item) => ({ name: item.name, os: item.os, online: item.online })),
-    });
+    online = items.filter((item) => item.online).length;
+    show(activity);
     return items;
   }
-
-  pi.events.on("cua:sandboxes-requested", () => {
-    void listSpaces().catch(() => undefined);
-  });
 
   function savePlace(place: Place): void {
     pi.appendEntry(placementEntry, place);
@@ -169,7 +164,7 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
   ): Promise<Attachment> {
     const signal = AbortSignal.any([AbortSignal.timeout(30 * 60_000), ...(ctx.signal ? [ctx.signal] : [])]);
     const timings: Timings = {};
-    const report = (phase: string, message: string) => progress(ctx, space.name, phase, message);
+    const report = (phase: string, message: string) => progress(space.name, phase, message);
     report("connect", "checking the Space");
     const { remote, probe: probed } = await probe(spaces(), space, signal);
     const saved = options.saved ?? options.parent;
@@ -230,8 +225,8 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
     target = next ? next.place : { kind: "local" };
     attachment = next;
     savePlace(target);
-    ctx.ui.setStatus("cua-session", undefined);
-    emitPlace(target);
+    diff = "";
+    show();
     if (options.announce !== false && label(previous) !== label(target))
       pi.sendMessage(
         {
@@ -283,10 +278,7 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
       route(next, ctx);
       await retire(previous, next, ctx);
     } catch (error) {
-      if (!closed) {
-        ctx.ui.setStatus("cua-session", undefined);
-        emitPlace(target);
-      }
+      show();
       throw error;
     } finally {
       entering = false;
@@ -315,14 +307,14 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
       }
       const workspace = previous && workspaceOf(previous);
       if (previous && workspace) {
-        progress(ctx, previous.place.name, "workspace.local", "syncing Space changes to local");
-        await syncToLocal(workspace, previous.place.localCwd, (phase, message) => progress(ctx, previous.place.name, phase, message), ctx.signal);
+        progress(previous.place.name, "workspace.local", "syncing Space changes to local");
+        await syncToLocal(workspace, previous.place.localCwd, (phase, message) => progress(previous.place.name, phase, message), ctx.signal);
       }
       route(undefined, ctx);
       await retire(previous, undefined, ctx);
     } finally {
       entering = false;
-      if (!closed) ctx.ui.setStatus("cua-session", undefined);
+      show();
     }
     await ctx.reload();
   }
@@ -349,14 +341,14 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
     if (args && !/^[a-z0-9][a-z0-9-]*$/.test(args)) throw new Error("usage: /space create [name]");
     const name = args || `pi-${randomBytes(3).toString("hex")}`;
     const input = { name, on: "local", wait: true };
-    progress(ctx, name, "create", "creating");
+    progress(name, "create", "creating");
     try {
       await callSpaces("create_space", input, ctx, ctx.signal);
     } catch (error) {
       if (error instanceof Error && error.message.endsWith("declined by the user")) return undefined;
       throw error;
     } finally {
-      ctx.ui.setStatus("cua-session", undefined);
+      show();
     }
     return (await listSpaces(ctx.signal)).find((item) => item.name === name);
   }
@@ -487,18 +479,12 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
     if (closed) return;
     const generation = ++diffGeneration;
     const active = attachment;
-    if (!active) {
-      pi.events.emit("cua:workspace-diff-changed", { kind: "local" });
-      return;
-    }
-    const workspace = workspaceOf(active);
-    try {
-      const status = workspace ? await diffStatus(workspace) : { additions: 0, deletions: 0, pendingSync: false };
-      if (closed || generation !== diffGeneration || attachment !== active) return;
-      pi.events.emit("cua:workspace-diff-changed", { kind: "sandbox", name: active.place.name, ...status });
-    } catch {
-      // A status refresh must not interrupt the session.
-    }
+    const workspace = active && workspaceOf(active);
+    if (!workspace) return;
+    const status = await diffStatus(workspace).catch(() => undefined);
+    if (!status || closed || generation !== diffGeneration || attachment !== active) return;
+    diff = status.additions || status.deletions ? ` • +${status.additions} -${status.deletions}` : "";
+    show(activity);
   }
 
   function onSpace(): SpaceOperations | undefined {
@@ -640,7 +626,10 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
 
   pi.on("session_start", (event, ctx) => {
     pendingStart = event;
+    ui = ctx.ui;
+    show();
     void loadCatalogue(ctx);
+    void listSpaces().catch(() => undefined);
   });
 
   pi.on("resources_discover", async (_event, ctx) => {
@@ -670,18 +659,7 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
       if (closed) return;
       placementError = error instanceof Error ? error : new Error(String(error));
       if (attempted && !creates) target = attempted;
-      if (attempted) {
-        ctx.ui.setStatus("cua-session", `${attempted.name} (failed to connect)`);
-        emitTarget({
-          kind: "sandbox",
-          name: attempted.name,
-          os: attempted.os,
-          state: "failed",
-          phase: "connect.failed",
-          message: "failed to connect",
-          error: placementError.message,
-        });
-      }
+      if (attempted) show(`${attempted.name} • failed to connect`);
       ctx.ui.notify(`execution placement blocked: ${placementError.message}`, "error");
     }
   });
