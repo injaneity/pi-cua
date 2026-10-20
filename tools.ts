@@ -1,7 +1,7 @@
-import { basename, dirname, isAbsolute, posix, resolve } from "node:path";
+import { basename, dirname, isAbsolute, posix, resolve, win32 } from "node:path";
 import { tmpdir } from "node:os";
 import type { BashOperations, EditOperations, FindOperations, ReadOperations, WriteOperations } from "@earendil-works/pi-coding-agent";
-import { pathPrefix, run, sh, type Remote } from "./remote.ts";
+import { run, sh, shellCommand, type Remote } from "./remote.ts";
 import { runProcess } from "./spaces.ts";
 
 export type SpaceOperations = {
@@ -26,9 +26,22 @@ export function localClipboard(path: string): boolean {
 }
 
 export function spaceOperations(remote: Remote, localCwd: string, remoteCwd: string): SpaceOperations {
+  const localRoot = process.platform === "win32" ? localCwd.replaceAll("\\", "/") : localCwd;
   const remotePath = (path: string) => {
+    if (process.platform === "win32") path = path.replaceAll("\\", "/");
+    const comparable = process.platform === "win32" ? path.toLowerCase() : path;
+    const root = process.platform === "win32" ? localRoot.toLowerCase() : localRoot;
+    const local = comparable === root || comparable.startsWith(`${root}/`);
+    if (remote.os === "windows") {
+      const supplied = local ? path.slice(localRoot.length + 1) : path;
+      if (supplied.startsWith("\\") || supplied.startsWith("//") || /^[a-z]:[^\\/]/i.test(supplied) || /^[a-z]:$/i.test(supplied))
+        throw new Error("Use a drive-qualified Windows path, such as C:/Users/name/file, or a workspace-relative path");
+      if (win32.isAbsolute(supplied) && /^[a-z]:[\\/]/i.test(supplied))
+        return win32.normalize(supplied).replaceAll("\\", "/");
+      path = path.replaceAll("\\", "/");
+    }
     const absolute = isAbsolute(path) ? posix.normalize(path) : posix.join(remoteCwd, path);
-    return absolute === localCwd || absolute.startsWith(`${localCwd}/`) ? remoteCwd + absolute.slice(localCwd.length) : absolute;
+    return local ? remoteCwd + absolute.slice(localRoot.length) : absolute;
   };
   const shell = async (script: string, input?: Buffer, signal?: AbortSignal) =>
     (await run(remote, script, { input, signal, timeoutMs: 600_000 })).stdout;
@@ -77,7 +90,7 @@ export function spaceOperations(remote: Remote, localCwd: string, remoteCwd: str
         const exit = await runProcess(
           remote.client,
           remote.spaceId,
-          { program: "/bin/sh", args: ["-c", `${pathPrefix}cd ${sh(remotePath(cwd))} && ${command}`], timeoutMs: timeout ? timeout * 1000 : undefined },
+          { ...shellCommand(remote, `cd ${sh(remotePath(cwd))} && ${command}`), timeoutMs: timeout ? timeout * 1000 : undefined },
           undefined,
           signal,
           (_stream, data) => onData(data),

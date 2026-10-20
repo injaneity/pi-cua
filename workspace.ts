@@ -265,6 +265,7 @@ else
   git -C ${root} config user.name pi-cua
   git -C ${root} config user.email pi-cua@localhost
 fi
+${remote.os === "windows" ? `git -C ${root} config core.autocrlf false\ngit -C ${root} config core.symlinks true` : ""}
 tar -xzf - -C ${root}
 git -C ${root} add -A
 git -C ${root} -c commit.gpgsign=false commit --allow-empty -qm 'pi-cua workspace baseline'

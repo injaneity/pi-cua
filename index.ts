@@ -635,7 +635,7 @@ fi
       let matches = 0;
       const kept: string[] = [];
       for (const line of output.split("\n").filter(Boolean)) {
-        if (/^[^:]+:\d+:/.test(line) && ++matches > limit) break;
+        if (/^(?:[a-z]:)?[^:]+:\d+:/i.test(line) && ++matches > limit) break;
         kept.push(line);
       }
       const text = truncateHead(kept.join("\n"), { maxBytes: DEFAULT_MAX_BYTES }).content;
@@ -776,7 +776,7 @@ fi
     const active = attachment;
     if (!active) return;
     const { place } = active;
-    const environment = `Execution environment: ${place.name} (${place.os}), a Cua Space. read, write, edit, bash, find, grep and user ! commands run there, in ${place.remoteCwd}; use workspace-relative paths. Other tools run on the user's machine. Cua Spaces tools (namespace cua) are available through tool_search.`;
+    const environment = `Execution environment: ${place.name} (${place.os}), a Cua Space. read, write, edit, bash, find, grep and user ! commands run there, in ${place.remoteCwd}; use workspace-relative paths. Other tools run on the user's machine. Cua Spaces tools (namespace cua) are available through tool_search.${place.os === "windows" ? " Windows support is experimental. Shell commands run in Git for Windows Bash, not PowerShell or cmd.exe. Prefer workspace-relative paths; native absolute paths must include a drive (C:/Users/...). Invoke powershell.exe explicitly when needed." : ""}`;
     return {
       systemPrompt: `${event.systemPrompt.replace(`Current working directory: ${place.localCwd}`, `Current working directory: ${place.workspaceState ? "workspace root" : "execution root"}`)}\n\n${environment}`,
     };

@@ -1,6 +1,6 @@
 import { Cua, CuaConfig, ProcessEventKind, SpacesdCommand, type SpacesdClientLike } from "@trycua/cua";
 
-export type SpaceOS = "linux" | "macos";
+export type SpaceOS = "linux" | "macos" | "windows";
 
 export type SpaceItem = {
   id: string;
@@ -61,7 +61,7 @@ export interface SpacesClient {
 }
 
 export function isSpaceOS(value: unknown): value is SpaceOS {
-  return value === "linux" || value === "macos";
+  return value === "linux" || value === "macos" || value === "windows";
 }
 
 export type RunResult = Exit & { stdout: Buffer; stderr: string };

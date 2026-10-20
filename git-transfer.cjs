@@ -173,7 +173,13 @@ const snapshot = () => {
     fs.rmSync(directory, { recursive: true });
   }
 };
+const configureCheckout = () => {
+  if (process.platform !== "win32") return;
+  git(["config", "core.autocrlf", "false"]);
+  git(["config", "core.symlinks", "true"]);
+};
 const applyFrames = () => {
+  configureCheckout();
   const tree = oid(options.tree);
   const baseline = oid(options.baseline);
   if (!/^[a-f0-9]{32}$/.test(options.reference))
@@ -264,6 +270,7 @@ if (action === "inventory") {
           canonical(options.root)
       )
         throw new Error("Invalid destination workspace root");
+      configureCheckout();
       git(["checkout", "--detach", "--force", commit]);
       git(["clean", "-ffd"]);
     }
