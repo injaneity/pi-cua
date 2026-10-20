@@ -96,7 +96,7 @@ enter(space)
 
 ## Supported today
 
-- Linux and macOS Spaces. Windows is not supported.
+- Cua Spaces supports macOS, Linux and Windows. pi-cua currently routes workspace tools to Linux and macOS Spaces; Windows execution and workspace transfer are not yet implemented in this integration.
 - Submodules, Git content filters and working-tree encodings are not transferred. Transfers are limited to 200 MiB.
 - Sessions on one Space share its user, files and logins. Use a dedicated Space when that matters.
 - Workspaces stay on the Space until you return with `/space local`.
