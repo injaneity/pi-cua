@@ -1,13 +1,11 @@
-import { spawn, type ChildProcess } from "node:child_process";
-import type { CreateOptions, Exit, ProcessHandle, ProcessSpec, SpaceItem, SpacesClient } from "../spaces.ts";
+import { spawn } from "node:child_process";
+import type { Exit, ProcessHandle, ProcessSpec, SpaceItem, SpacesClient, SpaceTool, ToolResult } from "../spaces.ts";
 
 export type FakeSpace = SpaceItem & { home: string };
 
 const machineIdCommand = `ioreg -rd1 -c IOPlatformExpertDevice | awk -F'"' '/IOPlatformUUID/ { print $4 }'`;
 
 export class FakeSpacesClient implements SpacesClient {
-  private readonly tagged = new Map<string, ChildProcess>();
-
   constructor(readonly spaces: FakeSpace[]) {}
 
   private find(spaceId: string): FakeSpace {
@@ -28,12 +26,11 @@ export class FakeSpacesClient implements SpacesClient {
     const space = this.find(spaceId);
     const args = spec.args.map((arg) => arg.replace(machineIdCommand, `echo fake-${space.id}`));
     const child = spawn(spec.program, args, {
-      cwd: spec.cwd ?? space.home,
-      env: { ...process.env, ...spec.env, HOME: space.home },
+      cwd: space.home,
+      env: { ...process.env, HOME: space.home },
       stdio: [spec.stdin ? "pipe" : "ignore", "pipe", "pipe"],
       detached: true,
     });
-    if (spec.tag) this.tagged.set(`${spaceId}:${spec.tag}`, child);
     child.stdout!.on("data", (data: Buffer) => onOutput("stdout", data));
     child.stderr!.on("data", (data: Buffer) => onOutput("stderr", data));
     let timedOut = false;
@@ -64,21 +61,23 @@ export class FakeSpacesClient implements SpacesClient {
     };
   }
 
-  async killTag(spaceId: string, tag: string): Promise<void> {
-    const child = this.tagged.get(`${spaceId}:${tag}`);
-    this.tagged.delete(`${spaceId}:${tag}`);
-    if (child?.pid && child.exitCode === null)
-      try {
-        process.kill(-child.pid, "SIGKILL");
-      } catch {}
+  readonly calls: Array<{ name: string; input: unknown }> = [];
+
+  async tools(): Promise<SpaceTool[]> {
+    return [
+      { name: "list_spaces", description: "List Spaces.", inputSchema: { type: "object", properties: {} }, annotations: { readOnlyHint: true } },
+      {
+        name: "delete_space",
+        description: "Delete a Space.",
+        inputSchema: { type: "object", properties: { space: { type: "string" } }, required: ["space"] },
+        annotations: { destructiveHint: true },
+      },
+    ];
   }
 
-  async create(_options: CreateOptions): Promise<SpaceItem> {
-    throw new Error("fake Spaces cannot be created");
-  }
-
-  async remove(): Promise<void> {
-    throw new Error("fake Spaces cannot be deleted");
+  async call(name: string, input: unknown): Promise<ToolResult> {
+    this.calls.push({ name, input });
+    return { content: [{ type: "text", text: `${name} ok` }], isError: false };
   }
 
   close(): void {}

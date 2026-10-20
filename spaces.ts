@@ -16,9 +16,6 @@ export type SpaceItem = {
 export type ProcessSpec = {
   program: string;
   args: string[];
-  cwd?: string;
-  env?: Record<string, string>;
-  tag?: string;
   timeoutMs?: number;
   stdin?: boolean;
 };
@@ -32,10 +29,16 @@ export type ProcessHandle = {
   exited: Promise<Exit>;
 };
 
-export type CreateOptions = {
-  name?: string;
-  cpus?: number;
-  memoryMb?: number;
+export type SpaceTool = {
+  name: string;
+  description?: string;
+  inputSchema?: Record<string, unknown>;
+  annotations?: Record<string, unknown>;
+};
+
+export type ToolResult = {
+  content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>;
+  isError: boolean;
 };
 
 export interface SpacesClient {
@@ -46,9 +49,8 @@ export interface SpacesClient {
     onOutput: (stream: "stdout" | "stderr", data: Buffer) => void,
     signal?: AbortSignal,
   ): Promise<ProcessHandle>;
-  killTag(spaceId: string, tag: string, signal?: AbortSignal): Promise<void>;
-  create(options: CreateOptions, signal?: AbortSignal): Promise<SpaceItem>;
-  remove(spaceId: string, signal?: AbortSignal): Promise<void>;
+  tools(signal?: AbortSignal): Promise<SpaceTool[]>;
+  call(name: string, input: unknown, signal?: AbortSignal): Promise<ToolResult>;
   close(): void;
 }
 
@@ -64,13 +66,14 @@ export async function runProcess(
   spec: Omit<ProcessSpec, "stdin">,
   input?: Buffer,
   signal?: AbortSignal,
+  onOutput?: (stream: "stdout" | "stderr", data: Buffer) => void,
 ): Promise<RunResult> {
   const stdout: Buffer[] = [];
   const stderr: Buffer[] = [];
   const handle = await client.spawn(
     spaceId,
     { ...spec, stdin: input !== undefined },
-    (stream, data) => (stream === "stdout" ? stdout : stderr).push(data),
+    (stream, data) => (onOutput ? onOutput(stream, data) : (stream === "stdout" ? stdout : stderr).push(data)),
     signal,
   );
   const onAbort = () => void handle.kill();
@@ -144,7 +147,7 @@ export class WorkerSpacesClient implements SpacesClient {
     return worker;
   }
 
-  private call<T>(method: string, args: unknown[], signal?: AbortSignal): Promise<T> {
+  private request<T>(method: string, args: unknown[], signal?: AbortSignal): Promise<T> {
     if (signal?.aborted) return Promise.reject(new Error("aborted"));
     let worker: ChildProcess;
     try {
@@ -174,7 +177,7 @@ export class WorkerSpacesClient implements SpacesClient {
   }
 
   list(signal?: AbortSignal): Promise<SpaceItem[]> {
-    return this.call("list", [], signal);
+    return this.request("list", [], signal);
   }
 
   async spawn(
@@ -188,29 +191,25 @@ export class WorkerSpacesClient implements SpacesClient {
     const exited = new Promise<Exit>((done) => (resolve = done));
     this.running.set(id, { onOutput, resolve });
     try {
-      await this.call("spawn", [spaceId, spec, id], signal);
+      await this.request("spawn", [spaceId, spec, id], signal);
     } catch (error) {
       this.running.delete(id);
       throw error;
     }
     return {
-      write: async (data) => void (await this.call("write", [id, data.toString("base64")])),
-      closeStdin: async () => void (await this.call("closeStdin", [id])),
-      kill: async () => void (await this.call("kill", [id])),
+      write: async (data) => void (await this.request("write", [id, data.toString("base64")])),
+      closeStdin: async () => void (await this.request("closeStdin", [id])),
+      kill: async () => void (await this.request("kill", [id])),
       exited,
     };
   }
 
-  async killTag(spaceId: string, tag: string, signal?: AbortSignal): Promise<void> {
-    await this.call("killTag", [spaceId, tag], signal);
+  tools(signal?: AbortSignal): Promise<SpaceTool[]> {
+    return this.request("tools", [], signal);
   }
 
-  create(options: CreateOptions, signal?: AbortSignal): Promise<SpaceItem> {
-    return this.call("create", [options], signal);
-  }
-
-  async remove(spaceId: string, signal?: AbortSignal): Promise<void> {
-    await this.call("delete", [spaceId], signal);
+  call(name: string, input: unknown, signal?: AbortSignal): Promise<ToolResult> {
+    return this.request("call", [name, input], signal);
   }
 
   close(): void {

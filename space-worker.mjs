@@ -1,5 +1,4 @@
-import { Cua, CuaConfig, ProcessEventKind, ReplayMode, SpacesdCommand } from "@trycua/cua";
-import { SpaceCreateOptions } from "@trycua/cua/spaces";
+import { Cua, CuaConfig, ProcessEventKind, SpacesdCommand } from "@trycua/cua";
 
 const cua = Cua.auto(CuaConfig.create({ fleetFromSession: true }));
 const spaces = cua.spaces();
@@ -85,9 +84,7 @@ async function dispatch({ method, args }, signal) {
       SpacesdCommand.create({
         program: spec.program,
         args: spec.args,
-        env: new Map(Object.entries(spec.env ?? {})),
-        cwd: spec.cwd,
-        tag: spec.tag,
+        env: new Map(),
         timeoutMs: spec.timeoutMs,
         stdin: spec.stdin === true,
       }),
@@ -110,36 +107,12 @@ async function dispatch({ method, args }, signal) {
     await processes.get(args[0])?.kill().catch(() => undefined);
     return true;
   }
-  if (method === "killTag") {
-    const [space, tag] = args;
-    const env = await spacesd(space, signal);
-    try {
-      await (await env.attach(undefined, tag, ReplayMode.None.new())).kill();
-    } catch {}
-    return true;
-  }
-  if (method === "create") {
-    const [options] = args;
-    const result = await spaces.create(
-      SpaceCreateOptions.create({
-        on: "local",
-        name: options.name,
-        cpus: options.cpus,
-        memoryMb: options.memoryMb === undefined ? undefined : BigInt(options.memoryMb),
-        wait: true,
-        reuse: false,
-        env: new Map(),
-        services: new Map(),
-      }),
-      { signal },
-    );
-    if (!result.space) throw new Error("Space creation did not finish; check `cua spaces list`");
-    return summary(result.space, true);
-  }
-  if (method === "delete") {
-    await spaces.delete_(args[0], { signal });
-    clients.delete(args[0]);
-    return true;
+  if (method === "tools") return JSON.parse(await spaces.listToolsJson({ signal })).tools;
+  if (method === "call") {
+    const [name, input] = args;
+    const result = await spaces.callToolJson(name, JSON.stringify(input ?? {}), { signal });
+    if (name === "delete_space") clients.clear();
+    return { content: JSON.parse(result.contentJson || "[]"), isError: result.isError === true };
   }
   throw new Error(`unknown Spaces operation: ${method}`);
 }

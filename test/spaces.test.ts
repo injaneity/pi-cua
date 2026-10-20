@@ -1,50 +1,21 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { after, before, describe, test } from "node:test";
-import { buildRuntime } from "../config.ts";
-import { layout } from "../remote.ts";
-import { ensurePi, ensureRuntime, hostFiles, probe, RemoteHost } from "../setup.ts";
+import { createBashToolDefinition, createEditToolDefinition, createFindToolDefinition, createReadToolDefinition, createWriteToolDefinition } from "@earendil-works/pi-coding-agent";
+import { probe } from "../remote.ts";
+import { spaceOperations } from "../tools.ts";
 import { cleanupWorkspace, diffStatus, inspectWorkspace, prepareWorkspace, type SpaceWorkspace, syncToLocal } from "../workspace.ts";
 import { FakeSpacesClient } from "./fake-spaces.ts";
 
 process.env.PI_CUA_ALLOW_LOCAL_ORIGIN = "1";
-const nodeModules = join(import.meta.dirname, "..", "node_modules");
-const piVersion = JSON.parse(readFileSync(join(nodeModules, "@earendil-works/pi-coding-agent/package.json"), "utf8")).version;
 const scratch = mkdtempSync(join(tmpdir(), "pi-cua-spaces-test-"));
 const git = (cwd: string, ...args: string[]) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
 
 after(() => {
   if (process.env.PI_CUA_KEEP !== "1") rmSync(scratch, { recursive: true, force: true });
-});
-
-function agentDir(name: string, extra: Record<string, unknown> = {}): string {
-  const dir = join(scratch, name);
-  mkdirSync(join(dir, "extensions"), { recursive: true });
-  mkdirSync(join(dir, "skills", "demo"), { recursive: true });
-  writeFileSync(join(dir, "settings.json"), JSON.stringify({ theme: "dark", apiToken: "secret", logPath: "/var/log/x", ...extra }));
-  writeFileSync(join(dir, "auth.json"), JSON.stringify({ key: "never" }));
-  writeFileSync(join(dir, "skills", "demo", "SKILL.md"), "# demo\n");
-  writeFileSync(join(dir, "skills", "demo", ".env"), "TOKEN=1\n");
-  return dir;
-}
-
-describe("runtime snapshot", () => {
-  test("drops credentials and controller-only settings, and hashes deterministically", () => {
-    const dir = agentDir("agent-a");
-    const inputs = { agentDir: dir, piVersion, packages: ["npm:demo@1.0.0"], toolFiles: [], skillFiles: [], hostFiles: hostFiles() };
-    const first = buildRuntime(inputs);
-    const second = buildRuntime(inputs);
-    assert.equal(first.hash, second.hash);
-    assert.match(first.hash, /^[0-9a-f]{20}$/);
-    assert.ok(first.warnings.some((warning) => warning.includes("credential setting: settings.json.apiToken")));
-    assert.ok(first.warnings.some((warning) => warning.includes("controller-only file: auth.json")));
-    assert.ok(first.warnings.some((warning) => warning.includes(".env")));
-    writeFileSync(join(dir, "skills", "demo", "SKILL.md"), "# changed\n");
-    assert.notEqual(buildRuntime(inputs).hash, first.hash);
-  });
 });
 
 describe("workspace moves between Spaces", () => {
@@ -146,60 +117,65 @@ describe("workspace moves between Spaces", () => {
   });
 });
 
-describe("tool host over the exec relay", () => {
-  const home = join(scratch, "home-host");
-  const client = new FakeSpacesClient([{ id: "fake:host", name: "space-host", os: "macos", provider: "local", online: true, home }]);
-  let host: RemoteHost;
+describe("pi tools on a Space", () => {
+  const home = join(scratch, "home-tools");
+  const localCwd = join(scratch, "local-cwd");
+  const client = new FakeSpacesClient([{ id: "fake:tools", name: "space-tools", os: "macos", provider: "local", online: true, home }]);
+  let ops: ReturnType<typeof spaceOperations>;
+  let remoteCwd: string;
+  const text = (result: { content: Array<{ type: string; text?: string }> }) => result.content.map((block) => block.text ?? "").join("\n");
 
   before(async () => {
-    mkdirSync(home, { recursive: true });
-    const piRoot = layout(home).pi(piVersion);
-    mkdirSync(piRoot, { recursive: true });
-    symlinkSync(nodeModules, join(piRoot, "node_modules"));
-    writeFileSync(join(piRoot, "complete"), "");
+    remoteCwd = join(home, "work");
+    mkdirSync(join(remoteCwd, "src"), { recursive: true });
+    mkdirSync(localCwd, { recursive: true });
+    git(remoteCwd, "init", "-q");
+    writeFileSync(join(remoteCwd, "hello.txt"), "hi from the Space\n");
+    writeFileSync(join(remoteCwd, "src", "a.ts"), "export const answer = 42;\n");
     const { remote } = await probe(client, client.spaces[0]!);
-    assert.equal(await ensurePi(remote, piVersion), piRoot);
-    const runtime = buildRuntime({ agentDir: agentDir("agent-host"), piVersion, packages: [], toolFiles: [], skillFiles: [], hostFiles: hostFiles() });
-    const runtimeRoot = await ensureRuntime(remote, runtime, piRoot);
-    assert.equal(existsSync(join(runtimeRoot, "complete")), true);
-    const cwd = join(home, "work");
-    mkdirSync(cwd, { recursive: true });
-    writeFileSync(join(cwd, "hello.txt"), "hi from the Space\n");
-    host = new RemoteHost(remote, "0123456789abcdef", runtime.hash, runtimeRoot, piRoot, cwd, ["read", "bash", "edit", "write"]);
-    await host.ensure();
+    ops = spaceOperations(remote, localCwd, remoteCwd);
   });
 
-  after(async () => {
-    await host?.shutdown();
+  test("read, write and edit act on the Space, never the local directory", async () => {
+    const read = await createReadToolDefinition(localCwd, { operations: ops.read }).execute("1", { path: "hello.txt" }, undefined, undefined, undefined as never);
+    assert.match(text(read), /hi from the Space/);
+    await createWriteToolDefinition(localCwd, { operations: ops.write }).execute("2", { path: "new/dir/file.txt", content: "written\n" }, undefined, undefined, undefined as never);
+    assert.equal(readFileSync(join(remoteCwd, "new/dir/file.txt"), "utf8"), "written\n");
+    await createEditToolDefinition(localCwd, { operations: ops.edit }).execute(
+      "3",
+      { path: join(localCwd, "hello.txt"), edits: [{ oldText: "hi", newText: "hello" }] },
+      undefined,
+      undefined,
+      undefined as never,
+    );
+    assert.equal(readFileSync(join(remoteCwd, "hello.txt"), "utf8"), "hello from the Space\n");
+    assert.equal(existsSync(join(localCwd, "hello.txt")), false);
+    await assert.rejects(
+      createReadToolDefinition(localCwd, { operations: ops.read }).execute("4", { path: "missing.txt" }, undefined, undefined, undefined as never),
+    );
   });
 
-  test("describes tools and runs read through the relay", async () => {
-    assert.ok(host.definition("read"));
-    const result = await host.execute("read", "call-1", { path: "hello.txt" }, undefined, undefined);
-    assert.match(JSON.stringify(result.content), /hi from the Space/);
-  });
-
-  test("runs user bash with output, exit code and timeout", async () => {
-    const chunks: Buffer[] = [];
-    const ok = await host.bash("bash-1", "echo out; echo err >&2; exit 3", { onData: (data) => chunks.push(data) });
-    assert.equal(ok.exitCode, 3);
-    assert.match(Buffer.concat(chunks).toString(), /out[\s\S]*err|err[\s\S]*out/);
-    await assert.rejects(host.bash("bash-2", "sleep 5", { onData: () => {}, timeout: 1 }), /^Error: timeout:1$/);
-  });
-
-  test("cancels a running command on the Space when aborted", async () => {
-    const marker = join(home, "work", "should-not-exist");
+  test("bash streams output, reports exit codes, times out and cancels", async () => {
+    const bash = createBashToolDefinition(localCwd, { operations: ops.bash });
+    const ok = await bash.execute("5", { command: "pwd; echo err >&2" }, undefined, undefined, undefined as never);
+    assert.match(text(ok), new RegExp(remoteCwd.replaceAll("/", "\\/")));
+    assert.match(text(ok), /err/);
+    const failed = await bash.execute("6", { command: "exit 3" }, undefined, undefined, undefined as never);
+    assert.match(text(failed), /exited with code 3/);
+    await assert.rejects(bash.execute("7", { command: "sleep 5", timeout: 1 }, undefined, undefined, undefined as never), /timed out after 1 seconds/);
+    const marker = join(remoteCwd, "should-not-exist");
     const controller = new AbortController();
-    setTimeout(() => controller.abort(), 1000);
-    await assert.rejects(host.bash("bash-3", `sleep 3; touch ${marker}`, { onData: () => {}, signal: controller.signal }), /aborted/);
-    await new Promise((resolve) => setTimeout(resolve, 3500));
+    setTimeout(() => controller.abort(), 500);
+    await assert.rejects(bash.execute("8", { command: `sleep 2; touch ${marker}` }, controller.signal, undefined, undefined as never), /aborted/);
+    await new Promise((resolve) => setTimeout(resolve, 2500));
     assert.equal(existsSync(marker), false);
   });
 
-  test("restarts the host when it has gone away", async () => {
-    await host.shutdown();
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    const result = await host.execute("read", "call-2", { path: "hello.txt" }, undefined, undefined);
-    assert.match(JSON.stringify(result.content), /hi from the Space/);
+  test("find globs and grep searches the Space", async () => {
+    const found = await createFindToolDefinition(localCwd, { operations: ops.find }).execute("9", { pattern: "*.ts" }, undefined, undefined, undefined as never);
+    assert.match(text(found), /src\/a\.ts/);
+    const output = await ops.grep(["git", "grep", "--no-index", "--exclude-standard", "-n", "-e", "answer"], localCwd);
+    assert.match(output, /src\/a\.ts:1:export const answer/);
+    assert.equal(await ops.grep(["git", "grep", "--no-index", "-n", "-e", "nothing-matches-this"], localCwd), "");
   });
 });

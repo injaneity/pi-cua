@@ -1,34 +1,28 @@
 import {
   type BashOperations,
-  createEditTool,
-  createReadTool,
-  createWriteTool,
-  type EditToolInput,
+  createBashToolDefinition,
+  createEditToolDefinition,
+  createFindToolDefinition,
+  createGrepToolDefinition,
+  createReadToolDefinition,
+  createWriteToolDefinition,
+  DEFAULT_MAX_BYTES,
   type ExtensionAPI,
   type ExtensionCommandContext,
   type ExtensionContext,
-  getAgentDir,
-  getPackageDir,
-  type ReadToolInput,
   SessionManager,
-  VERSION,
-  type WriteToolInput,
+  truncateHead,
 } from "@earendil-works/pi-coding-agent";
 import { Editor, Key, matchesKey, SelectList, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
-import { dirname, join, parse, posix } from "node:path";
+import { randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { buildRuntime, type Runtime } from "./config.ts";
-import type { Remote } from "./remote.ts";
-import { ensurePi, ensureRuntime, hostFiles, probe, RemoteHost } from "./setup.ts";
-import { isSpaceOS, type SpaceItem, type SpaceOS, type SpacesClient, WorkerSpacesClient } from "./spaces.ts";
+import { probe, type Remote } from "./remote.ts";
+import { isSpaceOS, type SpaceItem, type SpaceOS, type SpacesClient, type SpaceTool, WorkerSpacesClient } from "./spaces.ts";
+import { type SpaceOperations, spaceOperations } from "./tools.ts";
 import {
   cleanupWorkspace,
   diffStatus,
-  executionDigest,
   executionDirectory,
   inspectWorkspace,
   parseWorkspaceState,
@@ -40,10 +34,10 @@ import {
   workspaceExists,
 } from "./workspace.ts";
 
-const extensionDir = dirname(fileURLToPath(import.meta.url));
+const extensionPath = fileURLToPath(import.meta.url);
 const placementEntry = "cua-space-placement";
 const noSpaces = "no Spaces are available; create one with /space create, or sign in and add machines with the cua CLI (see the pi-cua README)";
-const localTools = new Set(["space", "report_papercut", "web_search"]);
+const workspaceTools = ["read", "write", "edit", "bash", "find", "grep"];
 
 type SpacePlace = {
   kind: "space";
@@ -58,23 +52,8 @@ type SpacePlace = {
   workspaceState?: WorkspaceState;
 };
 type Place = { kind: "local" } | SpacePlace;
-type Attachment = {
-  place: SpacePlace;
-  remote: Remote;
-  host: RemoteHost;
-  runtime: Runtime;
-  runtimeRoot: string;
-};
+type Attachment = { place: SpacePlace; remote: Remote; ops: SpaceOperations };
 type UIContext = ExtensionContext | ExtensionCommandContext;
-type ToolWithSource = ReturnType<ExtensionAPI["getAllTools"]>[number];
-type Routes = Readonly<{
-  tools: readonly string[];
-  unavailable: ReadonlyMap<string, string>;
-  packages: readonly string[];
-  files: readonly string[];
-  skills: readonly string[];
-  definitions: readonly ToolWithSource[];
-}>;
 type Mode = "enter" | "resume" | "inherit";
 
 function latestEntryData(entries: Array<{ type: string; customType?: string; data?: unknown }>, customType: string): unknown {
@@ -116,80 +95,6 @@ function parsePlace(value: unknown): Place | undefined {
   };
 }
 
-function packageRoot(path: string, packageName?: string): string | undefined {
-  let current = dirname(path);
-  for (;;) {
-    const manifest = join(current, "package.json");
-    if (existsSync(manifest)) {
-      if (!packageName) return current;
-      try {
-        if ((JSON.parse(readFileSync(manifest, "utf8")) as { name?: unknown }).name === packageName) return current;
-      } catch {}
-    }
-    if (existsSync(join(current, ".git"))) return current;
-    const parent = dirname(current);
-    if (parent === current || current === parse(current).root) return undefined;
-    current = parent;
-  }
-}
-
-function immutablePackageSource(tool: ToolWithSource): string {
-  const source = tool.sourceInfo.source;
-  if (source.startsWith("npm:")) {
-    const match = source.match(/^npm:(@[^/]+\/[^@]+|[^@]+)(?:@.+)?$/);
-    if (!match) throw new Error(`unsupported npm tool package: ${source}`);
-    const root = packageRoot(tool.sourceInfo.path, match[1]);
-    if (!root) throw new Error(`cannot locate installed tool package: ${source}`);
-    const version = (JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as { version?: unknown }).version;
-    if (typeof version !== "string" || !version) throw new Error(`tool package has no version: ${source}`);
-    return `npm:${match[1]}@${version}`;
-  }
-  const root = packageRoot(tool.sourceInfo.path);
-  if (!root) throw new Error(`cannot locate installed tool package: ${source}`);
-  const revision = spawnSync("git", ["-C", root, "rev-parse", "HEAD"], { encoding: "utf8" });
-  const commit = revision.stdout.trim();
-  if (revision.status !== 0 || !/^[0-9a-f]{40,64}$/.test(commit)) throw new Error(`cannot resolve tool package revision: ${source}`);
-  const marker = source.lastIndexOf("@");
-  const pathStart = Math.max(source.lastIndexOf("/"), source.lastIndexOf(":"));
-  return `${marker > pathStart ? source.slice(0, marker) : source}@${commit}`;
-}
-
-const remoteSource = (source: string) => ["git:", "npm:", "https://", "http://", "ssh://"].some((prefix) => source.startsWith(prefix));
-
-function isControllerFile(toolName: string, input: unknown): input is ReadToolInput {
-  if (!["read", "edit", "write"].includes(toolName) || input === null || typeof input !== "object") return false;
-  const path = (input as { path?: unknown }).path;
-  if (typeof path !== "string") return false;
-  if (
-    toolName === "read" &&
-    /^\/(?:private\/)?var\/folders\/[^/]+\/[^/]+\/T\/pi-clipboard-[^/]+\.(?:png|jpe?g|gif|webp|bmp)$/i.test(path)
-  )
-    return true;
-  const normalized = posix.normalize((path.startsWith("~/") ? `${homedir()}/${path.slice(2)}` : path).replaceAll("\\", "/"));
-  const papercuts = `${posix.normalize(getAgentDir().replaceAll("\\", "/"))}/papercuts/`;
-  if (normalized.startsWith(papercuts) && /^[a-z0-9._-]+-[a-f0-9]{12}\/papercuts\.md$/.test(normalized.slice(papercuts.length)))
-    return true;
-  if (toolName !== "read") return false;
-  const temporary = `${posix.normalize(tmpdir().replaceAll("\\", "/"))}/`;
-  return normalized.startsWith(temporary) && /^pi-exa-search-[a-zA-Z0-9]+\/results\.txt$/.test(normalized.slice(temporary.length));
-}
-
-function mapConfigInput(name: string, input: unknown, paths: Record<string, string>, agentRoot: string): { input: unknown; path?: string } {
-  if (!input || typeof input !== "object" || !("path" in input) || typeof input.path !== "string") return { input };
-  const raw = input.path.startsWith("~/") ? `${homedir()}/${input.path.slice(2)}` : input.path;
-  const path = posix.normalize(raw.replaceAll("\\", "/"));
-  for (const [source, destination] of Object.entries(paths).sort(([a], [b]) => b.length - a.length)) {
-    if (path !== source && !path.startsWith(`${source}/`)) continue;
-    if (["write", "edit"].includes(name))
-      throw new Error("Pi configuration snapshots are read-only; edit configuration locally and re-enter the Space");
-    if (!["read", "find", "grep", "fffind", "ffgrep"].includes(name)) return { input };
-    if (destination.startsWith("/") || destination.split("/").includes("..")) throw new Error("invalid remote configuration mapping");
-    const mapped = `${agentRoot}/${destination}${path.slice(source.length)}`;
-    return { input: { ...input, path: mapped }, path: mapped };
-  }
-  return { input };
-}
-
 function label(place: Place): string {
   return place.kind === "space"
     ? `${place.name} (${place.os})`
@@ -201,12 +106,11 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
   let target: Place = { kind: "local" };
   let attachment: Attachment | undefined;
   let placementError: Error | undefined;
-  let routeCatalog: Routes | undefined;
-  let runtimeCache: { key: string; runtime: Runtime } | undefined;
   let entering = false;
   let mixedBatch = false;
   let closed = false;
   let diffGeneration = 0;
+  let catalogue: Promise<void> | undefined;
 
   const spaces = () => (client ??= new WorkerSpacesClient());
 
@@ -220,7 +124,7 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
 
   function progress(ctx: UIContext, name: string, phase?: string, message?: string): void {
     if (closed) return;
-    const activity = phase?.startsWith("workspace.") ? "syncing workspace" : phase?.startsWith("setup.") ? "setting up" : "connecting";
+    const activity = phase?.startsWith("workspace.") ? "syncing workspace" : "connecting";
     const detail = message && !["started", "completed"].includes(message) ? ` • ${message}` : "";
     ctx.ui.setStatus("cua-session", `${name} (${activity})${detail}`);
     emitTarget({ kind: "sandbox", name, state: "connecting", phase, message });
@@ -237,57 +141,6 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
   pi.events.on("cua:sandboxes-requested", () => {
     void listSpaces().catch(() => undefined);
   });
-
-  function routes(): Routes {
-    if (routeCatalog) return routeCatalog;
-    const packages = new Set<string>();
-    const files = new Set<string>();
-    const unavailable = new Map<string, string>();
-    const definitions: ToolWithSource[] = [];
-    for (const tool of pi.getAllTools()) {
-      if (localTools.has(tool.name)) continue;
-      const info = tool.sourceInfo;
-      if (info.origin === "package" && info.scope === "user") {
-        if (!remoteSource(info.source)) {
-          unavailable.set(tool.name, `${tool.name} comes from the local package ${info.source}, which pi-cua cannot install on a Space`);
-          continue;
-        }
-        if (!info.source.toLowerCase().includes("pi-cua")) packages.add(immutablePackageSource(tool));
-      }
-      if (info.origin === "top-level" && info.scope === "user") files.add(info.path);
-      definitions.push(tool);
-    }
-    routeCatalog = Object.freeze({
-      tools: Object.freeze(definitions.map((tool) => tool.name)),
-      unavailable,
-      packages: Object.freeze([...packages]),
-      files: Object.freeze([...files]),
-      skills: Object.freeze(pi.getCommands().filter((command) => command.source === "skill").map((command) => command.sourceInfo.path)),
-      definitions: Object.freeze(definitions),
-    });
-    return routeCatalog;
-  }
-
-  function runtimeFor(ctx: UIContext, localCwd: string): Runtime {
-    const catalog = routes();
-    const projectDir = ctx.isProjectTrusted?.() === true ? localCwd : undefined;
-    const key = JSON.stringify([catalog.packages, catalog.files, catalog.skills, projectDir]);
-    if (runtimeCache?.key !== key)
-      runtimeCache = {
-        key,
-        runtime: buildRuntime({
-          agentDir: getAgentDir(),
-          piVersion: VERSION,
-          packages: catalog.packages,
-          toolFiles: catalog.files,
-          skillFiles: catalog.skills,
-          hostFiles: hostFiles(),
-          documentationRoot: getPackageDir(),
-          projectDir,
-        }),
-      };
-    return runtimeCache.runtime;
-  }
 
   function savePlace(place: Place): void {
     pi.appendEntry(placementEntry, place);
@@ -329,11 +182,6 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
       mode === "inherit"
         ? ctx.sessionManager.getSessionId()
         : (options.saved?.executionId ?? options.source?.place.executionId ?? ctx.sessionManager.getSessionId());
-    const runtime = runtimeFor(ctx, localCwd);
-    report("setup.pi", `pi ${VERSION}`);
-    const piRoot = await ensurePi(remote, VERSION, signal);
-    report("setup.runtime", runtime.hash);
-    const runtimeRoot = await ensureRuntime(remote, runtime, piRoot, signal);
 
     let place: SpacePlace = {
       kind: "space",
@@ -371,76 +219,12 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
         throw new Error("this session's Git workspace is no longer available locally");
       } else place = { ...place, remoteCwd: await executionDirectory(remote, executionId, signal) };
     }
-    report("connect.tools", "starting the tool host");
-    const host = new RemoteHost(
-      remote,
-      executionDigest(place.executionId).slice(0, 16),
-      runtime.hash,
-      runtimeRoot,
-      piRoot,
-      place.remoteCwd,
-      routes().tools,
-    );
-    await host.ensure(signal);
     if (Object.keys(timings).length) pi.appendEntry("cua-entry-timing", { name: space.name, timings });
-    return { place, remote, host, runtime, runtimeRoot };
-  }
-
-  function installProxies(next: Attachment): void {
-    const active = pi.getActiveTools();
-    const definitions = routes().definitions.map((info) => {
-      const remote = next.host.definition(info.name);
-      if (!remote) throw new Error(`remote tool metadata missing: ${info.name}`);
-      if (
-        remote.sourceInfo?.origin !== info.sourceInfo.origin ||
-        (info.sourceInfo.origin === "package" && remote.sourceInfo?.source !== immutablePackageSource(info))
-      )
-        throw new Error(
-          `remote tool provider mismatch for ${info.name}; expected ${info.sourceInfo.source}, got ${remote.sourceInfo?.source ?? "unknown"}`,
-        );
-      return { info, remote };
-    });
-    for (const { info, remote } of definitions) {
-      pi.registerTool({
-        ...(remote as any),
-        async execute(id: string, input: unknown, signal: AbortSignal | undefined, onUpdate: any, toolCtx: ExtensionContext) {
-          if (isControllerFile(info.name, input)) {
-            const result =
-              info.name === "edit"
-                ? await createEditTool(toolCtx.cwd).execute(id, input as EditToolInput, signal, onUpdate)
-                : info.name === "write"
-                  ? await createWriteTool(toolCtx.cwd).execute(id, input as WriteToolInput, signal, onUpdate)
-                  : await createReadTool(toolCtx.cwd).execute(id, input, signal, onUpdate);
-            result.content.unshift({
-              type: "text",
-              text: input.path.endsWith("papercuts.md")
-                ? `live controller papercut ledger: ${input.path}. This is shared across Space switches, not a Space file.`
-                : `controller file: ${input.path}. This is not a Space file.`,
-            });
-            return result;
-          }
-          const current = attachment;
-          if (!current || target.kind !== "space") throw new Error("Space placement changed before dispatch");
-          const mapped = mapConfigInput(info.name, input, current.runtime.paths, `${current.runtimeRoot}/agent`);
-          const result = await current.host.execute(info.name, id, mapped.input, signal, onUpdate);
-          if (mapped.path) result.content.unshift({ type: "text", text: `resource path in this environment: ${mapped.path}` });
-          return result;
-        },
-      });
-    }
-    for (const { info } of definitions) {
-      const effective = pi.getAllTools().find((tool) => tool.name === info.name);
-      if (effective?.sourceInfo.path !== join(extensionDir, "index.ts")) {
-        placementError = new Error(`another extension overrides ${info.name}; load pi-cua after other tool packages, then run /reload`);
-        throw placementError;
-      }
-    }
-    pi.setActiveTools(active);
+    return { place, remote, ops: spaceOperations(remote, localCwd, place.remoteCwd) };
   }
 
   function route(next: Attachment | undefined, ctx: UIContext, options: { announce?: boolean } = {}): void {
     if (closed) throw new Error("extension runtime was replaced while entering the Space");
-    if (next) installProxies(next);
     placementError = undefined;
     const previous = target;
     target = next ? next.place : { kind: "local" };
@@ -466,7 +250,6 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
     const sameExecution =
       next?.place.machineId === previous.place.machineId && next.place.workspaceRoot === previous.place.workspaceRoot;
     if (sameExecution) return;
-    await previous.host.shutdown().catch(() => undefined);
     const workspace = workspaceOf(previous);
     if (!workspace) return;
     try {
@@ -544,26 +327,38 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
     await ctx.reload();
   }
 
-  async function createSpace(args: string, ctx: UIContext): Promise<SpaceItem | undefined> {
-    const match = args.match(/^([a-z0-9][a-z0-9-]*)?(?:\s*([1-9]\d*)\s+([1-9]\d*))?$/);
-    if (!match) throw new Error("usage: /space create [name] [cpus memory_mb]");
-    const [, name, cpus, memory] = match;
-    if (!ctx.hasUI) throw new Error("creating a Space needs an interactive session");
-    const confirmed = await ctx.ui.confirm(
-      `create a Space${name ? ` named ${name}` : ""} on this machine?`,
-      cpus ? `${cpus} CPUs and ${memory} MiB of memory.` : "default resources.",
+  async function callSpaces(tool: SpaceTool | string, input: Record<string, unknown>, ctx: UIContext, signal?: AbortSignal) {
+    const name = typeof tool === "string" ? tool : tool.name;
+    const destructive = typeof tool === "string" || tool.annotations?.destructiveHint === true;
+    if (destructive) {
+      if (!ctx.hasUI) throw new Error(`${name} changes your Spaces and needs an interactive session to confirm`);
+      if (!(await ctx.ui.confirm(`allow ${name}?`, JSON.stringify(input, null, 2))))
+        throw new Error(`${name} was declined by the user`);
+    }
+    const result = await spaces().call(name, input, signal);
+    const content = result.content.map((block) =>
+      block.type === "image" && block.data && block.mimeType
+        ? { type: "image" as const, data: block.data, mimeType: block.mimeType }
+        : { type: "text" as const, text: truncateHead(block.text ?? JSON.stringify(block), { maxBytes: DEFAULT_MAX_BYTES }).content },
     );
-    if (!confirmed) return undefined;
-    progress(ctx, name ?? "new Space", "create", "creating");
+    if (result.isError) throw new Error(content.map((block) => ("text" in block ? block.text : "")).join("\n") || `${name} failed`);
+    return content;
+  }
+
+  async function createSpace(args: string, ctx: UIContext): Promise<SpaceItem | undefined> {
+    if (args && !/^[a-z0-9][a-z0-9-]*$/.test(args)) throw new Error("usage: /space create [name]");
+    const name = args || `pi-${randomBytes(3).toString("hex")}`;
+    const input = { name, on: "local", wait: true };
+    progress(ctx, name, "create", "creating");
     try {
-      return await spaces().create(
-        { name, cpus: cpus ? Number(cpus) : undefined, memoryMb: memory ? Number(memory) : undefined },
-        ctx.signal,
-      );
+      await callSpaces("create_space", input, ctx, ctx.signal);
+    } catch (error) {
+      if (error instanceof Error && error.message.endsWith("declined by the user")) return undefined;
+      throw error;
     } finally {
       ctx.ui.setStatus("cua-session", undefined);
-      void listSpaces().catch(() => undefined);
     }
+    return (await listSpaces(ctx.signal)).find((item) => item.name === name);
   }
 
   async function deleteSpace(name: string, ctx: UIContext): Promise<string> {
@@ -571,9 +366,7 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
     if (!item) throw new Error(`unknown Space: ${name}`);
     if (target.kind === "space" && target.spaceId === item.id)
       throw new Error(`move this session off ${item.name} with /space local before deleting it`);
-    if (!ctx.hasUI || !(await ctx.ui.confirm(`delete ${item.name}?`, "this permanently removes the Space and its files.")))
-      return "deletion was declined";
-    await spaces().remove(item.id, ctx.signal);
+    await callSpaces("delete_space", { space: item.id }, ctx, ctx.signal);
     void listSpaces().catch(() => undefined);
     return `deleted ${item.name}`;
   }
@@ -687,10 +480,7 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
   }
 
   function entered(item: SpaceItem): string {
-    const warnings = attachment?.runtime.warnings ?? [];
-    return `execution environment: ${item.name} (${attachment?.place.os ?? item.os}). Subsequent tools run there.${
-      warnings.length ? `\nPi configuration transfer notes:\n${warnings.join("\n")}` : ""
-    }`;
+    return `execution environment: ${item.name} (${attachment?.place.os ?? item.os}). read, write, edit, bash, find, grep and ! commands now run there.`;
   }
 
   async function refreshDiff(): Promise<void> {
@@ -711,7 +501,105 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
     }
   }
 
-  const usage = "<name> enters a Space · local returns · create [name] [cpus memory_mb] · delete <name> · nothing lists Spaces";
+  function onSpace(): SpaceOperations | undefined {
+    if (entering) throw new Error("a Space entry is in progress; no tool dispatched");
+    if (placementError) throw placementError;
+    return target.kind === "space" ? attachment?.ops : undefined;
+  }
+
+  pi.registerTool({
+    ...createReadToolDefinition(process.cwd()),
+    execute: (id, input, signal, onUpdate, ctx) => {
+      const ops = onSpace();
+      return createReadToolDefinition(ctx.cwd, ops ? { operations: ops.read } : {}).execute(id, input, signal, onUpdate, ctx);
+    },
+  });
+  pi.registerTool({
+    ...createWriteToolDefinition(process.cwd()),
+    execute: (id, input, signal, onUpdate, ctx) => {
+      const ops = onSpace();
+      return createWriteToolDefinition(ctx.cwd, ops ? { operations: ops.write } : {}).execute(id, input, signal, onUpdate, ctx);
+    },
+  });
+  pi.registerTool({
+    ...createEditToolDefinition(process.cwd()),
+    execute: (id, input, signal, onUpdate, ctx) => {
+      const ops = onSpace();
+      return createEditToolDefinition(ctx.cwd, ops ? { operations: ops.edit } : {}).execute(id, input, signal, onUpdate, ctx);
+    },
+  });
+  pi.registerTool({
+    ...createBashToolDefinition(process.cwd()),
+    execute: (id, input, signal, onUpdate, ctx) => {
+      const ops = onSpace();
+      return createBashToolDefinition(ctx.cwd, ops ? { operations: ops.bash } : {}).execute(id, input, signal, onUpdate, ctx);
+    },
+  });
+  pi.registerTool({
+    ...createFindToolDefinition(process.cwd()),
+    defaultActive: false,
+    execute: (id, input, signal, onUpdate, ctx) => {
+      const ops = onSpace();
+      return createFindToolDefinition(ctx.cwd, ops ? { operations: ops.find } : {}).execute(id, input, signal, onUpdate, ctx);
+    },
+  });
+  pi.registerTool({
+    ...createGrepToolDefinition(process.cwd()),
+    defaultActive: false,
+    async execute(id, input, signal, onUpdate, ctx) {
+      const ops = onSpace();
+      if (!ops) return createGrepToolDefinition(ctx.cwd).execute(id, input, signal, onUpdate, ctx);
+      const args = ["git", "grep", "--no-index", "--exclude-standard", "-n", "-I"];
+      if (input.ignoreCase) args.push("-i");
+      if (input.literal) args.push("-F");
+      if (input.context) args.push(`-C${Math.max(0, Math.floor(input.context))}`);
+      const base = input.path ? ops.remotePath(input.path) : ".";
+      const glob = input.glob && (input.glob.includes("/") ? input.glob : `**/${input.glob}`);
+      args.push("-e", input.pattern, "--", glob ? `:(glob)${base === "." ? "" : `${base}/`}${glob}` : base);
+      const output = await ops.grep(args, ctx.cwd, signal);
+      const limit = input.limit ?? 100;
+      let matches = 0;
+      const kept: string[] = [];
+      for (const line of output.split("\n").filter(Boolean)) {
+        if (/^[^:]+:\d+:/.test(line) && ++matches > limit) break;
+        kept.push(line);
+      }
+      const text = truncateHead(kept.join("\n"), { maxBytes: DEFAULT_MAX_BYTES }).content;
+      return {
+        content: [{ type: "text", text: text ? `${text}${matches > limit ? `\n\n[${limit} matches limit reached]` : ""}` : "No matches found" }],
+        details: undefined,
+      };
+    },
+  });
+
+  function loadCatalogue(ctx: UIContext): Promise<void> {
+    catalogue ??= spaces()
+      .tools()
+      .then((tools) => {
+        for (const tool of tools)
+          pi.registerTool({
+            name: `cua_${tool.name}`,
+            label: `cua/${tool.name}`,
+            description: tool.description ?? tool.name,
+            parameters: { type: "object", properties: {}, ...tool.inputSchema } as never,
+            exposure: "deferred",
+            namespace: { name: "cua", aliases: ["spaces"], description: "Cua Spaces: machines, sandboxes, agents, Volume, sharing" },
+            annotations: tool.annotations as never,
+            async execute(_id, input, signal, _onUpdate, toolCtx) {
+              return { content: await callSpaces(tool, input, toolCtx, signal), details: { tool: tool.name } };
+            },
+          });
+        if (pi.getAllTools().some((tool) => tool.name === "tool_search") && !pi.getActiveTools().includes("tool_search"))
+          pi.setActiveTools([...pi.getActiveTools(), "tool_search"]);
+      })
+      .catch((error) => {
+        catalogue = undefined;
+        if (!closed) ctx.ui.notify(`Cua Spaces tools unavailable: ${error instanceof Error ? error.message : String(error)}`, "warning");
+      });
+    return catalogue;
+  }
+
+  const usage = "<name> enters a Space · local returns · create [name] · delete <name> · nothing lists Spaces";
 
   pi.registerTool({
     name: "space",
@@ -750,8 +638,9 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
 
   let pendingStart: { reason: "startup" | "reload" | "new" | "resume" | "fork"; previousSessionFile?: string } | undefined;
 
-  pi.on("session_start", (event) => {
+  pi.on("session_start", (event, ctx) => {
     pendingStart = event;
+    void loadCatalogue(ctx);
   });
 
   pi.on("resources_discover", async (_event, ctx) => {
@@ -793,7 +682,7 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
           error: placementError.message,
         });
       }
-      ctx.ui.notify(`execution placement blocked: ${placementError.message}; choose a target with /space`, "error");
+      ctx.ui.notify(`execution placement blocked: ${placementError.message}`, "error");
     }
   });
 
@@ -805,41 +694,31 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
     if (mixedBatch)
       return { block: true, reason: "space must be the only tool call in its batch; no tools dispatched" };
     if (entering) return { block: true, reason: "a Space entry is in progress; no tool dispatched" };
-    if (target.kind !== "space" || localTools.has(event.toolName)) return;
-    const reason = routes().unavailable.get(event.toolName);
-    if (reason) return { block: true, reason: `${reason}; it is unavailable while this session runs on ${target.name}` };
-    if (!routes().tools.includes(event.toolName))
-      return { block: true, reason: `${event.toolName} was registered after entering the Space; run /reload to rebuild the Space tool set` };
+    if (target.kind !== "space" || !workspaceTools.includes(event.toolName)) return;
+    const effective = pi.getAllTools().find((tool) => tool.name === event.toolName);
+    if (effective?.sourceInfo.path !== extensionPath)
+      return {
+        block: true,
+        reason: `${event.toolName} comes from ${effective?.sourceInfo.source ?? "another extension"}, which would act on your local files while this session runs on ${target.name}; load pi-cua before it or disable it`,
+      };
   });
 
-  pi.on("before_agent_start", async (event) => {
+  pi.on("before_agent_start", async (event, ctx) => {
+    await loadCatalogue(ctx);
     if (placementError) throw placementError;
     const active = attachment;
     if (!active) return;
-    const { place, runtime, runtimeRoot } = active;
-    const resources = Object.entries(runtime.paths)
-      .sort(([a], [b]) => b.length - a.length)
-      .map(([source, destination]) => `${source} → ${runtimeRoot}/agent/${destination}`)
-      .join("\n");
-    const environment = `Execution environment: ${place.name} (${place.os}), a Cua Space. Workspace tools and user shell commands run there; use workspace-relative paths. Web search and reads of its full-output files remain on the controller; API credentials are not copied to Spaces. Papercut reports and read/edit/write operations on their absolute ledger paths remain on the controller; do not use Space shell commands to access them. Pi resources have been copied to this Space; use these paths for their supporting scripts:\n${resources}\nConfiguration transfer notes: ${runtime.warnings.join("; ") || "none"}`;
+    const { place } = active;
+    const environment = `Execution environment: ${place.name} (${place.os}), a Cua Space. read, write, edit, bash, find, grep and user ! commands run there, in ${place.remoteCwd}; use workspace-relative paths. Other tools run on the user's machine. Cua Spaces tools (namespace cua) are available through tool_search.`;
     return {
       systemPrompt: `${event.systemPrompt.replace(`Current working directory: ${place.localCwd}`, `Current working directory: ${place.workspaceState ? "workspace root" : "execution root"}`)}\n\n${environment}`,
     };
   });
 
   pi.on("user_bash", () => {
-    if (entering) throw new Error("a Space entry is in progress; run the command when it finishes");
-    if (placementError) throw placementError;
-    const active = attachment;
-    if (!active) return;
-    const operations: BashOperations = {
-      exec: (command, _cwd, options) =>
-        active.host.bash(`bash-${crypto.randomUUID()}`, command, {
-          onData: options.onData,
-          signal: options.signal,
-          timeout: options.timeout,
-        }),
-    };
+    const ops = onSpace();
+    if (!ops) return;
+    const operations: BashOperations = ops.bash;
     return { operations };
   });
 
