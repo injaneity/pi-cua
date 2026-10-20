@@ -1,22 +1,36 @@
 # pi-cua
 
-Run a local pi session's work on a [Cua Space](https://cua.ai/docs), and use every Cua Spaces tool from pi. pi, your extensions, skills, settings and credentials stay on your machine. `read`, `write`, `edit`, `bash`, `find`, `grep` and `!` commands run on the Space, in a copy of your Git workspace. Nothing pi-related is installed there.
+**Bring your pi coding sessions to [Cua Spaces](https://cua.ai/).**
+
+Cua Spaces gives people and agents shared desktops on computers you own or rent: your computer, another computer you connect, or a VM in your own cloud account. A Space can be a container, a virtual machine, or a computer's own desktop—not a Cua-hosted computer. See [how Spaces works](https://cua.ai/docs/spaces/concepts/how-spaces-works).
+
+pi-cua connects pi to Linux and macOS Spaces. Keep pi, your extensions, skills, settings and model credentials local; run workspace tools on the selected Space and bring Git changes back when you return. Cua Spaces tools are also discoverable through `tool_search`.
+
+```mermaid
+flowchart LR
+  P["Local pi session"] -->|"workspace tools"| S["Cua Space on your computers"]
+  S -->|"Git changes on return"| W["Local checkout"]
+```
+
+## install
 
 ```sh
 pi install git:github.com/injaneity/pi-cua
 ```
 
-Signing in and adding your own machines is a one-time step with the `cua` CLI or the Cua Spaces app:
+Install the `cua` CLI, or use the [Cua Spaces app](https://cua.ai/). Local Spaces and direct connections do not require a Cua account. Sign in to reach your computers through the Cua relay:
 
 ```sh
 curl -fsSL https://cua.ai/install.sh | sh -s -- --cli-only --yes   # on this computer
 cua auth login
 
-# on each machine you want to code on (or use the Cua Spaces app's "Add a machine")
+# on each computer you want to connect (or use the Cua Spaces app)
 curl -fsSL https://cua.ai/install.sh | sh -s -- --only host --yes
 ```
 
-Then run `/space`. Your machines are listed by name; `/space create` makes a new Space on this computer. There is nothing to configure.
+Follow [Add a computer](https://cua.ai/docs/spaces/guides/add-a-computer) to connect another computer or let it host Spaces.
+
+Then run `/space` in pi to choose from your available Spaces. `/space create` creates and enters a Space on this computer; creation requires a supported local runtime.
 
 A Space needs `node` and `git`, which the canonical Cua images ship. pi-cua checks for them on entry.
 
@@ -47,7 +61,7 @@ The picker shows online Spaces first, then those still being checked, then offli
 
 ## Cua Spaces tools
 
-Everything the Cua Spaces SDK offers (Spaces, agents, routines, the Cua Volume, sharing, teleport, hotspot and more) is registered as `cua_<tool>`, read from the SDK at startup. They stay out of the prompt until `tool_search` loads them, so they cost no context. Any tool the SDK marks destructive asks you to confirm first, whether you or the agent called it.
+The tool catalogue exposed by the installed Cua Spaces SDK—including Space management, agents, sharing, Teleport and more—is registered as `cua_<tool>` at startup. Tool definitions stay out of the prompt until `tool_search` loads them. Availability depends on your SDK version and connected computers. Any tool the SDK marks destructive asks you to confirm first, whether you or the agent called it.
 
 ## what entering does
 
