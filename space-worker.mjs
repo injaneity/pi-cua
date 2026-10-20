@@ -68,7 +68,7 @@ async function dispatch({ method, args }, signal) {
     return Promise.all(
       listed.map(async (info) => {
         try {
-          const probe = AbortSignal.any([signal, AbortSignal.timeout(10_000)]);
+          const probe = AbortSignal.any([signal, AbortSignal.timeout(3_000)]);
           const capabilities = await (await spacesd(info.id, probe)).capabilities({ signal: probe });
           return summary(info, true, undefined, info.os || capabilities.osFamily);
         } catch (error) {

@@ -115,6 +115,8 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
   let online = 0;
   let diff = "";
   let activity: string | undefined;
+  let known: SpaceItem[] | undefined;
+  let listing: Promise<SpaceItem[]> | undefined;
 
   const spaces = () => (client ??= new WorkerSpacesClient());
 
@@ -125,16 +127,46 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
     ui.setStatus("cua-session", activity ?? here);
   }
 
-  function progress(name: string, phase?: string, message?: string): void {
-    const doing = phase?.startsWith("workspace.") ? "syncing workspace" : phase === "create" ? "creating" : "connecting";
-    show(`${name} • ${doing}${message && !["started", "completed", "creating"].includes(message) ? ` • ${message}` : ""}`);
+  const steps: Array<[string, string]> = [
+    ["create", "creating the Space"],
+    ["connect", "checking the Space"],
+    ["workspace.preflight", "checking the repository"],
+    ["workspace.capture", "capturing local changes"],
+    ["workspace.objects", "sending files"],
+    ["workspace.snapshot", "sending a snapshot"],
+    ["workspace.local", "bringing changes back"],
+    ["workspace", "preparing the workspace"],
+  ];
+
+  function progress(name: string, phase = "", message?: string): void {
+    const step = steps.find(([prefix]) => phase.startsWith(prefix))?.[1] ?? "connecting";
+    const detail = message && /\d/.test(message) ? ` (${message})` : "";
+    show(`${name} • ${step}${detail}…`);
   }
 
-  async function listSpaces(signal?: AbortSignal): Promise<SpaceItem[]> {
-    const items = await spaces().list(signal);
-    online = items.filter((item) => item.online).length;
-    show(activity);
-    return items;
+  function listSpaces(signal?: AbortSignal): Promise<SpaceItem[]> {
+    if (listing) return listing;
+    const before = activity;
+    if (!known) show("listing Spaces…");
+    listing = spaces()
+      .list(signal)
+      .then((items) => {
+        known = items;
+        online = items.filter((item) => item.online).length;
+        return items;
+      })
+      .finally(() => {
+        listing = undefined;
+        show(before);
+      });
+    return listing;
+  }
+
+  async function findSpace(value: string, signal?: AbortSignal): Promise<SpaceItem | undefined> {
+    const match = (items: SpaceItem[]) => items.find((item) => item.name === value || item.id === value);
+    const cached = known && match(known);
+    if (cached?.online) return cached;
+    return match(await listSpaces(signal));
   }
 
   function savePlace(place: Place): void {
@@ -354,7 +386,7 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
   }
 
   async function deleteSpace(name: string, ctx: UIContext): Promise<string> {
-    const item = (await listSpaces(ctx.signal)).find((candidate) => candidate.name === name || candidate.id === name);
+    const item = await findSpace(name, ctx.signal);
     if (!item) throw new Error(`unknown Space: ${name}`);
     if (target.kind === "space" && target.spaceId === item.id)
       throw new Error(`move this session off ${item.name} with /space local before deleting it`);
@@ -429,7 +461,8 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
   }
 
   async function pick(ctx: UIContext): Promise<string | undefined> {
-    const items = await listSpaces(ctx.signal);
+    const items = known ?? (await listSpaces(ctx.signal));
+    if (known) void listSpaces().catch(() => undefined);
     const options = [
       ...(target.kind === "space" ? [{ value: "local", label: target.workspaceState ? "sync back to local directory" : "return to local execution" }] : []),
       ...items.map((item) => ({ value: item.id, label: item.name, description: describe(item) })),
@@ -464,11 +497,13 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
       if (!name) throw new Error("usage: /space delete <name>");
       return deleteSpace(name, ctx);
     }
-    const item = (await listSpaces(ctx.signal)).find((candidate) => candidate.name === value || candidate.id === value);
+    const item = await findSpace(value, ctx.signal);
     if (!item) throw new Error(`unknown Space: ${value}`);
     if (!item.online) throw new Error(`${item.name} is offline`);
-    if (!(target.kind === "space" && target.spaceId === item.id && attachment)) await enter(item, ctx);
-    return entered(item);
+    if (target.kind === "space" && target.spaceId === item.id && attachment) return entered(item);
+    const started = performance.now();
+    await enter(item, ctx);
+    return `${entered(item)} (${((performance.now() - started) / 1000).toFixed(1)}s)`;
   }
 
   function entered(item: SpaceItem): string {
