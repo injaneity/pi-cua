@@ -117,6 +117,8 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
   let activity: string | undefined;
   let known: SpaceItem[] | undefined;
   let listing: Promise<SpaceItem[]> | undefined;
+  let checks = new Map<string, Promise<SpaceItem>>();
+  let redraw: (() => void) | undefined;
 
   const spaces = () => (client ??= new NativeSpacesClient());
 
@@ -144,6 +146,23 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
     show(`${name} • ${step}${detail}…`);
   }
 
+  function checked(item: SpaceItem): Promise<SpaceItem> {
+    let check = checks.get(item.id);
+    if (!check) {
+      check = spaces()
+        .check(item)
+        .then((result) => {
+          Object.assign(item, result);
+          online = (known ?? []).filter((each) => each.online).length;
+          show(activity);
+          redraw?.();
+          return item;
+        });
+      checks.set(item.id, check);
+    }
+    return check;
+  }
+
   function listSpaces(signal?: AbortSignal): Promise<SpaceItem[]> {
     if (listing) return listing;
     const before = activity;
@@ -151,8 +170,15 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
     listing = spaces()
       .list(signal)
       .then((items) => {
+        const previous = new Map((known ?? []).map((item) => [item.id, item]));
+        for (const item of items) {
+          const seen = previous.get(item.id);
+          if (seen) Object.assign(item, { online: seen.online, reason: seen.reason, os: item.os || seen.os });
+        }
         known = items;
-        online = items.filter((item) => item.online).length;
+        checks = new Map();
+        for (const item of items) void checked(item);
+        redraw?.();
         return items;
       })
       .finally(() => {
@@ -164,9 +190,8 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
 
   async function findSpace(value: string, signal?: AbortSignal): Promise<SpaceItem | undefined> {
     const match = (items: SpaceItem[]) => items.find((item) => item.name === value || item.id === value);
-    const cached = known && match(known);
-    if (cached?.online) return cached;
-    return match(await listSpaces(signal));
+    const item = (known && match(known)) ?? match(await listSpaces(signal));
+    return item && checked(item);
   }
 
   function savePlace(place: Place): void {
@@ -181,7 +206,7 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
   }
 
   async function resolveSpace(spaceId: string, signal?: AbortSignal): Promise<SpaceItem> {
-    const item = (await listSpaces(signal)).find((candidate) => candidate.id === spaceId);
+    const item = await findSpace(spaceId, signal);
     if (!item) throw new Error(`Space ${spaceId} is no longer registered; choose another Space with /space`);
     if (!item.online)
       throw new Error(`${item.name} is offline${item.reason ? ` (${item.reason})` : ""}; bring it back online or choose another Space with /space`);
@@ -395,7 +420,8 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
     return `deleted ${item.name}`;
   }
 
-  async function search(ctx: UIContext, options: Array<{ value: string; label: string; description?: string }>): Promise<string | undefined> {
+  async function search(ctx: UIContext, choices: () => Array<{ value: string; label: string; description?: string }>): Promise<string | undefined> {
+    const options = choices();
     const input =
       ctx.mode === "tui"
         ? await ctx.ui.custom<string | null>((tui, theme, _keybindings, done) => {
@@ -413,9 +439,12 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
             const editor = new Editor(tui, { borderColor: (text) => theme.fg("borderMuted", text), selectList: listTheme });
             editor.disableSubmit = true;
             let list: SelectList;
-            const rebuild = (query: string) => {
+            let query = "";
+            const rebuild = (text: string) => {
+              query = text;
               const normalized = query.trim().toLowerCase();
-              const filtered = options.filter((option) => `${option.label} ${option.description ?? ""}`.toLowerCase().includes(normalized));
+              const selected = list?.getSelectedItem()?.value;
+              const filtered = choices().filter((option) => `${option.label} ${option.description ?? ""}`.toLowerCase().includes(normalized));
               const width = Math.max(1, ...filtered.map((option) => visibleWidth(option.label))) + 4;
               list = new SelectList(
                 filtered.map(({ value, label, description }) => ({ value, label, description })),
@@ -424,9 +453,15 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
                 { minPrimaryColumnWidth: width, maxPrimaryColumnWidth: width },
               );
               list.onSelect = (item) => done(item.value);
+              const index = filtered.findIndex((option) => option.value === selected);
+              if (index > 0) list.setSelectedIndex(index);
             };
             rebuild("");
             editor.onChange = rebuild;
+            redraw = () => {
+              rebuild(query);
+              tui.requestRender();
+            };
             return {
               get focused() {
                 return editor.focused;
@@ -452,7 +487,9 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
   }
 
   function describe(item: SpaceItem): string {
-    const status = !item.online
+    const status = item.online === undefined
+      ? "checking…"
+      : !item.online
       ? `offline${item.reason ? `: ${item.reason.slice(0, 80)}` : ""}`
       : target.kind === "space" && target.spaceId === item.id
         ? "current"
@@ -461,20 +498,24 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
   }
 
   async function pick(ctx: UIContext): Promise<string | undefined> {
-    const items = known ?? (await listSpaces(ctx.signal));
     if (known) void listSpaces().catch(() => undefined);
-    const options = [
+    else await listSpaces(ctx.signal);
+    const choices = () => [
       ...(target.kind === "space" ? [{ value: "local", label: target.workspaceState ? "sync back to local directory" : "return to local execution" }] : []),
-      ...items.map((item) => ({ value: item.id, label: item.name, description: describe(item) })),
+      ...(known ?? []).map((item) => ({ value: item.id, label: item.name, description: describe(item) })),
     ];
-    if (!options.length) throw new Error(noSpaces);
-    return search(ctx, options);
+    if (!choices().length) throw new Error(noSpaces);
+    try {
+      return await search(ctx, choices);
+    } finally {
+      redraw = undefined;
+    }
   }
 
   async function space(argument: string, ctx: UIContext): Promise<string | undefined> {
     const value = argument.trim();
     if (!value) {
-      const items = await listSpaces(ctx.signal);
+      const items = await Promise.all((await listSpaces(ctx.signal)).map(checked));
       return items.length ? items.map((item) => `${item.name}\t${describe(item)}`).join("\n") : noSpaces;
     }
     if (value === "local") {

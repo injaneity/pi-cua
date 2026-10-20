@@ -7,9 +7,11 @@ export type SpaceItem = {
   name: string;
   os: string;
   provider: string;
-  online: boolean;
+  online?: boolean;
   reason?: string;
 };
+
+export type SpaceCheck = { online: boolean; os: string; reason?: string };
 
 export type ProcessSpec = {
   program: string;
@@ -41,6 +43,7 @@ export type ToolResult = {
 
 export interface SpacesClient {
   list(signal?: AbortSignal): Promise<SpaceItem[]>;
+  check(item: SpaceItem, signal?: AbortSignal): Promise<SpaceCheck>;
   spawn(
     spaceId: string,
     spec: ProcessSpec,
@@ -108,18 +111,17 @@ export class NativeSpacesClient implements SpacesClient {
 
   async list(signal?: AbortSignal): Promise<SpaceItem[]> {
     const listed = await this.spaces.list(signal ? { signal } : undefined);
-    return Promise.all(
-      listed.map(async (info) => {
-        const item = { id: info.id, name: info.name, os: info.os, provider: info.provider };
-        try {
-          const probe = AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(3_000)]);
-          const capabilities = await (await this.spacesd(info.id, probe)).capabilities({ signal: probe });
-          return { ...item, os: info.os || capabilities.osFamily, online: true };
-        } catch (error) {
-          return { ...item, online: false, reason: error instanceof Error ? error.message : String(error) };
-        }
-      }),
-    );
+    return listed.map((info) => ({ id: info.id, name: info.name, os: info.os, provider: info.provider }));
+  }
+
+  async check(item: SpaceItem, signal?: AbortSignal): Promise<SpaceCheck> {
+    try {
+      const probe = AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(3_000)]);
+      const capabilities = await (await this.spacesd(item.id, probe)).capabilities({ signal: probe });
+      return { online: true, os: item.os || capabilities.osFamily };
+    } catch (error) {
+      return { online: false, os: item.os, reason: error instanceof Error ? error.message : String(error) };
+    }
   }
 
   async spawn(

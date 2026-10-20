@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import type { Exit, ProcessHandle, ProcessSpec, SpaceItem, SpacesClient, SpaceTool, ToolResult } from "../spaces.ts";
+import type { Exit, ProcessHandle, ProcessSpec, SpaceCheck, SpaceItem, SpacesClient, SpaceTool, ToolResult } from "../spaces.ts";
 
 export type FakeSpace = SpaceItem & { home: string };
 
@@ -15,7 +15,12 @@ export class FakeSpacesClient implements SpacesClient {
   }
 
   async list(): Promise<SpaceItem[]> {
-    return this.spaces.map(({ home: _home, ...item }) => item);
+    return this.spaces.map(({ home: _home, online: _online, ...item }) => item);
+  }
+
+  async check(item: SpaceItem): Promise<SpaceCheck> {
+    const space = this.find(item.id);
+    return { online: space.online !== false, os: space.os };
   }
 
   async spawn(
