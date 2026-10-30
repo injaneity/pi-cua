@@ -31,6 +31,7 @@ import {
   parseWorkspaceState,
   prepareWorkspace,
   type SpaceWorkspace,
+  syncBack,
   syncToLocal,
   type Timings,
   type WorkspaceState,
@@ -39,6 +40,8 @@ import {
 
 const extensionPath = fileURLToPath(import.meta.url);
 const placementEntry = "cua-space-placement";
+const childEntry = "cua-subagent";
+const threadEntry = "pi-subagent:thread:v1";
 const noSpaces = "no Spaces are available; create one with /space create, or sign in and add machines with the cua CLI (see the pi-cua README)";
 const workspaceTools = ["read", "write", "edit", "bash", "find", "grep"];
 
@@ -57,7 +60,25 @@ type SpacePlace = {
 type Place = { kind: "local" } | SpacePlace;
 type Attachment = { place: SpacePlace; remote: Remote; ops: SpaceOperations };
 type UIContext = ExtensionContext | ExtensionCommandContext;
-type Mode = "enter" | "resume" | "inherit";
+type Mode = "enter" | "resume" | "inherit" | "child";
+type Thread = { rootId: string; path: string };
+type Child = { owned: boolean; parent: Place };
+type Handoff = { space?: string; parent: Place; source?: Attachment };
+
+const subagents: { handoffs: Map<string, Handoff>; sync: Promise<unknown> } = ((globalThis as Record<symbol, unknown>)[
+  Symbol.for("pi-cua.subagents")
+] ??= { handoffs: new Map(), sync: Promise.resolve() }) as never;
+
+function threadOf(entries: Array<{ type: string; customType?: string; data?: unknown }>): Thread | undefined {
+  const data = latestEntryData(entries, threadEntry) as { rootId?: unknown; threadPath?: unknown } | undefined;
+  return typeof data?.rootId === "string" && typeof data.threadPath === "string" ? { rootId: data.rootId, path: data.threadPath } : undefined;
+}
+
+function parseChild(value: unknown): Child | undefined {
+  const data = value as { owned?: unknown; parent?: unknown } | undefined;
+  const parent = data && typeof data === "object" ? parsePlace(data.parent) : undefined;
+  return parent && typeof data?.owned === "boolean" ? { owned: data.owned, parent } : undefined;
+}
 
 function latestEntryData(entries: Array<{ type: string; customType?: string; data?: unknown }>, customType: string): unknown {
   for (let index = entries.length - 1; index >= 0; index--) {
@@ -122,6 +143,8 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
   let listing: Promise<SpaceItem[]> | undefined;
   let checks = new Map<string, Promise<SpaceItem>>();
   let redraw: (() => void) | undefined;
+  let thread: Thread | undefined;
+  let child: Child | undefined;
 
   const spaces = () => (client ??= new NativeSpacesClient());
 
@@ -234,7 +257,7 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
       );
     const localCwd = options.saved?.localCwd ?? options.parent?.localCwd ?? options.source?.place.localCwd ?? ctx.cwd;
     const executionId =
-      mode === "inherit"
+      mode === "inherit" || mode === "child"
         ? ctx.sessionManager.getSessionId()
         : (options.saved?.executionId ?? options.source?.place.executionId ?? ctx.sessionManager.getSessionId());
 
@@ -253,7 +276,7 @@ export default function cuaSpaces(pi: ExtensionAPI): void {
       const kept = options.saved;
       const present = kept.workspaceRoot ? await workspaceExists(remote, kept.workspaceRoot, kept.remoteCwd, signal) : true;
       if (present) place = { ...place, remoteCwd: kept.remoteCwd, workspaceRoot: kept.workspaceRoot, workspaceState: kept.workspaceState };
-    } else if (sameMachine && options.source) {
+    } else if (mode !== "child" && sameMachine && options.source) {
       const kept = options.source.place;
       place = { ...place, remoteCwd: kept.remoteCwd, workspaceRoot: kept.workspaceRoot, workspaceState: kept.workspaceState };
     }
@@ -721,10 +744,61 @@ fi
     void listSpaces().catch(() => undefined);
   });
 
+  function parentPlace(ctx: ExtensionContext): Place {
+    const file = ctx.sessionManager.getHeader()?.parentSession;
+    try {
+      return (file && parsePlace(latestEntryData(SessionManager.open(file).getEntries(), placementEntry))) || { kind: "local" };
+    } catch {
+      return { kind: "local" };
+    }
+  }
+
+  function report(ctx: ExtensionContext, message: string): void {
+    let hosted = false;
+    pi.events.emit("pi-subagent-manager:diagnostic:probe", {
+      respond: (capability: { protocol?: number }) => (hosted = capability?.protocol === 1),
+    });
+    if (hosted) pi.events.emit("pi-subagent-manager:diagnostic", { level: "error", message, source: "pi-cua" });
+    else ctx.ui.notify(message, "error");
+  }
+
+  async function startChild(ctx: ExtensionContext, entries: ReturnType<ExtensionContext["sessionManager"]["getEntries"]>, current: Thread): Promise<void> {
+    const key = `${current.rootId}:${current.path}`;
+    const saved = parseChild(latestEntryData(entries, childEntry));
+    const handoff = subagents.handoffs.get(key);
+    subagents.handoffs.delete(key);
+    child = saved ?? { owned: handoff?.space !== undefined, parent: handoff?.parent ?? parentPlace(ctx) };
+    if (!saved) pi.appendEntry(childEntry, child);
+    const placed = saved ? parsePlace(latestEntryData(entries, placementEntry)) : child.owned ? undefined : child.parent;
+    const place = placed?.kind === "space" ? placed : undefined;
+    if (!place && !child.owned) return;
+    if (!place && saved) {
+      placementError = new Error(`${current.path} lost its Space workspace before it was prepared; spawn a new subagent`);
+      return;
+    }
+    entering = true;
+    try {
+      const locate = async (id: string) => (await findSpace(id, ctx.signal)) ?? Promise.reject(new Error(`Space ${id} is no longer registered`));
+      const next = place
+        ? await attach(await locate(place.spaceId), ctx, "resume", { saved: place })
+        : await attach(await locate(handoff!.space!), ctx, "child", { source: handoff!.source });
+      route(next, ctx, { announce: false });
+    } catch (error) {
+      placementError = error instanceof Error ? error : new Error(String(error));
+      if (place) target = place;
+      report(ctx, `execution placement blocked for ${current.path}: ${placementError.message}`);
+    } finally {
+      entering = false;
+    }
+  }
+
   pi.on("resources_discover", async (_event, ctx) => {
     const event = pendingStart;
     pendingStart = undefined;
     if (!event) return;
+    const entries = ctx.sessionManager.getEntries();
+    thread = threadOf(entries);
+    if (thread) return startChild(ctx, entries, thread);
     let attempted: SpacePlace | undefined;
     const creates = event.reason === "new" || event.reason === "fork";
     try {
@@ -757,10 +831,40 @@ fi
     void refreshDiff();
   });
 
-  pi.on("tool_call", (event) => {
+  pi.on("agent_before_settle", async (_event, ctx) => {
+    const active = attachment;
+    const workspace = active && workspaceOf(active);
+    if (!child?.owned || child.parent.kind !== "local" || !active || !workspace) return;
+    const synced = subagents.sync.then(() => syncBack(workspace, active.place.localCwd, ctx.signal));
+    subagents.sync = synced.catch(() => undefined);
+    try {
+      active.place = { ...active.place, workspaceState: await synced };
+      if (attachment === active) {
+        target = active.place;
+        savePlace(target);
+      }
+    } catch (error) {
+      report(ctx, `${thread?.path ?? "subagent"} changes stay on ${active.place.name} at ${active.place.remoteCwd}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  });
+
+  async function handOff(input: Record<string, unknown>, ctx: ExtensionContext) {
+    const space = typeof input.space === "string" && input.space.trim() ? input.space.trim() : undefined;
+    delete input.space;
+    if (typeof input.path !== "string") return;
+    if (space) {
+      const item = await findSpace(space, ctx.signal).catch(() => undefined);
+      if (!item) return { block: true, reason: `unknown Space: ${space}` };
+    }
+    const path = input.path.startsWith("/") ? input.path : `${thread?.path ?? "/root"}/${input.path}`;
+    subagents.handoffs.set(`${thread?.rootId ?? ctx.sessionManager.getSessionId()}:${path}`, { space, parent: target, source: attachment });
+  }
+
+  pi.on("tool_call", async (event, ctx) => {
     if (mixedBatch)
       return { block: true, reason: "space must be the only tool call in its batch; no tools dispatched" };
     if (entering) return { block: true, reason: "a Space entry is in progress; no tool dispatched" };
+    if (event.toolName === "agent_spawn") return handOff(event.input as Record<string, unknown>, ctx);
     if (target.kind !== "space" || !workspaceTools.includes(event.toolName)) return;
     const effective = pi.getAllTools().find((tool) => tool.name === event.toolName);
     if (effective?.sourceInfo.path !== extensionPath)
@@ -770,15 +874,32 @@ fi
       };
   });
 
+  function spawnSpaces(): string {
+    const schema = pi.getAllTools().find((tool) => tool.name === "agent_spawn")?.parameters as { properties?: Record<string, unknown> } | undefined;
+    if (!schema?.properties) return "";
+    schema.properties.space ??= Type.Optional(
+      Type.String({ description: "Cua Space name or id for the child's workspace tools, with its own copy of this workspace. Omit to share this session's execution environment." }),
+    );
+    return "\n\nagent_spawn accepts space: run a child's workspace tools on that Cua Space with its own copy of this workspace, so children can work across several Spaces in parallel. Without space, children share this session's execution environment.";
+  }
+
+  function childGuidance(place: SpacePlace): string {
+    if (!child?.owned) return "";
+    return child.parent.kind === "local"
+      ? ` This is your own copy of the parent's workspace; your changes sync back to the parent's local checkout when you finish.`
+      : ` This is your own copy of the parent's workspace, and your changes stay on ${place.name}. Commit them to a new branch, push it, and name the branch in your final answer.`;
+  }
+
   pi.on("before_agent_start", async (event, ctx) => {
     await loadCatalogue(ctx);
     if (placementError) throw placementError;
+    const spawning = spawnSpaces();
     const active = attachment;
-    if (!active) return;
+    if (!active) return spawning ? { systemPrompt: `${event.systemPrompt}${spawning}` } : undefined;
     const { place } = active;
-    const environment = `Execution environment: ${place.name} (${place.os}), a Cua Space. read, write, edit, bash, find, grep and user ! commands run there, in ${place.remoteCwd}; use workspace-relative paths. Other tools run on the user's machine. Cua Spaces tools (namespace cua) are available through tool_search.${place.os === "windows" ? " Windows support is experimental. Shell commands run in Git for Windows Bash, not PowerShell or cmd.exe. Prefer workspace-relative paths; native absolute paths must include a drive (C:/Users/...). Invoke powershell.exe explicitly when needed." : ""}`;
+    const environment = `Execution environment: ${place.name} (${place.os}), a Cua Space. read, write, edit, bash, find, grep and user ! commands run there, in ${place.remoteCwd}; use workspace-relative paths. Other tools run on the user's machine. Cua Spaces tools (namespace cua) are available through tool_search.${place.os === "windows" ? " Windows support is experimental. Shell commands run in Git for Windows Bash, not PowerShell or cmd.exe. Prefer workspace-relative paths; native absolute paths must include a drive (C:/Users/...). Invoke powershell.exe explicitly when needed." : ""}${childGuidance(place)}`;
     return {
-      systemPrompt: `${event.systemPrompt.replace(`Current working directory: ${place.localCwd}`, `Current working directory: ${place.workspaceState ? "workspace root" : "execution root"}`)}\n\n${environment}`,
+      systemPrompt: `${event.systemPrompt.replace(`Current working directory: ${place.localCwd}`, `Current working directory: ${place.workspaceState ? "workspace root" : "execution root"}`)}\n\n${environment}${spawning}`,
     };
   });
 
@@ -789,7 +910,9 @@ fi
     return { operations };
   });
 
-  pi.on("session_shutdown", () => {
+  pi.on("session_shutdown", async () => {
+    const workspace = child?.owned && child.parent.kind === "local" && attachment ? workspaceOf(attachment) : undefined;
+    if (workspace) await subagents.sync.then(() => cleanupWorkspace(workspace)).catch(() => undefined);
     closed = true;
     diffGeneration += 1;
     attachment = undefined;

@@ -7,7 +7,7 @@ import { after, before, describe, test } from "node:test";
 import { createBashToolDefinition, createEditToolDefinition, createFindToolDefinition, createReadToolDefinition, createWriteToolDefinition } from "@earendil-works/pi-coding-agent";
 import { probe } from "../remote.ts";
 import { spaceOperations } from "../tools.ts";
-import { cleanupWorkspace, diffStatus, inspectWorkspace, prepareWorkspace, type SpaceWorkspace, syncToLocal } from "../workspace.ts";
+import { cleanupWorkspace, diffStatus, inspectWorkspace, prepareWorkspace, type SpaceWorkspace, syncBack, syncToLocal } from "../workspace.ts";
 import { FakeSpacesClient } from "./fake-spaces.ts";
 
 process.env.PI_CUA_ALLOW_LOCAL_ORIGIN = "1";
@@ -105,6 +105,22 @@ describe("workspace moves between Spaces", () => {
     const kept = readdirSync(join(remoteC.home, ".cua-pi", "work")).filter((name) => name.startsWith(`${basename(first.root)}.stranded-`));
     assert.equal(kept.length, 1);
     assert.equal(readFileSync(join(remoteC.home, ".cua-pi", "work", kept[0]!, "unsynced.txt"), "utf8"), "only copy\n");
+  });
+
+  test("a subagent's repeated sync-backs only carry changes made since the last sync", async () => {
+    const remoteC = (await probe(client, client.spaces[2]!)).remote;
+    const child = await prepareWorkspace(remoteC, "subagent-1", inspectWorkspace(local)!, undefined, {});
+    let workspace: SpaceWorkspace = { remote: remoteC, root: child.root, state: child.state };
+    writeFileSync(join(child.cwd, "child-1.txt"), "first\n");
+    workspace = { ...workspace, state: await syncBack(workspace, local) };
+    assert.equal(readFileSync(join(local, "child-1.txt"), "utf8"), "first\n");
+    writeFileSync(join(child.cwd, "child-1.txt"), "second\n");
+    writeFileSync(join(local, "parent.txt"), "parent meanwhile\n");
+    workspace = { ...workspace, state: await syncBack(workspace, local) };
+    assert.equal(readFileSync(join(local, "child-1.txt"), "utf8"), "second\n");
+    assert.equal(readFileSync(join(local, "parent.txt"), "utf8"), "parent meanwhile\n");
+    assert.equal((await diffStatus(workspace)).pendingSync, false);
+    await cleanupWorkspace(workspace);
   });
 
   test("refuses workspaces with Git filters it cannot reproduce", () => {
