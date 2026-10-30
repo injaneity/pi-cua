@@ -604,6 +604,12 @@ function applyPatch(root: string, patch: Buffer, expectedTree: string, beforeTre
   throw new Error("workspace verification failed after applying Space changes");
 }
 
+export async function syncBack(workspace: SpaceWorkspace, localCwd: string, signal?: AbortSignal): Promise<WorkspaceState> {
+  const tree = await spaceTree(workspace, signal);
+  await syncToLocal(workspace, localCwd, undefined, signal);
+  return { ...workspace.state, baselineTree: tree };
+}
+
 export async function syncToLocal(workspace: SpaceWorkspace, localCwd: string, progress?: Progress, signal?: AbortSignal): Promise<boolean> {
   const { state } = workspace;
   const localRoot = realpathSync(state.localRoot);

@@ -99,6 +99,15 @@ enter(space)
 
 `/new` and `/fork` inherit the Space with their own copy of the workspace.
 
+## Subagents across Spaces
+
+With [pi-subagent-manager](https://github.com/championswimmer/pi-subagent-manager), select pi-cua under **[lab] Subagent extensions** in `/agents settings` so each subagent loads it.
+
+- **no `space`.** The child shares the parent's execution environment and workspace, local or on a Space.
+- **`agent_spawn({ ..., space: "<name>" })`.** The child gets its own copy of the parent's workspace on that Space, so siblings can work on several Spaces in parallel. When the parent is local, the child's changes sync back to the local checkout each time it finishes a run, and its workspace is removed when the child is disposed. When the parent is itself on a Space, the child's changes stay on its Space and the child is told to push a branch.
+
+Children cannot confirm destructive Spaces tools, so they cannot create or delete Spaces.
+
 ## Supported today
 
 - Linux and macOS Spaces, plus experimental Windows Spaces using Git for Windows Bash. Windows support has not been runtime-tested.
